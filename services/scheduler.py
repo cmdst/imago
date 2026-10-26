@@ -7,6 +7,7 @@ import uuid
 from contextlib import asynccontextmanager
 from collections.abc import Awaitable, Callable
 from dataclasses import replace
+from typing import Any
 
 try:
     from aiohttp import ClientError as _AiohttpClientError
@@ -14,6 +15,7 @@ except ImportError:  # 允许在不含 AstrBot 运行依赖的源码环境运行
     class _AiohttpClientError(Exception):
         pass
 
+from ..core.config import matches_template
 from ..core.errors import ConfigurationError, NoOutputError, ProviderError
 from ..core.models import DrawTask, ImageResult, TaskStage, TaskState
 from ..core.prompting import REFERENCE_RELATION_SUFFIX, reference_relation_suffix
@@ -61,6 +63,35 @@ class _DynamicLimiter:
             await self.release()
 
 
+class _ProxySession:
+    """把 ``proxy`` 注入每次请求的 session 代理。
+
+    节点级 ``enable_proxy`` 只影响 HTTP 直连节点：aiohttp 的 ``proxy`` 是**逐请求**
+    参数，而 session 由插件共享，因此这里用一层极薄的包装把 ``get``/``post`` 的
+    ``proxy`` 补上，而不是为每个节点新建 session（那会多出一份连接池生命周期，
+    且节点配置在运行期随时可变）。``astrbot_native`` 节点不使用它——原生路由的
+    代理由 AstrBot provider_source 自己决定。
+
+    Attributes:
+        session: 底层 aiohttp ``ClientSession``。
+        proxy: 形如 ``http://127.0.0.1:7890`` 的出站代理；为空时原样直连。
+    """
+
+    def __init__(self, session: Any, proxy: str) -> None:
+        self.session = session
+        self.proxy = proxy
+
+    def get(self, url: str, **kwargs: Any):
+        """带代理的 GET；``kwargs`` 中的 ``proxy`` 优先（显式传入即不被覆盖）。"""
+        kwargs.setdefault("proxy", self.proxy)
+        return self.session.get(url, **kwargs)
+
+    def post(self, url: str, **kwargs: Any):
+        """带代理的 POST；``kwargs`` 中的 ``proxy`` 优先。"""
+        kwargs.setdefault("proxy", self.proxy)
+        return self.session.post(url, **kwargs)
+
+
 class TaskScheduler:
     def __init__(self, config_getter, session, runner: Callable[[DrawTask, list[ImageResult]], Awaitable[bool]], logger, debug=None):
         self.config_getter = config_getter
@@ -84,7 +115,7 @@ class TaskScheduler:
         task.updated_at = now
         task.state = TaskState.QUEUED
         task.stage = TaskStage.QUEUED
-        handle = asyncio.create_task(self._execute(task), name=f"imago:{task.id}")
+        handle = asyncio.create_task(self._execute(task), name=f"imago_fusion:{task.id}")
         self.tasks[task.id] = (task, handle)
         handle.add_done_callback(lambda _: self._archive(task.id))
         return task.id
@@ -280,13 +311,25 @@ class TaskScheduler:
             task.errors.append(f"terminal_notice:{type(exc).__name__}")
 
     async def _generate(self, task: DrawTask) -> list[ImageResult]:
-        providers = list(self.config_getter().providers)
+        config = self.config_getter()
+        providers = list(config.providers)
+        proxy_url = config.proxy_url
         if not providers: raise ConfigurationError("未配置有效图片节点")
         primary_id = str(task.runtime.get("primary_provider_id", ""))
+        # ``模板名/模型名`` 覆写：仅当开关开启且前缀确实是已配置模板名时生效，因此
+        # ``cpa_Gemini/web-gemini-image`` 这类原生 id 不会被劫持（DESIGN §4 A4）。
+        override_model = ""
+        if primary_id and matches_template(providers, primary_id, enabled=config.template_override):
+            primary_id, _, override_model = primary_id.partition("/")
+            override_model = override_model.strip()
         if primary_id:
             primary = next((item for item in providers if item.id == primary_id), None)
             if primary is not None:
                 providers = [primary, *(item for item in providers if item.id != primary_id)]
+                if override_model:
+                    # 覆写只作用于主节点：把它插到该节点的模型尝试序列最前面，失败后
+                    # 仍按 available_models 回退。
+                    providers[0] = replace(primary, model=override_model)
         last_error = None
         no_output_error = None
         for provider in providers:
@@ -302,9 +345,12 @@ class TaskScheduler:
                 task.runtime["current_provider_id"] = attempt.id
                 task.runtime["current_model"] = model
                 self.set_stage(task, TaskStage.REQUESTING_PROVIDER)
+                # ``astrbot_native`` 节点由 AstrBot provider 自理鉴权，api_keys 可以
+                # 为空；空元组上取模会抛 ZeroDivisionError（异常发生在 try 之外，
+                # 任务只会记一个不可诊断的除零错误）。
                 adapter = ADAPTERS[attempt.api_type](attempt)
                 key_index = self._key_indices.get(attempt.id, 0)
-                key = attempt.api_keys[key_index % len(attempt.api_keys)]
+                key = attempt.api_keys[key_index % len(attempt.api_keys)] if attempt.api_keys else ""
                 self._key_indices[attempt.id] = key_index + 1
                 try:
                     self.debug(
@@ -317,7 +363,12 @@ class TaskScheduler:
                         task.runtime.get("current_persona_reference_count", 0),
                     )
                     async with asyncio.timeout(attempt.timeout):
-                        results = await adapter.generate(self.session, attempt_request, key)
+                        results = await adapter.generate(
+                            _ProxySession(self.session, proxy_url)
+                            if attempt.enable_proxy and proxy_url else self.session,
+                            attempt_request,
+                            key,
+                        )
                     self.debug(
                         task,
                         "task=%s 绘图模型成功 node=%s model=%s results=%d references=%d persona_refs=%d forms=%s bytes=%d",

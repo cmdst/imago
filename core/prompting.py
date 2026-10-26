@@ -516,7 +516,7 @@ def merge_camera_request(action: str, camera: str) -> str:
 def sanitize_caption(text: str, max_length: int = 300) -> str:
     """整理配文：压缩空白并按长度截断。
 
-    不做 ChatMemory `<cm_*>` 标签清洗：那是 CM 装饰链的职责，imago 不耦合
+    不做 ChatMemory `<cm_*>` 标签清洗：那是 CM 装饰链的职责，imago_fusion 不耦合
     其他插件的内部格式；配文经主动发送走装饰链时由 CM 自行清理。
     """
     return " ".join((text or "").split())[:max_length]

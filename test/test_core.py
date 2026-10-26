@@ -4,32 +4,32 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from imago.core.config import (
+from imago_fusion.core.config import (
     load_config,
     optimizer_in_use,
     persona_provider_settings,
     style_arg_consumed,
 )
-from imago.core.dedup import DEDUPE_WINDOW_SECONDS, is_duplicate_request
-from imago.core.errors import (
+from imago_fusion.core.dedup import DEDUPE_WINDOW_SECONDS, is_duplicate_request
+from imago_fusion.core.errors import (
     DuplicateImage,
     NoOutputError,
     ProviderError,
     UnsupportedResponse,
     safe_creation_error_message,
 )
-from imago.core.models import GenerationRequest, ImageInput, ProviderConfig, QuotaConfig, TaskState
-from imago.providers.base import ProviderAdapter
-from imago.providers.dashscope import DashScopeMultimodalAdapter
-from imago.providers.openai_chat import OpenAIChatAdapter
-from imago.providers.openai_image import OpenAIImageAdapter
-from imago.core.prompting import (
+from imago_fusion.core.models import GenerationRequest, ImageInput, ProviderConfig, QuotaConfig, TaskState
+from imago_fusion.providers.base import ProviderAdapter
+from imago_fusion.providers.dashscope import DashScopeMultimodalAdapter
+from imago_fusion.providers.openai_chat import OpenAIChatAdapter
+from imago_fusion.providers.openai_image import OpenAIImageAdapter
+from imago_fusion.core.prompting import (
     DEFAULT_OPTIMIZER_SYSTEM,
     optimizer_system,
 )
-from imago.core.security import ensure_child, parse_extra_params, redact, redact_debug, safe_component
-from imago.services.persona_store import PersonaStore
-from imago.services.quota_store import QuotaStore, terminal_refund_amount
+from imago_fusion.core.security import ensure_child, parse_extra_params, redact, redact_debug, safe_component
+from imago_fusion.services.persona_store import PersonaStore
+from imago_fusion.services.quota_store import QuotaStore, terminal_refund_amount
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -310,7 +310,7 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(values[1].data, b"image")
 
     def test_gemini_file_uri_appends_key_when_missing(self):
-        from imago.providers.gemini import _file_uri_with_key
+        from imago_fusion.providers.gemini import _file_uri_with_key
         self.assertEqual(
             _file_uri_with_key("https://example.invalid/v1beta/files/abc", "k1"),
             "https://example.invalid/v1beta/files/abc?key=k1",

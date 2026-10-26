@@ -1,1 +1,1 @@
-"""Imago stateful application services."""
+"""IMAGO·FUSION stateful application services."""

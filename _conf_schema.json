@@ -29,22 +29,48 @@
               "openai_chat",
               "gemini_official",
               "dashscope_multimodal",
-              "custom_endpoint"
+              "custom_endpoint",
+              "astrbot_native"
             ],
             "default": "openai_image",
-            "hint": "openai_image=OpenAI images；openai_chat=chat/completions；gemini_official=Gemini；dashscope_multimodal=百炼；custom_endpoint=Imago JSON。"
+            "hint": "openai_image=OpenAI images；openai_chat=chat/completions；gemini_official=Gemini（反代填 `http://host:端口/v1beta`）；dashscope_multimodal=百炼；custom_endpoint=IMAGO·FUSION JSON；astrbot_native=走 AstrBot 已配置的原生 Provider（反代网页端出图，节点无需 base_url/api_keys）。"
           },
           "base_url": {
             "description": "接口地址",
             "type": "string",
             "default": "",
-            "hint": "OpenAI 填 `https://host/v1`；Gemini 填 `https://generativelanguage.googleapis.com/v1beta`；百炼/custom 填可直接 POST 的完整 URL。"
+            "hint": "OpenAI 填 `https://host/v1`；Gemini 填 `https://generativelanguage.googleapis.com/v1beta`（本地反代必须带 /v1beta，否则 404）；百炼/custom 填可直接 POST 的完整 URL。astrbot_native 节点可留空。"
           },
           "api_keys": {
             "description": "API Keys（每行一个）",
             "type": "list",
             "default": [],
-            "hint": "多行填写多个 Key，每行一个；每个节点内按调用顺序轮换，不随机挑选。"
+            "hint": "多行填写多个 Key，每行一个；每个节点内按调用顺序轮换，不随机挑选。astrbot_native 节点可留空（鉴权在 AstrBot Provider 侧）。"
+          },
+          "astrbot_provider_id": {
+            "description": "原生 Provider（仅 astrbot_native 生效）",
+            "type": "string",
+            "default": "",
+            "_special": "select_provider",
+            "hint": "选择 AstrBot 已配置的 Chat Provider，如 cpa_Gemini/web-gemini-image。它自带上游地址与密钥，本节点无需填 base_url/api_keys。"
+          },
+          "stream": {
+            "description": "流式请求（仅 astrbot_native 生效）",
+            "type": "bool",
+            "default": false,
+            "hint": "开启后走 provider.text_chat_stream 逐帧提取图片；部分中转的流式图片帧不兼容，失败时请关闭。"
+          },
+          "enable_proxy": {
+            "description": "启用出站代理（HTTP 直连节点）",
+            "type": "bool",
+            "default": false,
+            "hint": "仅 HTTP 直连节点生效，走插件级的「出站代理地址」；astrbot_native 的代理由 AstrBot provider_source 决定，本开关对它无效。本地反代（127.0.0.1）不要开。"
+          },
+          "fallback_order": {
+            "description": "回退顺序（可选）",
+            "type": "int",
+            "default": 0,
+            "hint": "数字小的先试，同值按列表顺序；WebUI 选定的主节点永远第一个尝试。留 0 表示按列表顺序。"
           },
           "model": {
             "description": "默认模型",
@@ -83,7 +109,7 @@
   "optimizer_config": {
     "description": "Persona 副脑与识图",
     "type": "object",
-    "hint": "使用副脑优化画面并按需识图；副脑按「成像基准 + 堆砌」两层补写画面（基准由插件裁决，学派/题材/效果/形态按用户措辞叠加）。generate_image 是否经过副脑由「普通绘图也走副脑」控制，/画 指令始终直接出图。",
+    "hint": "使用副脑优化画面并按需识图；副脑按「成像基准 + 堆砌」两层补写画面（基准由插件裁决，学派/题材/效果/形态按用户措辞叠加）。generate_fusion_image 是否经过副脑由「普通绘图也走副脑」控制，/f画 指令始终直接出图。",
     "items": {
       "enable_optimizer": {
         "description": "启用副脑优化",
@@ -138,7 +164,7 @@
         "description": "普通绘图也走副脑",
         "type": "bool",
         "default": false,
-        "hint": "只决定 generate_image 是否也经过副脑整理画面（开启后多一次副脑 LLM 调用，与出图共用任务超时预算）；不改变风格裁决规则。关闭时普通绘图与 /画 一样直接把描述交给图片模型。Persona 出镜任务不受本开关影响（副脑总开关开启时始终经副脑）；/画 指令始终直接出图。"
+        "hint": "只决定 generate_fusion_image 是否也经过副脑整理画面（开启后多一次副脑 LLM 调用，与出图共用任务超时预算）；不改变风格裁决规则。关闭时普通绘图与 /f画 一样直接把描述交给图片模型。Persona 出镜任务不受本开关影响（副脑总开关开启时始终经副脑）；/f画 指令始终直接出图。"
       },
       "fallback_style_injection": {
         "description": "副脑降级时注入风格后缀",
@@ -187,7 +213,7 @@
         "description": "启用签到额度",
         "type": "bool",
         "default": false,
-        "hint": "启用后可用 /imago quota sign 每日领取一次随机额度。"
+        "hint": "启用后可用 /imago_fusion quota sign 每日领取一次随机额度。"
       },
       "daily_checkin_quota_min": {
         "description": "每日签到额度下限",
@@ -218,7 +244,7 @@
         "description": "LLM 调用重试次数",
         "type": "int",
         "default": 1,
-        "hint": "imago 发起的 LLM 调用（副脑/摘要/识图/配文）可重试错误的最大尝试次数（含首次），范围 1-5；AstrBot 全局默认 5 次。"
+        "hint": "IMAGO·FUSION 发起的 LLM 调用（副脑/摘要/识图/配文）可重试错误的最大尝试次数（含首次），范围 1-5；AstrBot 全局默认 5 次。"
       },
       "max_concurrent_tasks": {
         "description": "最大并发任务数",
@@ -255,7 +281,7 @@
   "storage_config": {
     "description": "图片存储与网络安全",
     "type": "object",
-    "hint": "控制参考图、临时缓存和远程图片下载；数据写入 AstrBot 的 imago 数据目录。",
+    "hint": "控制参考图、临时缓存和远程图片下载；数据写入 AstrBot 的 imago_fusion 数据目录。",
     "items": {
       "max_upload_mb": {
         "description": "单张参考图上限（MB）",
@@ -273,8 +299,20 @@
         "description": "阻止私网图片 URL",
         "type": "bool",
         "default": true,
-        "hint": "拒绝 localhost、回环、局域网等非公网地址；仅在确需内网图片时关闭。"
+        "hint": "拒绝 localhost、回环、局域网等非公网地址；仅在确需内网图片时关闭。注意：本开关只约束参考图/结果图的下载，不影响节点 base_url（本地反代仍可用）。"
       }
     }
+  },
+  "proxy_url": {
+    "description": "出站代理地址（HTTP 直连节点）",
+    "type": "string",
+    "default": "",
+    "hint": "供节点上「启用出站代理」使用，形如 http://127.0.0.1:7890；留空表示直连。原生 Provider 节点不使用本地址（它走 AstrBot provider_source 的 proxy）。"
+  },
+  "template_override": {
+    "description": "允许 `模板名/模型名` 覆写主节点模型（不推荐开启）",
+    "type": "bool",
+    "default": false,
+    "hint": "默认关闭，不推荐开启：该语法与 AstrBot 原生 provider id 形态相同（都含 `/`），命名碰撞会改变主节点的实际去向。开启后主节点可写成 `模板名/模型名` 覆写该模板的模型；判据要求 `/` 前确实是已配置的模板名，因此 cpa_Gemini/web-gemini-image 这类原生 id 不会被误当作覆写。碰撞守卫：若模板名与某个 astrbot_native 节点 id 完全相同，会记 WARNING 并跳过覆写（保留原生路由）。更推荐用节点的「备选模型列表」做模型回退。"
   }
 }

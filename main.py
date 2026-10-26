@@ -26,6 +26,7 @@ except ImportError:  # AstrBot 旧版本仅处理 Reply.chain 内嵌图片
 
 from .core.commands import GreedyStr
 from .core.config import (
+    matches_template,
     load_config,
     optimizer_in_use,
     persona_provider_settings,
@@ -36,6 +37,7 @@ from .core.errors import DuplicateRequest, QuotaError, safe_creation_error_messa
 from .core.models import DrawTask, GenerationRequest, ImageInput, ImageResult, TaskStage, TaskState
 from .core.network import fetch_reference, materialize_result
 from .core.references import ReferencePlanner, quoted_reply_missing_images
+from .core import runtime
 from .core.prompting import (
     REFERENCE_CAPTION_SYSTEM,
     STYLE_AUTO,
@@ -70,8 +72,8 @@ PENDING_PHOTO = "📸 正在为当前人设「{persona}」拍摄，请稍后…�
 FOREGROUND_REFERENCE_TIMEOUT = 30.0
 
 
-@register("imago", "Wolfycz", "异步图片生成与 Persona 素材管理", "1.2.0")
-class Imago(Star):
+@register("imago_fusion", "Wolfycz", "IMAGO·FUSION：映相骨架 + AstrBot 原生 Provider（反代网页端）绘图", "1.0.0")
+class ImagoFusion(Star):
     _STAGE_LABELS = {
         TaskStage.QUEUED: "排队中",
         TaskStage.PREPARING_REFERENCES: "正在准备参考图",
@@ -102,7 +104,7 @@ class Imago(Star):
         self.session = None
         self.scheduler = None
         self.sender = ProactiveSender(context, self._decorate_error, self._debug)
-        data_dir = Path(StarTools.get_data_dir("imago"))
+        data_dir = Path(StarTools.get_data_dir("imago_fusion"))
         self.store = PersonaStore(
             data_dir,
             lambda: load_config(self.raw_config).max_upload_bytes,
@@ -135,26 +137,29 @@ class Imago(Star):
             try:
                 save_fn()
             except Exception:
-                logger.warning("[Imago] providers 模板键补齐已应用，但落盘失败（仅本次运行生效）")
+                logger.warning("[ImagoFusion] providers 模板键补齐已应用，但落盘失败（仅本次运行生效）")
 
     async def initialize(self):
         self._migrate_provider_template_keys()
+        # 原生路线的适配器需要 context / DEBUG 日志 / Provider 失败行，这三样由插件
+        # 类提供；注入到 core.runtime 容器，调度器构造适配器时保持既有签名不变。
+        runtime.configure(context=self.context, debug=self._debug, error_reporter=self._provider_error)
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=15))
         self.scheduler = TaskScheduler(lambda: load_config(self.raw_config), self.session, self._finish_task, self._provider_error, self._scheduler_debug)
         api = PageAPI(self)
         for route, handler, methods, desc in (
-            ("/imago/personas", api.personas, ["GET"], "获取 Persona 列表"),
-            ("/imago/detail", api.detail, ["GET"], "获取 Persona 素材详情"),
-            ("/imago/upload", api.upload, ["POST"], "上传 Persona 参考图"),
-            ("/imago/delete", api.delete, ["POST"], "删除 Persona 参考图"),
-            ("/imago/preview", api.preview, ["GET"], "预览 Persona 参考图"),
-            ("/imago/rebuild", api.rebuild, ["POST"], "重建 Persona 外观摘要"),
-            ("/imago/summary", api.set_summary, ["POST"], "手工覆写 Persona 外观摘要"),
-            ("/imago/providers", api.providers, ["GET"], "获取图片节点与当前主节点"),
-            ("/imago/providers/primary", api.set_primary_provider, ["POST"], "设置主图片生成节点"),
-            ("/imago/providers/save", api.save_providers, ["POST"], "保存图片节点配置"),
-            ("/imago/quotas", api.quotas, ["GET"], "获取绘图额度列表"),
-            ("/imago/quotas/save", api.save_quotas, ["POST"], "保存绘图额度列表"),
+            ("/imago_fusion/personas", api.personas, ["GET"], "获取 Persona 列表"),
+            ("/imago_fusion/detail", api.detail, ["GET"], "获取 Persona 素材详情"),
+            ("/imago_fusion/upload", api.upload, ["POST"], "上传 Persona 参考图"),
+            ("/imago_fusion/delete", api.delete, ["POST"], "删除 Persona 参考图"),
+            ("/imago_fusion/preview", api.preview, ["GET"], "预览 Persona 参考图"),
+            ("/imago_fusion/rebuild", api.rebuild, ["POST"], "重建 Persona 外观摘要"),
+            ("/imago_fusion/summary", api.set_summary, ["POST"], "手工覆写 Persona 外观摘要"),
+            ("/imago_fusion/providers", api.providers, ["GET"], "获取图片节点与当前主节点"),
+            ("/imago_fusion/providers/primary", api.set_primary_provider, ["POST"], "设置主图片生成节点"),
+            ("/imago_fusion/providers/save", api.save_providers, ["POST"], "保存图片节点配置"),
+            ("/imago_fusion/quotas", api.quotas, ["GET"], "获取绘图额度列表"),
+            ("/imago_fusion/quotas/save", api.save_quotas, ["POST"], "保存绘图额度列表"),
         ):
             self.context.register_web_api(route, handler, methods, desc)
 
@@ -195,8 +200,8 @@ class Imago(Star):
             if decision is None or decision.allowed:
                 return
         if req.func_tool is not None:
-            req.func_tool.remove_tool("generate_image")
-            req.func_tool.remove_tool("generate_persona_image")
+            req.func_tool.remove_tool("generate_fusion_image")
+            req.func_tool.remove_tool("generate_fusion_persona_image")
 
     @staticmethod
     def _quota_target_user_id(event: AstrMessageEvent, target: str) -> str:
@@ -225,16 +230,16 @@ class Imago(Star):
     def _log_prefix(self, event=None):
         if load_config(self.raw_config).log_with_bot_id and event is not None:
             try:
-                return f"[Imago][platform:{event.get_platform_id()}]"
+                return f"[ImagoFusion][platform:{event.get_platform_id()}]"
             except Exception:
                 pass
-        return "[Imago]"
+        return "[ImagoFusion]"
 
     def _provider_error(self, provider, exc, task):
         logger.warning("%s 模型失败 type=%s node=%s model=%s status=%s detail=%s", self._log_prefix(task.runtime.get("source_event")), type(exc).__name__, provider.id, provider.model, getattr(exc, "status", None), redact(str(exc)))
 
     def _decorate_error(self, message, exc):
-        logger.error("[Imago] %s: %s", message, redact(str(exc)))
+        logger.error("[ImagoFusion] %s: %s", message, redact(str(exc)))
 
     @staticmethod
     def _safe_creation_error(exc: Exception) -> str:
@@ -305,7 +310,7 @@ class Imago(Star):
             provider_id = await self.context.get_current_chat_provider_id(umo)
         if not provider_id: raise RuntimeError("无可用 Chat Provider")
         self._debug(
-            "[Imago] LLM请求 purpose=%s provider=%s images=%d system=%s input=%s",
+            "[ImagoFusion] LLM请求 purpose=%s provider=%s images=%d system=%s input=%s",
             purpose, redact_debug(provider_id), len(image_urls or []), redact_debug(system), redact_debug(prompt),
         )
         result = await self.context.llm_generate(
@@ -317,7 +322,7 @@ class Imago(Star):
         )
         text = getattr(result, "completion_text", None) or getattr(result, "text", None) or str(result)
         text = " ".join(text.split())
-        self._debug("[Imago] LLM响应 purpose=%s provider=%s output=%s", purpose, redact_debug(provider_id), redact_debug(text))
+        self._debug("[ImagoFusion] LLM响应 purpose=%s provider=%s output=%s", purpose, redact_debug(provider_id), redact_debug(text))
         return text
 
     async def get_persona_prompt(self, persona_id: str) -> str:
@@ -365,7 +370,7 @@ class Imago(Star):
                 summary = await self._chat(umo, SUMMARY_SYSTEM, summary_input, purpose="persona_summary_with_vision")
                 return summary
             except Exception as exc:
-                self._debug("[Imago] 多模态外观摘要失败，回退纯文本 type=%s", type(exc).__name__)
+                self._debug("[ImagoFusion] 多模态外观摘要失败，回退纯文本 type=%s", type(exc).__name__)
         summary_input = summary_user_prompt(prompt)
         return await self._chat(umo, SUMMARY_SYSTEM, summary_input, purpose="persona_summary_text")
 
@@ -426,9 +431,9 @@ class Imago(Star):
         后台延迟解析。
 
         `style` 是主 LLM 传的风格参数，`plain_draw_tool` 标记本次调用来自
-        generate_image 工具（普通绘图据此走副脑逻辑；Persona 出镜任务本就按副脑
+        generate_fusion_image 工具（普通绘图据此走副脑逻辑；Persona 出镜任务本就按副脑
         配置处理，不需要该标记）。两者最终是否生效由 `_prepare` 里的
-        `resolve_style` 与配置裁决，`/画` 指令两者都不传。
+        `resolve_style` 与配置裁决，`/f画` 指令两者都不传。
         """
         if not prompt.strip(): raise ValueError("提示词不能为空")
         count = max(1, min(4, int(count)))
@@ -666,7 +671,7 @@ class Imago(Star):
         """ref-upload 路径：事件阶段接管明确 Image 组件并按来源分类（复用 ReferencePlanner）。
 
         本地路径/file: 直接读入；data:/base64:// 立即解码；HTTP(S) 走
-        ``fetch_reference``（含 imago 自身 SSRF 校验与大小限制），不调用 converter；
+        ``fetch_reference``（含 imago_fusion 自身 SSRF 校验与大小限制），不调用 converter；
         仅裸文件名 / 无可用来源才用 ``convert_to_file_path()`` 接管，且 converter 结果
         必须本地读取，HTTP 绝不交给 converter。引用消息的远程/OneBot fallback 保留
         extractor 路径。严格失败不吞掉。
@@ -872,9 +877,9 @@ class Imago(Star):
                 persona_references.append(ImageInput(path.read_bytes(), mime, path.name))
             task.runtime["persona_references"] = persona_references
         elif use_optimizer:
-            # 普通绘图经副脑（generate_image 且「普通绘图也走副脑」开启，见
+            # 普通绘图经副脑（generate_fusion_image 且「普通绘图也走副脑」开启，见
             # core/config.optimizer_in_use）：副脑按解析出的成像基准整理画面；
-            # 降级时保留原始描述。/画 指令与开关关闭时不进这里，直接出图。
+            # 降级时保留原始描述。/f画 指令与开关关闭时不进这里，直接出图。
             self.scheduler.set_stage(task, TaskStage.OPTIMIZING_PROMPT)
             scene = task.request.prompt
             if ref_caption:
@@ -1190,9 +1195,12 @@ class Imago(Star):
         output_paths = []
         task.runtime["provider_output_count"] = len(results)
         output_dir = self.store.task_output_dir(task.id)
+        # 循环外取一次配置：load_config 会重建全部节点对象，放在逐图循环里会让
+        # N 张图产生 2N 次全量解析。
+        result_cfg = load_config(self.raw_config)
         for result in results:
             try:
-                value = await materialize_result(self.session, result, output_dir, max_bytes=load_config(self.raw_config).max_upload_bytes, block_private=load_config(self.raw_config).block_private_networks)
+                value = await materialize_result(self.session, result, output_dir, max_bytes=result_cfg.max_upload_bytes, block_private=result_cfg.block_private_networks)
                 if isinstance(value, Path): output_paths.append(value)
                 chain.append(Image.fromFileSystem(str(value)) if isinstance(value, Path) else Image.fromURL(value))
                 self._debug("%s task=%s 生成结果已落盘 index=%d bytes=%d", self._log_prefix(task.runtime.get("source_event")), task.id[:8], len(chain), value.stat().st_size if isinstance(value, Path) else 0)
@@ -1439,18 +1447,18 @@ class Imago(Star):
         active = set(self.scheduler.tasks) if self.scheduler else set()
         self.store.prune_task_cache(load_config(self.raw_config).temp_cache_bytes, protected=active)
 
-    @filter.command_group("imago")
-    def imago_group(self): pass
+    @filter.command_group("imago_fusion")
+    def imago_fusion_group(self): pass
 
-    @imago_group.group("quota")
+    @imago_fusion_group.group("quota")
     def quota_group(self): pass
 
     @quota_group.command("help")
     async def quota_help(self, event: AstrMessageEvent):
         text = (
-            "/imago quota show：查看自己的额度\n"
-            "/imago quota sign：每日签到领取额度\n"
-            "/imago quota add/del/set <用户 ID> <整数>：管理员调整额度"
+            "/imago_fusion quota show：查看自己的额度\n"
+            "/imago_fusion quota sign：每日签到领取额度\n"
+            "/imago_fusion quota add/del/set <用户 ID> <整数>：管理员调整额度"
         )
         yield event.plain_result(text)
 
@@ -1517,44 +1525,44 @@ class Imago(Star):
         text = await self._quota_admin_adjust(event, "set", target, amount)
         yield event.plain_result(text)
 
-    @imago_group.command("help")
+    @imago_fusion_group.command("help")
     async def help_command(self, event: AstrMessageEvent):
         lines = [
-            "🖼️ IMAGO·映相 指令帮助",
+            "🖼️ IMAGO·FUSION 指令帮助",
             "",
             "[开始绘图]",
-            "- /imago draw <画面描述>  普通绘图或参考图改图",
-            "- /画 <画面描述>  普通绘图快捷入口",
-            "- /imago photo <画面要求>  让当前人设出镜",
-            "- /拍照 <画面要求>  人设出镜快捷入口",
+            "- /imago_fusion draw <画面描述>  普通绘图或参考图改图",
+            "- /f画 <画面描述>  普通绘图快捷入口",
+            "- /imago_fusion photo <画面要求>  让当前人设出镜",
+            "- /f拍照 <画面要求>  人设出镜快捷入口",
             "",
             "[任务与额度]",
-            "- /imago status  查看正在处理或刚结束的任务",
-            "- /imago quota show  查看自己的绘图额度",
-            "- /imago quota sign  每日签到领取额度",
+            "- /imago_fusion status  查看正在处理或刚结束的任务",
+            "- /imago_fusion quota show  查看自己的绘图额度",
+            "- /imago_fusion quota sign  每日签到领取额度",
             "",
             "[Persona 素材]",
-            "- /imago ref-upload  为当前人设上传参考图（同条消息附图）",
-            "- /imago summary-show  查看当前人设外观摘要",
-            "- /imago summary-rebuild  重新生成外观摘要",
-            "- /imago summary-set <外观摘要>  手工设置外观摘要",
+            "- /imago_fusion ref-upload  为当前人设上传参考图（同条消息附图）",
+            "- /imago_fusion summary-show  查看当前人设外观摘要",
+            "- /imago_fusion summary-rebuild  重新生成外观摘要",
+            "- /imago_fusion summary-set <外观摘要>  手工设置外观摘要",
             "",
             "[图片节点]",
-            "- /imago provider-primary <节点 ID>  设置主节点（也可在 WebUI 设置）",
+            "- /imago_fusion provider-primary <节点 ID>  设置主节点（也可在 WebUI 设置）",
         ]
         if event.is_admin():
             lines.extend([
                 "",
                 "[Bot 管理员]",
-                "- /imago quota add <用户 ID> <整数>  增加额度",
-                "- /imago quota del <用户 ID> <整数>  扣除额度",
-                "- /imago quota set <用户 ID> <整数>  设置额度",
+                "- /imago_fusion quota add <用户 ID> <整数>  增加额度",
+                "- /imago_fusion quota del <用户 ID> <整数>  扣除额度",
+                "- /imago_fusion quota set <用户 ID> <整数>  设置额度",
             ])
         lines.extend([
             "",
             "[示例]",
-            "- /画 雨夜街头的橘猫，电影感，横幅构图",
-            "- /拍照 在海边回头看向镜头，黄昏逆光",
+            "- /f画 雨夜街头的橘猫，电影感，横幅构图",
+            "- /f拍照 在海边回头看向镜头，黄昏逆光",
         ])
 
         md_text = "\n".join(lines)
@@ -1569,16 +1577,16 @@ class Imago(Star):
             )
             yield event.plain_result(md_text)
 
-    @imago_group.command("status")
+    @imago_fusion_group.command("status")
     async def status_command(self, event: AstrMessageEvent):
         tasks = self._tasks_for_event(event)
         if not tasks:
-            yield event.plain_result("当前没有正在处理或刚刚结束的映相任务。")
+            yield event.plain_result("当前没有正在处理或刚刚结束的 IMAGO·FUSION 任务。")
             return
-        text = "当前映相任务：\n" + "\n".join(self._task_status_lines(tasks)) + "\n不提供准确完成时间。"
+        text = "当前 IMAGO·FUSION 任务：\n" + "\n".join(self._task_status_lines(tasks)) + "\n不提供准确完成时间。"
         yield event.plain_result(text)
 
-    @imago_group.command("draw")
+    @imago_fusion_group.command("draw")
     async def draw_command(self, event: AstrMessageEvent, prompt: GreedyStr):
         try:
             await self._submit(event, prompt)
@@ -1586,7 +1594,7 @@ class Imago(Star):
         except Exception as exc:
             yield event.plain_result(f"无法创建任务：{self._safe_creation_error(exc)}")
 
-    @imago_group.command("photo")
+    @imago_fusion_group.command("photo")
     async def photo_command(self, event: AstrMessageEvent, action: GreedyStr):
         try:
             resolved_persona = await self._resolve_persona(event)
@@ -1595,15 +1603,15 @@ class Imago(Star):
         except Exception as exc:
             yield event.plain_result(f"无法创建任务：{self._safe_creation_error(exc)}")
 
-    @filter.command("画")
+    @filter.command("f画")
     async def draw_shortcut(self, event: AstrMessageEvent, prompt: GreedyStr):
         async for result in self.draw_command(event, prompt): yield result
 
-    @filter.command("拍照")
+    @filter.command("f拍照")
     async def photo_shortcut(self, event: AstrMessageEvent, action: GreedyStr):
         async for result in self.photo_command(event, action): yield result
 
-    @imago_group.command("summary-show")
+    @imago_fusion_group.command("summary-show")
     async def summary_show(self, event: AstrMessageEvent):
         try:
             persona_id, prompt = await self._resolve_persona(event); item = self.store.get_summary(persona_id, prompt)
@@ -1611,7 +1619,7 @@ class Imago(Star):
         except Exception as exc:
             yield event.plain_result(self._safe_creation_error(exc))
 
-    @imago_group.command("summary-rebuild")
+    @imago_fusion_group.command("summary-rebuild")
     async def summary_rebuild(self, event: AstrMessageEvent):
         try:
             persona_id, _ = await self._resolve_persona(event)
@@ -1620,7 +1628,7 @@ class Imago(Star):
         except Exception as exc:
             yield event.plain_result(self._safe_creation_error(exc))
 
-    @imago_group.command("summary-set")
+    @imago_fusion_group.command("summary-set")
     async def summary_set(self, event: AstrMessageEvent, summary: GreedyStr):
         try:
             persona_id, prompt = await self._resolve_persona(event)
@@ -1629,7 +1637,7 @@ class Imago(Star):
         except Exception as exc:
             yield event.plain_result(self._safe_creation_error(exc))
 
-    @imago_group.command("ref-upload")
+    @imago_fusion_group.command("ref-upload")
     async def ref_upload(self, event: AstrMessageEvent):
         try:
             persona_id, _ = await self._resolve_persona(event)
@@ -1641,24 +1649,27 @@ class Imago(Star):
         except Exception as exc:
             yield event.plain_result(self._safe_creation_error(exc))
 
-    @imago_group.command("provider-primary")
+    @imago_fusion_group.command("provider-primary")
     async def provider_primary(self, event: AstrMessageEvent, provider_id: str):
-        configured = [item.id for item in load_config(self.raw_config).providers]
+        cfg = load_config(self.raw_config)
+        configured = [item.id for item in cfg.providers]
         provider_id = provider_id.strip()
-        if provider_id not in configured:
+        if provider_id not in configured and not matches_template(
+            list(cfg.providers), provider_id, enabled=cfg.template_override
+        ):
             yield event.plain_result(f"节点不存在。已配置节点：{', '.join(configured) or '无'}")
             return
         self.store.set_primary_provider_id(provider_id)
         yield event.plain_result(f"已将主图片生成节点设为 {provider_id}；其他节点将按配置顺序 fallback。")
 
-    @filter.llm_tool(name="generate_image")
-    async def generate_image(self, event: AstrMessageEvent, prompt: str, count: int = 1, aspect_ratio: str = "", size: str = "", extra_params: str = "", style: str = ""):
+    @filter.llm_tool(name="generate_fusion_image")
+    async def generate_fusion_image(self, event: AstrMessageEvent, prompt: str, count: int = 1, aspect_ratio: str = "", size: str = "", extra_params: str = "", style: str = ""):
         """
         当用户当前消息明确提出新生成、绘制、改图或重绘一张图片，且当前会话 Persona 本人不需要出现在画面中时，必须调用本工具。
         不要只用文字描述成图、假装已经画好，或在未成功创建任务时声称稍后会发图。历史中已经创建过、正在处理的画面绝对不要重复调用本工具：同一条用户消息里重复调用会被忽略，用户另发消息重复提交仍会再次扣费并生成重复图片，工具只负责创建任务，图片会由插件后台完成后另行发送。
 
         适用于场景、物品、海报/报纸/截图这类载体画面、非当前会话 Persona 角色或其他普通图片。
-        当前会话 Persona 本人需要出镜时应改用 generate_persona_image。
+        当前会话 Persona 本人需要出镜时应改用 generate_fusion_persona_image。
         用户只是讨论、评价或询问已有图片时不要调用。
         用户当前消息、引用消息及消息正文中可访问的 HTTP/HTTPS 图片会自动作为本轮参考图；
         插件会等待这些图片完成本地化后再请求图片节点。本轮存在参考图时，prompt 必须明确
@@ -1688,14 +1699,14 @@ class Imago(Star):
         except Exception as exc:
             return f"后台绘图任务未能创建。可告知用户的原因：{self._safe_creation_error(exc)}。请以当前 Persona 的语气简短说明失败，不要虚构任务已开始或图片已生成。"
 
-    @filter.llm_tool(name="generate_persona_image")
-    async def generate_persona_image(self, event: AstrMessageEvent, action: str, count: int = 1, aspect_ratio: str = "", size: str = "", extra_params: str = "", camera: str = "", style: str = ""):
+    @filter.llm_tool(name="generate_fusion_persona_image")
+    async def generate_fusion_persona_image(self, event: AstrMessageEvent, action: str, count: int = 1, aspect_ratio: str = "", size: str = "", extra_params: str = "", camera: str = "", style: str = ""):
         """
         当用户当前消息明确提出让当前会话 Persona 自拍、拍照、发一张本人照片、以图片展示动作或场景、合影，或以其他方式本人出镜时，必须调用本工具。
         不要只用文字扮演拍照、假装已经拍好，或在未成功创建任务时声称稍后会发照片。历史中已经创建过、正在处理的画面绝对不要重复调用本工具：同一条用户消息里重复调用会被忽略，用户另发消息重复提交仍会再次扣费并生成重复图片，工具只负责创建任务，图片会由插件后台完成后另行发送。
 
         适用于自拍、他拍、第三人称场景照、全身照、特写、合影或其他需要当前 Persona 出镜的画面。
-        当前会话 Persona 本人不需要出镜的普通绘图应改用 generate_image。
+        当前会话 Persona 本人不需要出镜的普通绘图应改用 generate_fusion_image。
         用户只是讨论、评价或询问已有照片时不要调用。
         不要在 action 中重复 Persona 的稳定外貌；插件会自动加入外观摘要和 Persona 固定参考图。
         用户当前消息、引用消息及消息正文中可访问的 HTTP/HTTPS 图片也会自动加入本轮参考图；
@@ -1731,3 +1742,5 @@ class Imago(Star):
     async def terminate(self):
         if self.scheduler: await self.scheduler.close()
         if self.session: await self.session.close()
+        # 卸载后不再持有 AstrBot context/日志回调，避免热重载残留引用。
+        runtime.reset()

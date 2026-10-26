@@ -58,6 +58,20 @@ class ProviderConfig:
     reference_image_limit: int = 0
     default_size: str = "1024x1024"
     timeout: int = 180
+    # AstrBot chat provider id used by ``astrbot_native`` nodes, e.g.
+    # ``cpa_Gemini/web-gemini-image``. That provider owns the real key, so such a
+    # node needs neither ``base_url`` nor ``api_keys``.
+    astrbot_provider_id: str = ""
+    # ``astrbot_native`` only: use ``provider.text_chat_stream`` instead of
+    # ``context.llm_generate``.
+    stream: bool = False
+    # HTTP direct nodes only: route the request through the plugin-wide outbound
+    # proxy from ``proxy_url``. Meaningless for ``astrbot_native`` (the AstrBot
+    # provider decides its own proxy) and harmful for a local reverse proxy.
+    enable_proxy: bool = False
+    # Smallest value is tried first during fallback; the primary node selected in
+    # the WebUI always stays first.
+    fallback_order: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -95,6 +109,12 @@ class RuntimeConfig:
     temp_cache_bytes: int = 512 * 1024 * 1024
     block_private_networks: bool = True
     log_with_bot_id: bool = False
+    # Outbound proxy applied to ``enable_proxy`` HTTP nodes; empty = direct.
+    proxy_url: str = ""
+    # Allow ``template/model`` model overrides on the primary node. Kept behind a
+    # switch because such a string is also a valid AstrBot provider id
+    # (``cpa_Gemini/web-gemini-image``); see ``core/config.py``.
+    template_override: bool = False
 
 
 @dataclass(slots=True)

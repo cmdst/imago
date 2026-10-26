@@ -155,12 +155,12 @@ class ProactiveSender:
             event_type,
             plugins_name=getattr(event, "plugins_name", None),
         )
-        self.debug("[Imago] 主动发送 Hook event=%s handlers=%d", event_type.name, len(handlers))
+        self.debug("[ImagoFusion] 主动发送 Hook event=%s handlers=%d", event_type.name, len(handlers))
         if not handlers and event_type == EventType.OnDecoratingResultEvent:
             # 一个装饰器都没命中：插件白名单（event.plugins_name）或激活状态把
             # 依赖装饰链捕获的插件（如 ChatMemory）过滤掉了，主动发送将绕过它们。
             astrbot_logger.warning(
-                "[Imago] 主动发送未命中任何 on_decorating_result 处理器 "
+                "[ImagoFusion] 主动发送未命中任何 on_decorating_result 处理器 "
                 f"(plugins_name={event.plugins_name})，依赖装饰链的插件将无法捕获本次发送"
             )
         for handler in handlers:
@@ -197,7 +197,7 @@ class ProactiveSender:
         result = event.get_result()
         processed = list(getattr(result, "chain", None) or [])
         self.debug(
-            "[Imago] 主动发送装饰完成 components=%d stopped=%s",
+            "[ImagoFusion] 主动发送装饰完成 components=%d stopped=%s",
             len(processed),
             event.is_stopped(),
         )
@@ -223,7 +223,7 @@ class ProactiveSender:
         if event.side_send_error:
             success = False
             error = error or f"SideSend:{event.side_send_error}"
-        self.debug("[Imago] 主动发送结束 success=%s error=%s", success, error or "none")
+        self.debug("[ImagoFusion] 主动发送结束 success=%s error=%s", success, error or "none")
         return SendOutcome(
             success,
             error,

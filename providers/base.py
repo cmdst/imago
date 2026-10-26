@@ -6,11 +6,22 @@ from typing import Any
 
 from ..core.errors import NoOutputError, UnsupportedResponse
 from ..core.models import GenerationRequest, ImageResult, ProviderConfig
+from ..core.network import detect_image_mime
 
 
 class ProviderAdapter(ABC):
-    def __init__(self, config: ProviderConfig):
+    """Base class for image provider adapters.
+
+    Attributes:
+        config: Frozen node configuration the adapter must honour.
+        context: AstrBot plugin context, or None. Only
+            :class:`~imago_fusion.providers.native.NativeAdapter` uses it (to call
+            an AstrBot provider); HTTP adapters ignore it.
+    """
+
+    def __init__(self, config: ProviderConfig, *, context: Any = None) -> None:
         self.config = config
+        self.context = context
 
     @abstractmethod
     async def generate(self, session: Any, request: GenerationRequest, api_key: str) -> list[ImageResult]: ...
@@ -30,9 +41,18 @@ class ProviderAdapter(ABC):
                 results.append(ImageResult(url=url))
             elif isinstance(encoded, str) and encoded:
                 try:
-                    results.append(ImageResult(data=base64.b64decode(encoded, validate=True)))
+                    data = base64.b64decode(encoded, validate=True)
                 except ValueError:
                     continue
+                # base64 结果没有 MIME 声明：按文件魔数判定，否则 JPEG/WEBP 字节会被
+                # 当成 image/png 落成 .png（materialize_result 按 mime_type 决定扩展名），
+                # 部分平台按扩展名处理时会拒绝或显示异常。识别失败才回落 image/png。
+                results.append(
+                    ImageResult(
+                        data=data,
+                        mime_type=detect_image_mime(data) or "image/png",
+                    )
+                )
         if not results:
             raise NoOutputError("响应中没有可识别的图片")
         return results

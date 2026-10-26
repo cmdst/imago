@@ -6,7 +6,7 @@ from collections.abc import Mapping
 
 from quart import jsonify, request
 
-from ..core.config import load_config
+from ..core.config import API_TYPES, load_config
 from ..core.errors import DuplicateImage
 
 
@@ -148,12 +148,18 @@ class PageAPI:
             provider_id = str(item.get("id", "")).strip()
             if not provider_id:
                 provider_id = f"未命名节点 {index + 1}"
+            api_type = str(item.get("api_type", ""))
+            native = api_type == "astrbot_native"
             keys = _line_items(item.get("api_keys", []))
             has_keys = bool(keys)
-            complete = bool(str(item.get("id", "")).strip() and str(item.get("base_url", "")).strip() and has_keys and provider_id not in seen)
+            astrbot_provider_id = str(item.get("astrbot_provider_id", "")).strip()
+            # 原生节点的必需项是 AstrBot provider id：base_url/api_keys 留空是正常配置，
+            # 旧判据会把这类节点显示成“不完整”，把用户往错误方向引导。
+            required = bool(astrbot_provider_id) if native else bool(str(item.get("base_url", "")).strip() and has_keys)
+            complete = bool(str(item.get("id", "")).strip() and required and provider_id not in seen)
             configured.append({
                 "id": provider_id,
-                "api_type": str(item.get("api_type", "")),
+                "api_type": api_type,
                 "model": str(item.get("model", "")),
                 "reference_image_limit": _safe_int(item.get("reference_image_limit"), 0, 0),
                 "available_models": [str(value) for value in (item.get("available_models", []) or [])],
@@ -161,6 +167,10 @@ class PageAPI:
                 "api_keys_configured": has_keys,
                 "default_size": str(item.get("default_size", "1024x1024")),
                 "timeout": _safe_int(item.get("timeout"), 180, 10),
+                "astrbot_provider_id": astrbot_provider_id,
+                "stream": bool(item.get("stream", False)),
+                "enable_proxy": bool(item.get("enable_proxy", False)),
+                "fallback_order": _safe_int(item.get("fallback_order"), 0),
                 "complete": complete,
             })
             seen.add(provider_id)
@@ -204,27 +214,37 @@ class PageAPI:
                 if not provider_id or provider_id in seen:
                     return _err("节点 ID 不能为空或重复")
                 api_type = str(item.get("api_type", "")).strip()
-                if api_type not in {"openai_image", "openai_chat", "gemini_official", "dashscope_multimodal", "custom_endpoint"}:
+                if api_type not in API_TYPES:
                     return _err(f"节点 {provider_id} 的接口类型无效")
                 old = old_by_id.get(provider_id, {})
                 submitted_keys = _line_items(item.get("api_keys", []))
                 stored_keys = _line_items(old.get("api_keys", []))
+                native = api_type == "astrbot_native"
+                astrbot_provider_id = str(item.get("astrbot_provider_id", "")).strip()
+                if native and not astrbot_provider_id:
+                    return _err(f"原生节点 {provider_id} 必须选择 AstrBot Provider")
                 saved.append({
                     "id": provider_id,
                     "api_type": api_type,
                     "base_url": str(item.get("base_url", "")).strip(),
-                    "api_keys": submitted_keys if submitted_keys else stored_keys,
+                    "api_keys": [] if native else (submitted_keys if submitted_keys else stored_keys),
                     "model": str(item.get("model", "")).strip(),
                     "reference_image_limit": max(0, int(item.get("reference_image_limit", 0) or 0)),
                     "available_models": [str(value).strip() for value in (item.get("available_models", []) or []) if str(value).strip()],
                     "default_size": str(item.get("default_size", "1024x1024")).strip(),
                     "timeout": max(10, int(item.get("timeout", 180) or 180)),
+                    # 原生路由字段；非原生节点不落盘，避免切换类型后残留旧 provider id。
+                    "astrbot_provider_id": astrbot_provider_id if native else "",
+                    "stream": bool(item.get("stream", False)) if native else False,
+                    "enable_proxy": bool(item.get("enable_proxy", False)),
+                    "fallback_order": int(item.get("fallback_order", 0) or 0),
                     # AstrBot 管理页校验 template_list 要求条目带模板键；
                     # WebUI 保存同样带上，保证两种 UI 数据互相兼容。
                     "__template_key": "provider",
                 })
                 seen.add(provider_id)
-            if primary and primary not in seen:
+            # ``template/model`` 覆写引用（开关开启时）命中模板前缀即合法。
+            if primary and primary not in seen and primary.partition("/")[0] not in seen:
                 return _err("主节点不在当前列表中")
             self.plugin.raw_config["providers"] = saved
             optimizer = self.plugin.raw_config.get("optimizer_config", {}) or {}
@@ -276,7 +296,7 @@ class PageAPI:
 
     async def set_primary_provider(self):
         # 目前 WebUI 走 providers/save 一并提交 primary_provider_id，本路由未被
-        # 前端调用；保留作为独立 API 入口（命令 /imago provider-primary 同功能）。
+        # 前端调用；保留作为独立 API 入口（命令 /imago_fusion provider-primary 同功能）。
         try:
             body = await request.get_json(force=True)
             provider_id = str((body or {}).get("provider_id", "")).strip()

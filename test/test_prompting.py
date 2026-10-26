@@ -1,6 +1,6 @@
 import unittest
 
-from imago.core.prompting import (
+from imago_fusion.core.prompting import (
     CAMERA_REQUEST_MARKER,
     BASIS_LABELS,
     STYLE_LLM_CHOICES,

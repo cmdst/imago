@@ -1,1 +1,1 @@
-"""Imago domain models, configuration, prompting and safety utilities."""
+"""IMAGO·FUSION domain models, configuration, prompting and safety utilities."""

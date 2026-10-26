@@ -7,7 +7,7 @@
 
 对本地不可读的明确 Image 组件按来源分类处理：
 - HTTP(S)：不调用 converter，进入 strict deferred，由后台
-  ``fetch_reference`` 执行逐跳 SSRF 校验与大小限制，避免绕过 imago 自身的
+  ``fetch_reference`` 执行逐跳 SSRF 校验与大小限制，避免绕过 imago_fusion 自身的
   远程下载策略；
 - ``data:``/``base64://``：事件阶段立即用 ``fetch_reference(None, ...)``
   解码接管（不需要 session），保留魔数识别与大小校验；
@@ -228,7 +228,7 @@ class ReferencePlanner:
                     )
                     if http_source is not None:
                         # 远程 URL 不在此处下载：交给后台 _resolve_deferred_references
-                        # -> fetch_reference，保留 imago 自身的 SSRF 校验和大小限制。
+                        # -> fetch_reference，保留 imago_fusion 自身的 SSRF 校验和大小限制。
                         deferred.append({"kind": "source", "source": http_source, "strict": True})
                         continue
                     inline_source = next(

@@ -1,226 +1,114 @@
-# IMAGO·映相
+# IMAGO·FUSION
 
-IMAGO·映相是 AstrBot 的异步图片生成插件，支持普通绘图、Persona 出镜、参考图、多节点/多模型 fallback、绘图额度和素材管理。
+IMAGO·FUSION 是 **IMAGO·映相** 骨架与 **大香蕉（astrbot_plugin_big_banana）AstrBot 原生 Provider 桥接** 的融合插件：保留映相的提示词优化、Persona 出镜、绘图额度、多节点 fallback 与素材管理，新增「走 AstrBot 已配置 Provider（反代 / 网页端模型）出图」的原生路由。
 
-- 版本：`1.1.6`
+- 版本：`1.0.0`（`metadata.yaml` / `__init__.py` / `main.py` 三处一致）
 - AstrBot：`>=4.16,<5`
+- 依赖：`aiohttp>=3.9,<4`（不引入 Pillow：插件侧不做格式转换）
+
+运行数据写入 AstrBot 分配的 `plugin_data/imago_fusion/`，**不读写** `plugin_data/imago/`（如需继承原插件的 Persona 素材，手工复制该目录）。
+
+## 与 IMAGO·映相 的关系
+
+| 项 | IMAGO·映相 (`imago`) | IMAGO·FUSION (`imago_fusion`) |
+| --- | --- | --- |
+| 命令组 | `/imago`、`/画`、`/拍照` | `/imago_fusion`、`/f画`、`/f拍照` |
+| LLM 工具 | `generate_image`、`generate_persona_image` | `generate_fusion_image`、`generate_fusion_persona_image` |
+| Web API | `/imago/*` | `/imago_fusion/*` |
+| 数据目录 | `plugin_data/imago/` | `plugin_data/imago_fusion/` |
+| 节点类型 | 5 种 HTTP 直连 | 5 种 HTTP 直连 + `astrbot_native`（原生 Provider） |
+| 出图路径 | HTTP 直连 | HTTP 直连 + AstrBot provider 路由（`llm_generate` / `text_chat_stream`） |
+
+两套命令、工具、路由、数据目录**全部不重名**，可以同时启用互不干扰；但两者语义高度重合，一般只需要启用其中一个。
 
 ## 安装
 
-将 `imago` 放入 AstrBot 插件目录并加载。依赖：
-
-```text
-aiohttp>=3.9,<4
-```
-
-运行数据写入 AstrBot 分配的 `plugin_data/imago/`，不写入源码目录。
+把 `imago_fusion` 放入 AstrBot 插件目录并加载，然后在管理台启用。
 
 ## 节点配置
 
-至少配置一个有效节点：节点 ID、接口类型、Base URL、API Key、模型、超时和默认尺寸。API Key 可逐行填写多个，每个节点独立按调用顺序轮换，不随机挑选。
+### 1. 原生路由节点（反代 / 网页端模型）
+
+先在 AstrBot「服务提供商」里配好一个 Chat Provider（例如 `cpa_Gemini/web-gemini-image`，它自带上游地址与密钥），再在插件里新增节点：
+
+| 字段 | 值 |
+| --- | --- |
+| 节点 ID | 任意唯一标识，如 `native_web_gemini` |
+| 接口类型 | `astrbot_native` |
+| 原生 Provider | `cpa_Gemini/web-gemini-image`（下拉选择，`_special: select_provider`） |
+| 流式 | 默认关闭；开启后走 `provider.text_chat_stream` |
+| Base URL / API Key | **留空**（鉴权与地址都由 AstrBot Provider 决定） |
+| 参考图总上限 | 建议显式设置，如 `14`；`0` 表示不限制 |
+
+原生路由的图片提取分两级（与设计契约 §2.4 一致）：
+
+1. `LLMResponse.result_chain` 里的 `Image` 组件（`url` 优先，其次 `file`）；
+2. 正文里的 Markdown 图片链接（`![alt](src)`，支持 `<...>` 包裹）。
+
+只接受 `http://`、`https://`、`data:image/`、`base64://` 四类引用；裸本地路径与 `file://` 一律跳过（避免 provider 消息链读宿主文件）。**适配器不解码、不下载、不判断格式**：引用统一交给 `core/network.py` 处理，体积上限、魔数校验与私网守卫都在那里。
+
+**出图张数（`count`）语义**：单次聊天调用通常只出 1 张图，因此适配器会**循环调用直至凑满 `count` 张不同引用，最多 4 次**；若 AstrBot Provider id 不存在，**立即中断本轮并让位给下一个节点 fallback**（错误的 id 重试也不会变对）。单次调用失败只记日志并继续；节点部分成功时返回已拿到的图片，不把整个任务判失败。
+
+### 2. HTTP 直连节点
+
+| 类型 | 地址示例 | 说明 |
+| --- | --- | --- |
+| `openai_image` | `https://api.example.com/v1` | images API / multipart |
+| `openai_chat` | `https://api.example.com/v1` | chat/completions |
+| `gemini_official` | `http://127.0.0.1:8317/v1beta` | generateContent；**本地反代必须带 `/v1beta`**，否则 404 |
+| `dashscope_multimodal` | 百炼完整 generation URL | MultiModal |
+| `custom_endpoint` | 自定义完整 POST URL | 插件自定义 JSON |
+
+- `api_keys` 支持逐行多个 Key，节点内**按调用顺序轮换**（不随机打乱），第 N 次尝试用第 N%K 个 Key。
+- `fallback_order`：数字小的先试，同值按列表顺序；WebUI 选定的主节点永远第一个尝试。
+- `enable_proxy`：仅 HTTP 直连节点生效，走全局「出站代理地址」；原生路由节点该开关无效（代理由 AstrBot provider_source 决定）。本地反代 `127.0.0.1` 不要开。
 
 调用顺序：
 
 ```text
-WebUI 选择的主节点默认模型 → 主节点备选模型 → 其他节点默认模型 → 其他节点备选模型
+主节点默认模型 → 主节点备选模型 → 其他节点默认模型 → 其他节点备选模型
 ```
 
-在 Plugin Page（WebUI）节点列表点击左侧图标并保存，即可切换主节点。未设置或所选节点无效时，第一个有效节点为主节点。同一节点的默认模型和备选模型必须使用同一协议与 Base URL；共用百炼 multimodal-generation 契约的 WAN 与 Qwen 可以放在同一节点。
+### 3. `模板名/模型名` 覆写（默认关闭，**不推荐开启**）
 
-### 接口类型
+`template_override` 开启后，主节点可以写成 `模板名/模型名` 覆写该模板的模型。判据要求 `/` 前**确实是已配置的模板名**，因此 AstrBot 原生 id（`cpa_Gemini/web-gemini-image`）不会被误当作覆写语法 —— 这是与大香蕉原实现的关键差异：原实现先按模板名查表再 `partition("/")`，只要用户建了一个与原生 id 前缀同名的模板，原生路由就会被静默换成「模板 base_url + 模板 key + 覆写模型名」。
 
-| 类型 | 地址示例 | 协议/参考图 |
-| --- | --- | --- |
-| `openai_image` | `https://api.example.com/v1` | images API / multipart |
-| `openai_chat` | `https://api.example.com/v1` | chat/completions / base64 |
-| `gemini_official` | `https://generativelanguage.googleapis.com/v1beta` | generateContent / `inlineData` |
-| `dashscope_multimodal` | 百炼完整 generation URL | MultiModal / data URL |
-| `custom_endpoint` | 自定义完整 POST URL | Imago JSON / base64 |
-
-有参考图时自动走图生图分支；否则走文生图。
-
-### 参考图总上限
-
-`reference_image_limit` 是本次请求的总参考图上限：消息中明确附带的图片优先占用名额，剩余名额再随机抽取 Persona 固定图。例如上限为 `3` 且用户带 `1` 张图时，最多取 `2` 张 Persona 图；`0` 表示不限制。节点的默认模型和备选模型共用此值。用户附图超过上限时不会丢弃，Provider 可能按自身限制拒绝请求。
+**不推荐开启**：该语法与 AstrBot 原生 provider id 形态相同（都含 `/`），一旦命名碰撞就会改变主节点的实际去向。插件已加碰撞守卫——若 `/` 前的模板名与某个 `astrbot_native` 节点 id **完全相同**，会记一条 WARNING 并**跳过覆写**，把引用留给原生节点解析（例如模板名写成 `cpa_Gemini` 而原生节点 id 就是 `cpa_Gemini`）。守卫只覆盖完全同名的情况，语义上仍建议用节点的 `available_models` 做模型回退，而不是依赖本开关。
 
 ## 命令
 
 | 命令 | 作用 |
 | --- | --- |
-| `/imago help` | 查看按用途和当前权限分组的帮助卡片；渲染失败时回退纯文本 |
-| `/imago draw <提示词>`、`/画 <提示词>` | 普通绘图 |
-| `/imago photo <画面要求>`、`/拍照 <画面要求>` | 当前 Persona 出镜 |
-| `/imago status` | 查看自己的任务 |
-| `/imago quota help/show/sign` | 查看、查询或签到 |
-| `/imago quota add/del/set <用户 ID> <整数>` | 管理员调额 |
-| `/imago ref-upload` | 上传 Persona 参考图 |
-| `/imago summary-show/rebuild/set` | 查看、重建或设置外观摘要 |
-| `/imago provider-primary <节点 ID>` | 指定主节点（也可在 WebUI 设置） |
+| `/imago_fusion help` | 查看按用途和当前权限分组的帮助卡片 |
+| `/imago_fusion draw <提示词>`、`/f画 <提示词>` | 普通绘图 |
+| `/imago_fusion photo <画面要求>`、`/f拍照 <画面要求>` | 当前 Persona 出镜 |
+| `/imago_fusion status` | 查看自己的任务 |
+| `/imago_fusion quota help/show/sign` | 查看、查询或签到 |
+| `/imago_fusion quota add/del/set <用户 ID> <整数>` | 管理员调额 |
+| `/imago_fusion ref-upload` | 上传 Persona 参考图 |
+| `/imago_fusion summary-show/rebuild/set` | 查看、重建或设置外观摘要 |
+| `/imago_fusion provider-primary <节点 ID>` | 指定主节点（也可在 WebUI 设置） |
 
-`/imago photo` 与 `/拍照` 的受理回复使用“当前人设”，不显示英文 `Persona`。
+LLM 工具：`generate_fusion_image`（普通绘图）、`generate_fusion_persona_image`（Persona 出镜）。
 
-`/imago draw`、`/画`、`/imago photo`、`/拍照` 的尾部提示词/画面要求使用 `GreedyStr` 语义，描述包含空格时不会被截断为第一个词。
+## 安全边界
 
-## 绘图额度
+- **参考图与结果图的下载**统一经 `core/network.py`：手动逐跳重定向（≤5 跳）、逐跳私网校验、体积上限、魔数校验。`storage_config.block_private_networks` 只约束这里，**不**约束节点 `base_url`，所以本地反代仍然可用。
+- 日志与用户可见文案统一经 `core/security.py` 脱敏：`api_key=`、裸 `key=`、`?key=` / `?apiKey=` 查询参数、`data:image/...` 载荷、完整 URL、长数字标识都会被掩码或替换。
+- 原生适配器不下载 provider 返回的引用，因此不存在「把宿主任意文件提交给上游」的路径。
 
-- 黑名单禁止绘图指令，并从本轮 LLM 请求移除两个 Imago 绘图工具；任务入口仍会复查。
-- 无限额度白名单不扣额度且无日上限；黑名单优先。
-- 关闭 `enable_quota` 时普通用户不扣额度，但黑名单仍生效。
-- 开启后按请求图片数量扣费；scheduler 拒绝入队会立即退款，后台任务在终态为 `failed` 或被取消（插件重载/关闭）时退回本次实际扣费。`no_output`、超时及其他终态均不退款。
-- 开启签到后，每人每天可 `/imago quota sign` 一次，获得配置范围内的随机额度。
+## 已知边界（非目标）
 
-`quota_config.daily_quota_target` 是每日目标余额。当天首次访问额度时精确重置到该值，低补高削；关闭 `enable_daily_refresh` 则不刷新。余额保存在 `plugin_data/imago/quotas.json`，也可在 Plugin Page 的额度页批量编辑。
+- 不移植大香蕉的直连 HTTP 栈、`@provider_type` 注册表、smart_retry、随机 key 打乱、图床/视频/白名单/冷却等绘图管线。
+- 不引入 Gemini 原生协议的 `system_prompt` / `responseModalities` / `imageConfig`：原生路由走 OpenAI 兼容协议，这些字段不会被 AstrBot Provider 带出；需要时用提示词表达。
+- `enable_proxy` 只覆盖 HTTP 直连节点；为原生路由加代理需要在 AstrBot Provider 侧配置。
 
-## Persona 与参考图
+## 测试
 
-- 普通绘图直接使用主 LLM 的完整画面描述；Persona 图片会自动加入稳定外观摘要和本轮动态描述。
-- 手工摘要优先；摘要一经生成即长期有效——只有点击 WebUI「重建外观摘要」/「保存摘要」或执行 `/imago summary-rebuild`、`/imago summary-set` 才会更新，Persona Prompt 与参考图的增删都不会让它失效。
-- Persona 识图 Provider 只在 Plugin Page 手动勾选图片并重建摘要时使用，且必须支持图片输入。
-- 任务会读取当前消息、引用消息和正文中的参考图，来源支持本地路径、HTTP(S)、`data:` 与 `base64://`。引用消息图片在事件处理阶段前台解析并并入任务参考图：只有引用 id 且无正文、或正文含 `[图片]` 等占位时按严格模式处理，提取不到图片会返回“引用消息图片无法获取”；明确为纯文字引用时保持宽松。
-- 参考图在事件阶段完成本地化接管与去重，无法解析时任务严格失败，不会静默退化为纯文生图；远程图下载后同样按文件魔数识别格式，空响应或内容不是图片会严格失败，头部 MIME 与内容不一致时以内容魔数为准。
-- 显式参考图存在时，最终 prompt 会自动追加低优先级关系声明：前 N 张是用户指定参考、其余是人设固定图。`optimizer_config.reference_caption`（默认关闭）开启后，还会用识图 Provider 为参考图生成视觉描述——拍照任务并入副脑输入，普通绘图以低优先级段落追加到最终 prompt；识图失败自动跳过，不影响任务。
-- 任务输入、输出和去身份化 manifest 位于 `plugin_data/imago/task_cache/<task_id>/`。
-- Persona 出镜默认采用自然第三方视角（他拍观感）：平视或轻微俯仰的中景/全景，仿佛画面外的摄影师拍摄，避免默认怼脸自拍或特写；用户明确要求自拍、特写或指定机位/视角时始终以用户为准。副脑关闭且未启用降级注入时，视角由用户描述决定。
-
-### 副脑优化原理
-
-- Persona 出镜任务在副脑开启时始终经过副脑；普通绘图（`generate_image`）是否也经过副脑由「普通绘图也走副脑」开关决定（默认关闭，开启后多一次副脑 LLM 调用），`/画` 指令不经过副脑。
-- 开启后，插件把稳定外观摘要与本轮画面要求分开交给副脑。副脑整理本轮动作、场景、临时服饰、视角、构图、镜头、光线，**并在本轮基准之上落实学派、题材、光影氛围、效果与形态**，不改写稳定外观。
-- 副脑 system prompt 依次由“副脑自定义提示词”、基准块和插件固定协议组成。基准块分四种形态：配置了基准时写「本轮成像基准已固定为「<基准名>」，不得按用户措辞改换；基准之上按用户措辞补写具体风格……<口径>」；`auto(自动)` 注入基准选择表；`default(通用)` 只给通用画面口径；`None(无)` 不注入。提示词里对模型统一称「成像基准」，不使用文档里的“骨架/堆砌”说法。
-- “副脑降级时注入风格后缀”开关（默认关闭）：启用后，副脑关闭或调用失败降级时，把当前基准的口径与默认第三方视角以低优先级英文后缀直接写入最终 prompt；关闭时降级路径保持原始描述。副脑调用失败或返回空内容时不终止任务，改用原始画面描述继续生成。副脑自定义提示词只作用于副脑，不会注入图片 prompt。
-- 对模型透明：发给主 LLM 的工具说明与发给副脑的提示词里都不出现「副脑」这个概念——主 LLM 不必知道插件里还有另一个 LLM，副脑也只面对自己的整理要求（优先级表述为「本提示词中的整理要求」）。「副脑」只是插件配置与文档里的称呼。
-
-### 成像基准与堆砌：风格是怎么组成的
-
-风格分两层看：**成像基准是唯一的、互斥的大类，其余一切都在基准之上堆砌**。（文档里沿用了“骨架/堆砌”这个内部说法，提示词发给模型时统一叫「成像基准」。）
-
-**成像基准（`optimizer_style` 单选）**——决定成图"由什么材质构成"，一张图只能属于其中之一：
-
-| 基准 | 内部键 | 一句话 |
-| --- | --- | --- |
-| `realistic(真人实拍)` | `realistic` | 真实相机拍到的人：皮肤微质感与毛孔、真实织物、真实光学与景深、随手抓拍体态 |
-| `real3d(照片级三维渲染)` | `real3d` | 照片级真实的三维画面：产品商品、静物、手办潮玩、模型、食品、载具、建筑室内，也可以是数字人/写实三维角色（不是相机拍到的真人，身份特征仍要保持一致） |
-| `cg3d(风格化三维渲染)` | `cg3d` | 风格化的三维动画画面：圆润造型、皮克斯/迪士尼式、卡通渲染、游戏 CG 过场 |
-| `illustration(手绘插画)` | `illustration` | 人手工画出来的图：线条/笔触、平涂或分层上色、纸与颜料质感 |
-| `pixel(像素阵列)` | `pixel` | 整幅图构建在严格像素网格上：边缘对齐网格、有限调色板与抖动 |
-| `logo(LOGO 设计)` | `logo` | 扁平矢量图形标志：几何构成、干脆边缘、极少色板、留白与居中构图，无场景无立体感 |
-
-各条基准口径都写死了 **HARD EXCLUSIONS**：点名排除其它基准的特征（例如真人实拍排除线条/赛璐璐/像素网格/"磨皮塑料感的 CG 光泽"，照片级三维排除卡通比例与抓拍颗粒，风格化三维排除纯二维赛璐璐平涂与照片写实处理，LOGO 设计排除照片写实/三维立体感/手绘笔触/整幅场景插画）。这是"区分度强烈"的落点——选错基准会立刻在画面上露馅，而不是模棱两可。`auto` 判定时也按同一组互斥线索走。
-
-**为什么"聊天记录/报纸"不是基准**：基准回答"图由**什么造出来**"（相机/渲染/手绘/像素/矢量），而载体回答"这张图**是什么东西**"。两者不在同一条轴上——同一张聊天记录截图里可以放一张照片、一页报纸版面上可以印插画，载体和内层材质会同时成立。所以载体类需求走形态层与措辞，共享句要求画出载体本身的质感（界面栅格与系统字体、纸张网点与折痕、版式结构）。
-
-**堆砌层（全部走用户措辞或人设描述，不占预设位）**：
-
-- **学派**：日系赛璐璐 / 美漫 / 韩系厚涂 / 国风水墨 / 绘本水彩 / 素描线稿 / 版画 ｜ 皮克斯式动画 / 游戏 CG / 卡通渲染 / 硬表面 / 低多边形 / 体素 ｜ 复古 sprite / HD-2D / 等距像素 ｜ 极简标志 / 徽章 / 字标（副脑共享句里每个基准都带了这类示例词，这里不逐条重复）
-- **题材**：赛博朋克、国风、奇幻、废土、校园……
-- **效果**：朦胧、胶片、黑白、裸眼3D、故障艺术、长曝光、移轴微缩，以及黏土、毛毡、纸艺、拼贴、刺绣等手工材质……（手工材质靠 `cg3d`/`real3d` 加措辞表达，副脑共享句已要求画出指纹、剪裁边、纤维、缝线这类制作痕迹，不要只给渲染光泽）
-- **形态**：叙事画面、商品展示（手办潮玩、包装）、分镜/贴纸，以及聊天记录/截图、报纸/海报、证件/信件这类**载体画面**（载体不占基准位，按措辞画并画出载体质感）；「手办化」指向 `real3d`
-
-副脑的职责就是**从基准出发把这些补写上去**：先立住基准（成图的材质与成因），再叠加用户要求的学派、题材、光影氛围、效果与形态。所以「配置 `realistic` + 用户说"电影感的猫"」得到电影布光的写实照片，「配置 `cg3d` + 用户说"黏土质感"」得到黏土风格的三维动画画面，都不需要新增预设。
-
-**`None(无)` / `default(通用)`**：前者不注入任何基准块，后者只给一段通用画面质量口径（不锁基准）。两者都不算"配置了基准"，用户当轮明确要求的风格仍然优先。
-
-### `auto(自动)` 只选基准
-
-`auto` 的选择表里**只有成像基准**（`REALISTIC_PHOTO`/`REAL_3D`/`CG_3D`/`HAND_DRAWN_ILLUSTRATION`/`PIXEL_GRID`/`LOGO_DESIGN`），命名强区分 + 互斥触发线索；没有任何线索能对上时落表末的 `GENERAL_NEUTRAL｜通用（不指定基准）`——**这轮不套用任何基准特征**，由副脑按通用画面质量要求与用户措辞把具体风格写清楚。选择在**同一次副脑调用**内完成，不额外发请求；两个基准都说得通时，取「去掉哪一层画面就散架」的那一层；载体类需求（聊天记录、报纸、海报）本身不提供基准线索——有材质线索（如水彩海报）照常按线索选基准，完全无线索时才落通用项、由措辞承担载体质感；选定后仍要按用户措辞把学派、题材、效果补写上去。提示词里的条目数不写死，由 `STYLE_AUTO_CATALOG` 生成，将来加基准自动跟上（当前表约 6900 字符，是全插件最贵的一档提示词）。
-
-### 基准由谁决定
-
-两件事彼此独立：
-
-**① 是否走副脑**（`enable_optimizer` + `optimize_plain_draw`）
-
-- `enable_optimizer` 是副脑总开关，关闭后任何路径都不调用副脑。
-- Persona 出镜任务（`generate_persona_image`、`/拍照`）在总开关开启时始终经过副脑。
-- 普通绘图只有「来自 `generate_image` 工具」且 `optimize_plain_draw`（「普通绘图也走副脑」）开启时才经过副脑（多一次副脑 LLM 调用，与出图共用任务超时预算）。该开关**只**决定这件事。
-- `/画` 指令始终直接出图，不经过副脑。
-
-**② 基准联动**（副脑 ↔ 主 LLM，唯一联动点 = 配置为 `auto`）
-
-两个绘图工具的 `style` 参数允许主 LLM 标注本轮基准，工具提示词要求它**只在能明显判断成图材质时填写**，无法判断就传 `auto` 或留空：
-
-| 配置 | 主 LLM 传参 | 本轮基准 |
-| --- | --- | --- |
-| 具体基准 | 任意 | 以配置为准，主 LLM 传参直接丢弃 |
-| `auto(自动)` | 明确基准 | 主 LLM 指定的基准 |
-| `auto(自动)` | `auto`/留空/非法值 | 由副脑按用户措辞从表中选（无线索时落通用：不指定基准） |
-
-主 LLM 只能传表中的基准之一（传 `auto`/留空/`default`/非法值一律落回由副脑选）。参数被**消费**的情形只有两种：① 本轮副脑参与（交给 `resolve_style` 裁决）；② 开启「副脑降级时注入风格后缀」（副脑没跑或调用失败时，也要按它注入后缀）。两者都不成立时（副脑未参与、也没开降级注入）参数直接丢弃——没有消费方。基准由插件裁决后整体交给副脑执行，锁定后「用户优先」条款里不再包含基准本身（只保留主体、数量、画面文字、视角、构图，以及学派、题材、光影氛围与效果），避免「配置写死真人实拍、用户随口提了像素，副脑就改画像素」这类与配置打架的结果。
-
-## 任务、页面与日志
-
-`generate_image` 和 `generate_persona_image` 只创建后台任务；成功返回不代表已生成或平台已确认送达。Plugin Page 提供 Persona、图片节点和额度三个管理区域；额度表可按任意列升降序排列，只维护稳定的用户 ID，不缓存昵称。
-
-任务进度只通过 `/imago status` 查询。插件不会向主 LLM 注入后台任务状态、阶段或最近任务信息。
-
-至少一张图片成功落盘才算生成成功；Provider 成功响应却没有可识别图片，或所有结果均无法落盘时，任务为 `no_output`，仍可继续模型 fallback，但最终不按普通失败退款。失败通知是否发送成功会单独写入 manifest。主动发送会补跑装饰链，兼容 BubbleReply 这类通过 `event.send()` 发前置分段的插件；任一前置分段失败时仍尽量发送剩余主链，但整次投递不会误记成功。
-
-`task_config.at_trigger_user`（默认开启）控制主动发送的链首：群聊中 @ 触发任务的人（私聊永不加 @；取不到触发者 ID 时也不加）；关闭后只发送配文/图片或失败文案本身。@ 始终排在配文和图片之前。
-
-同一条用户消息只创建一个绘图任务：主 LLM 在同一轮内重复调用绘图工具会被直接忽略（不重复生成、不重复扣费），并收到「已创建」话术；用户新发一条消息即可再次生成同一画面。平台取不到触发消息 ID 时退化为「相同内容且上一任务仍在处理中，或结束不到 30 秒」判定。若一条消息里想要多张不同画面，请让用户分开发送（工具单次最多可生成 4 张）。
-
-`task_config.llm_caption`（默认关闭）开启后，出图成功或失败时会用会话 Chat Provider 按当前人设生成一句简短配文与结果一起发送，配文在前、图片拼接在其后。`llm_caption_cm_context`（默认关闭）开启后配文请求复用 ChatMemory 的接管上下文（只通过公开实例 API 只读查询，模式同 time_awareness），关闭时仅携带任务局部上下文。`llm_caption_pregen`（默认关闭）开启后，图片生成期间并行预生成成功版通用配文，出图成功直接使用；任务失败时预生成结果丢弃，失败通知走同步配文。注意：预生成与图片生成可能并发请求同一上游（网关限流时相互影响），且任务失败时预生成这次调用会被浪费——开启前请确认可接受这两项成本。LLM 调用失败或时间预算不足时自动回退固定文案。
-
-配置修改后对后续请求动态生效。并发上限提高会放行等待任务，降低时不取消已运行任务；单个已开始的 Provider 尝试仍使用其创建时的节点参数快照。
-
-DEBUG 会记录阶段、节点和具体模型、成功/失败、参考图数量、脱敏后的提示词与参数、结果落盘和发送阶段；不会记录密钥、完整 base64、原始 URL 或绝对路径。日志等级请到 WebUI 插件详情页调整（运行期生效）；`log_with_bot_id` 开启后日志前缀附加机器人实例 ID，便于多 Bot 排查。
-
-## `custom_endpoint` 契约
-
-向配置的完整 URL 发送 `Authorization: Bearer <api_key>` JSON POST：
-
-```json
-{
-  "prompt": "完整提示词",
-  "model": "model-id",
-  "count": 1,
-  "size": "1024x1024",
-  "aspect_ratio": "1:1",
-  "references": [{"mime_type": "image/png", "data": "BASE64"}],
-  "parameters": {"quality": "high"}
-}
-```
-
-响应使用 `{"data":[{"url":"..."}]}` 或 `{"data":[{"b64_json":"..."}]}`。`parameters` 只接受用户通过 `--key value` 传入的值。
-
-## 图片尺寸怎么填（`default_size` / `size` 参数）
-
-插件的立场是**只设置、不解释**：`size` 不做校验、不做换算，写什么就原样发给上游（百炼节点也一样，要星号请自己写 `1024*1024`）。
-
-| 写法 | 含义 |
-| --- | --- |
-| `1024x1024` / `1024*1024` | 像素尺寸（`x` 小写；`*` 写法用于百炼） |
-| `1:1`、`3:4`、`16:9` | 比例串——支持的站点会按该比例出图 |
-| `auto` | 交给上游自选 |
-| 留空 | 不指定：请求里不发送 `size` 字段 |
-
-节点里的 `default_size` 是「用户/主 LLM 没给尺寸时用哪个」（留空 = 不指定），工具传入的 `size` 优先于它。越界或上游不认的值不会被插件纠正，可能被上游报错，或按它自己的尺寸处理。
-
-两点实测提醒（new-api 中转站 + `gpt-image-2`）：方形像素尺寸可能被上游吸附到它自己的原生边长（要 `1024x1024` 可能给 1254×1254），比例串与横竖尺寸按你给的值出图；`size` 走像素计费，越大越贵（`2048x2048` 约为方形的 2.6 倍）。另外 `aspect_ratio` 字段在走 images 接口的中转站会被丢弃——比例要写进 `size`。
-
-## `dashscope_multimodal`
-
-```text
-api_type: dashscope_multimodal
-base_url: https://{WorkspaceId}.cn-beijing.maas.aliyuncs.com/api/v1/services/aigc/multimodal-generation/generation
-model: qwen-image-3.0-pro
-default_size: 1024x1024
-```
-
-Base URL 必须是同地域、可直接 POST 的完整 generation URL。插件会构造单轮 `input.messages`，`size` 原样发送（需要 `*` 就自己写 `1024*1024`），默认开启 `prompt_extend`，并支持 `negative_prompt`、`seed`、`watermark` 等 `extra_params`。
-
-插件不按模型名写死图片数量或大小能力。参考图数量由节点的 `reference_image_limit` 控制，用户明确附图不会被静默删除；模型自身限制由百炼响应决定。百炼错误会保留脱敏后的 `code/message` 并进入可用的模型/节点 fallback。
-
-## 安全与验证
-
-- 默认阻止回环、局域网和其他非公网图片 URL（含公网 URL 重定向到内网的情况），不新增白名单；被拒绝时请改用公网 URL，或确认风险后关闭 `storage_config.block_private_networks`。
-- 远程图、`data:`/`base64://` 与 `/imago ref-upload` 共用同一套来源分类、SSRF 校验与大小限制；WebUI 上传接口单次最多 20 张，`/imago ref-upload` 命令路径不限制单次张数（仅受单张大小限制）。
-- Persona 数据按安全编码的 ID 隔离，参考图按哈希去重。
-- 摘要和额度采用原子写入，任务缓存按任务目录隔离；插件重载时取消运行任务。
+纯逻辑测试不需要 AstrBot 运行环境（原生适配器用假 `LLMResponse`/`MessageChain` 打桩）：
 
 ```bash
-PYTHONPATH=. PYTHONDONTWRITEBYTECODE=1 python3 -m unittest discover -s imago/test -v
-node --check imago/pages/webui/app.js
+cd data/plugins/imago_fusion/test
+PYTHONPATH=/root/AstrBot/data/plugins /root/AstrBot/.venv/bin/python test_native_adapter.py
+PYTHONPATH=/root/AstrBot/data/plugins /root/AstrBot/.venv/bin/python test_scheduler.py
 ```
-
-真实 Provider、平台引用消息和 Plugin Page 交互仍需在目标 AstrBot 环境验收。

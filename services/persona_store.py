@@ -151,7 +151,7 @@ class PersonaStore:
     def get_summary(self, persona_id: str, prompt: str) -> dict | None:
         """取已保存的外观摘要。
 
-        摘要只认用户显式操作（WebUI 重建/保存、`/imago summary-rebuild`）：
+        摘要只认用户显式操作（WebUI 重建/保存、`/imago_fusion summary-rebuild`）：
         Persona Prompt 变化或参考图增删都不会让它失效，避免「没动它就没了」。
         prompt 参数仅为兼容调用方签名（只在 set_summary 时记录 source_hash）。
         """

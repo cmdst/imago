@@ -3,10 +3,10 @@ import time
 import unittest
 from unittest.mock import patch
 
-from imago.core.errors import ProviderError
-from imago.core.models import DrawTask, GenerationRequest, ImageInput, ImageResult, ProviderConfig, RuntimeConfig, TaskStage, TaskState
-from imago.services import scheduler as scheduler_module
-from imago.services.scheduler import TaskScheduler
+from imago_fusion.core.errors import ProviderError
+from imago_fusion.core.models import DrawTask, GenerationRequest, ImageInput, ImageResult, ProviderConfig, RuntimeConfig, TaskStage, TaskState
+from imago_fusion.services import scheduler as scheduler_module
+from imago_fusion.services.scheduler import TaskScheduler
 
 
 class DummySession: pass
@@ -213,7 +213,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         async def prepare(current):
             prepare_started.set()
             await allow_prepare.wait()
-            from imago.core.models import ImageInput
+            from imago_fusion.core.models import ImageInput
             current.request.references.append(ImageInput(b"reference", "image/png"))
 
         task.runtime["prepare"] = prepare
@@ -511,4 +511,114 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
             else: scheduler_module.ADAPTERS["custom_endpoint"] = old
 
 
-if __name__ == "__main__": unittest.main()
+    async def test_native_node_with_empty_api_keys_enters_the_adapter(self):
+        captured = []
+
+        class Adapter:
+            def __init__(self, config): self.config = config
+            async def generate(self, session, request, key):
+                captured.append((self.config.astrbot_provider_id, key))
+                return [ImageResult(url="https://host/a.png")]
+
+        old = scheduler_module.ADAPTERS.get("astrbot_native")
+        scheduler_module.ADAPTERS["astrbot_native"] = Adapter
+        provider = ProviderConfig(
+            "native_node", "astrbot_native", "", (), astrbot_provider_id="cpa_Gemini/web-gemini-image"
+        )
+        scheduler = TaskScheduler(
+            lambda: RuntimeConfig(providers=(provider,), generation_timeout=30),
+            DummySession(), lambda *_: True, lambda *_: None,
+        )
+        try:
+            task = DrawTask("native", "umo", GenerationRequest("x"))
+            results = await scheduler._generate(task)
+            # 空 api_keys 曾直接抛 ZeroDivisionError（除零发生在 try 之外）。
+            self.assertEqual(captured, [("cpa_Gemini/web-gemini-image", "")])
+            self.assertEqual(results[0].url, "https://host/a.png")
+            self.assertNotIn("ZeroDivisionError", task.errors)
+        finally:
+            await scheduler.close()
+            if old is None:
+                scheduler_module.ADAPTERS.pop("astrbot_native", None)
+            else:
+                scheduler_module.ADAPTERS["astrbot_native"] = old
+
+    async def test_template_model_override_replaces_the_primary_node_model(self):
+        seen = []
+
+        class Adapter:
+            def __init__(self, config): self.config = config
+            async def generate(self, session, request, key):
+                seen.append((self.config.id, self.config.model))
+                return [ImageResult(data=b"image")]
+
+        old = scheduler_module.ADAPTERS.get("custom_endpoint")
+        scheduler_module.ADAPTERS["custom_endpoint"] = Adapter
+        providers = (
+            ProviderConfig("node_a", "custom_endpoint", "https://example.invalid/a", ("key",), model="model_a"),
+            ProviderConfig("node_b", "custom_endpoint", "https://example.invalid/b", ("key",), model="model_b"),
+        )
+
+        def runtime_config(template_override):
+            return RuntimeConfig(
+                providers=providers, generation_timeout=30, template_override=template_override
+            )
+
+        scheduler = TaskScheduler(lambda: runtime_config(True), DummySession(), lambda *_: True, lambda *_: None)
+        try:
+            override = DrawTask("override", "umo", GenerationRequest("x"))
+            override.runtime["primary_provider_id"] = "node_a/model_override"
+            await scheduler._generate(override)
+            self.assertEqual(seen[-1], ("node_a", "model_override"))
+
+            # 开关关闭时同一个引用按普通节点名处理，退回列表首节点、不覆写模型。
+            scheduler.config_getter = lambda: runtime_config(False)
+            disabled = DrawTask("disabled", "umo", GenerationRequest("x"))
+            disabled.runtime["primary_provider_id"] = "node_a/model_override"
+            await scheduler._generate(disabled)
+            self.assertEqual(seen[-1], ("node_a", "model_a"))
+        finally:
+            await scheduler.close()
+            if old is None:
+                scheduler_module.ADAPTERS.pop("custom_endpoint", None)
+            else:
+                scheduler_module.ADAPTERS["custom_endpoint"] = old
+
+    async def test_native_reference_override_prefix_is_not_hijacked(self):
+        """``cpa_Gemini/web-gemini-image`` 必须原样当节点名，不得被当成覆写语法。"""
+        seen = []
+
+        class Adapter:
+            def __init__(self, config): self.config = config
+            async def generate(self, session, request, key):
+                seen.append((self.config.id, self.config.astrbot_provider_id, self.config.model))
+                return [ImageResult(data=b"image")]
+
+        old = scheduler_module.ADAPTERS.get("astrbot_native")
+        scheduler_module.ADAPTERS["astrbot_native"] = Adapter
+        providers = (
+            ProviderConfig("cpa_Gemini", "custom_endpoint", "https://example.invalid", ("key",), model="shadow"),
+            ProviderConfig(
+                "native_node", "astrbot_native", "", (),
+                model="web-gemini-image", astrbot_provider_id="cpa_Gemini/web-gemini-image",
+            ),
+        )
+        scheduler = TaskScheduler(
+            lambda: RuntimeConfig(providers=providers, generation_timeout=30, template_override=True),
+            DummySession(), lambda *_: True, lambda *_: None,
+        )
+        try:
+            task = DrawTask("shadow", "umo", GenerationRequest("x"))
+            task.runtime["primary_provider_id"] = "native_node"
+            await scheduler._generate(task)
+            self.assertEqual(seen[-1], ("native_node", "cpa_Gemini/web-gemini-image", "web-gemini-image"))
+        finally:
+            await scheduler.close()
+            if old is None:
+                scheduler_module.ADAPTERS.pop("astrbot_native", None)
+            else:
+                scheduler_module.ADAPTERS["astrbot_native"] = old
+
+
+if __name__ == "__main__":
+    unittest.main()

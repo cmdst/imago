@@ -1,24 +1,24 @@
-class ImagoError(Exception):
+class ImagoFusionFusionError(Exception):
     code = "internal_error"
 
 
-class ConfigurationError(ImagoError):
+class ConfigurationError(ImagoFusionFusionError):
     code = "configuration_missing"
 
 
-class PersonaError(ImagoError):
+class PersonaError(ImagoFusionFusionError):
     code = "persona_invalid"
 
 
-class ReferenceImageError(ImagoError):
+class ReferenceImageError(ImagoFusionFusionError):
     code = "reference_invalid"
 
 
-class QuotaError(ImagoError):
+class QuotaError(ImagoFusionFusionError):
     code = "quota_denied"
 
 
-class ProviderError(ImagoError):
+class ProviderError(ImagoFusionFusionError):
     code = "provider_error"
 
     def __init__(self, message: str, *, status: int | None = None):
@@ -40,15 +40,15 @@ class NoOutputError(UnsupportedResponse):
     code = "no_output"
 
 
-class SendError(ImagoError):
+class SendError(ImagoFusionFusionError):
     code = "send_failed"
 
 
-class DuplicateImage(ImagoError):
+class DuplicateImage(ImagoFusionFusionError):
     code = "duplicate_image"
 
 
-class DuplicateRequest(ImagoError):
+class DuplicateRequest(ImagoFusionFusionError):
     """同一条用户消息重复调用绘图工具，或缺少消息 ID 时的同内容重复提交。"""
 
     code = "duplicate_request"

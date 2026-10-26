@@ -1,6 +1,6 @@
 """拍照/绘图参考图透传修复的纯逻辑单元测试（不导入 astrbot core）。
 
-覆盖 imago 自身纯模块行为：
+覆盖 imago_fusion 自身纯模块行为：
 - fetch_reference 对 base64:// / data URL / 本地路径的严格解码、大小限制与魔数识别；
 - fetch_reference 的 HTTP(S) 重定向 SSRF 加固（IP 字面量，不访问网络）；
 - ReferencePlanner 对 Image/引用消息组件的同步本地化、去重与引用 strict 判定；
@@ -18,12 +18,12 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from imago.core.errors import ReferenceImageError
-from imago.core.models import GenerationRequest, ImageInput, ProviderConfig
-from imago.core.network import detect_image_mime, fetch_reference
-from imago.core.references import ReferencePlanner, quoted_reply_missing_images
-from imago.providers.custom import CustomEndpointAdapter
-from imago.providers.openai_image import OpenAIImageAdapter
+from imago_fusion.core.errors import ReferenceImageError
+from imago_fusion.core.models import GenerationRequest, ImageInput, ProviderConfig
+from imago_fusion.core.network import detect_image_mime, fetch_reference
+from imago_fusion.core.references import ReferencePlanner, quoted_reply_missing_images
+from imago_fusion.providers.custom import CustomEndpointAdapter
+from imago_fusion.providers.openai_image import OpenAIImageAdapter
 
 PNG = b"\x89PNG\r\n\x1a\n" + bytes(24)
 JPEG = b"\xff\xd8\xff\xe0" + bytes(24)
@@ -451,18 +451,18 @@ class FetchReferenceDataUrlTests(unittest.IsolatedAsyncioTestCase):
 
 class ResolveCheckedUrlTests(unittest.IsolatedAsyncioTestCase):
     async def test_http_ip_literal_is_pinned_with_host_header(self):
-        from imago.core.network import _resolve_checked_url
+        from imago_fusion.core.network import _resolve_checked_url
         request_url, headers = await _resolve_checked_url("http://1.1.1.1/a.png", block_private=True)
         self.assertEqual(request_url, "http://1.1.1.1/a.png")
         self.assertEqual(headers, {"Host": "1.1.1.1"})
 
     async def test_private_ip_is_rejected(self):
-        from imago.core.network import _resolve_checked_url
+        from imago_fusion.core.network import _resolve_checked_url
         with self.assertRaisesRegex(ValueError, "私网"):
             await _resolve_checked_url("http://127.0.0.1/x", block_private=True)
 
     async def test_https_keeps_original_url_without_host_header(self):
-        from imago.core.network import _resolve_checked_url
+        from imago_fusion.core.network import _resolve_checked_url
         request_url, headers = await _resolve_checked_url("https://1.1.1.1/a.png", block_private=True)
         self.assertEqual(request_url, "https://1.1.1.1/a.png")
         self.assertIsNone(headers)
