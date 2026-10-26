@@ -235,8 +235,15 @@ class ImagoFusion(Star):
                 pass
         return "[ImagoFusion]"
 
-    def _provider_error(self, provider, exc, task):
-        logger.warning("%s 模型失败 type=%s node=%s model=%s status=%s detail=%s", self._log_prefix(task.runtime.get("source_event")), type(exc).__name__, provider.id, provider.model, getattr(exc, "status", None), redact(str(exc)))
+    def _provider_error(self, provider, exc, task=None):
+        # ``task`` 可缺省，这是运行时钩子契约的一部分：``core/runtime.py`` 的
+        # ``report_provider_error(provider, exc)`` 按 **2 参**调用注入的 reporter，
+        # 只有调度器（``services/scheduler.py``）直接调用时才带 ``task``。
+        # 缺省为 None 时退化成不带 platform 前缀的日志行；少传它绝不能再抛
+        # ``TypeError``，否则真实失败原因会被「上报失败」吞掉，``attempt_errors``
+        # 永远为空（终态日志 ``attempts=-``），多节点 fallback 也会被整段跳过。
+        event = task.runtime.get("source_event") if task is not None else None
+        logger.warning("%s 模型失败 type=%s node=%s model=%s status=%s detail=%s", self._log_prefix(event), type(exc).__name__, provider.id, provider.model, getattr(exc, "status", None), redact(str(exc)))
 
     def _decorate_error(self, message, exc):
         logger.error("[ImagoFusion] %s: %s", message, redact(str(exc)))
