@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from .models import ProviderConfig, QuotaConfig, RuntimeConfig
+from .models import ProviderConfig, QuotaConfig, RuntimeConfig, UpscaleConfig
 
 API_TYPES = {
     "openai_image",
@@ -164,6 +164,7 @@ def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
     quota_raw = raw.get("quota_config", {}) or {}
     tasks = raw.get("task_config", {}) or {}
     storage = raw.get("storage_config", {}) or {}
+    upscale_raw = raw.get("upscale_config", {}) or {}
     style = _style(optimizer.get("optimizer_style", "default(通用)"))
     checkin_min = max(0, int(quota_raw.get("daily_checkin_quota_min", 1) or 0))
     checkin_max = max(checkin_min, int(quota_raw.get("daily_checkin_quota_max", 3) or 0))
@@ -200,6 +201,18 @@ def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
         log_with_bot_id=bool(raw.get("log_with_bot_id", False)),
         proxy_url=str(raw.get("proxy_url", "")).strip(),
         template_override=bool(raw.get("template_override", False)),
+        # 百度「图像无损放大」：键名与 _conf_schema.json 的 upscale_config 组一一对应
+        # （7 键全部在这里读取，不允许「schema 有、解析不转发」的静默丢键）。
+        # 数值按百度硬限 clamp：base64 ≤4M、长宽乘积 ≤2000×2000、超时 5-60 s。
+        upscale=UpscaleConfig(
+            enabled=bool(upscale_raw.get("enable", False)),
+            api_key=str(upscale_raw.get("api_key", "") or "").strip(),
+            secret_key=str(upscale_raw.get("secret_key", "") or "").strip(),
+            max_image_mb=max(1, min(4, _int_or_default(upscale_raw.get("max_image_mb"), 4))),
+            max_pixels=max(250_000, min(4_000_000, _int_or_default(upscale_raw.get("max_pixels"), 4_000_000))),
+            timeout_seconds=max(5, min(60, _int_or_default(upscale_raw.get("timeout_seconds"), 20))),
+            enable_proxy=bool(upscale_raw.get("enable_proxy", False)),
+        ),
     )
 
 

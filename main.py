@@ -63,6 +63,7 @@ from .integrations.web_api import PageAPI
 from .services.persona_store import PersonaStore
 from .services.quota_store import QuotaStore, terminal_refund_amount
 from .services.scheduler import TaskScheduler
+from .core.upscale_client import BaiduUpscaler, UpscaleState
 
 PENDING_DRAW = "🎨 收到灵感，正在绘制，请稍后…… ✨"
 PENDING_PHOTO = "📸 正在为当前人设「{persona}」拍摄，请稍后……"
@@ -72,7 +73,7 @@ PENDING_PHOTO = "📸 正在为当前人设「{persona}」拍摄，请稍后…�
 FOREGROUND_REFERENCE_TIMEOUT = 30.0
 
 
-@register("imago_fusion", "Wolfycz", "IMAGO·FUSION：映相骨架 + AstrBot 原生 Provider（反代网页端）绘图", "1.0.0")
+@register("imago_fusion", "Wolfycz", "IMAGO·FUSION：映相骨架 + AstrBot 原生 Provider（反代网页端）绘图", "1.1.0")
 class ImagoFusion(Star):
     _STAGE_LABELS = {
         TaskStage.QUEUED: "排队中",
@@ -103,6 +104,8 @@ class ImagoFusion(Star):
         self.raw_config = config or {}
         self.session = None
         self.scheduler = None
+        # 百度「图像无损放大」客户端：initialize() 里构造（需要共享 session）。
+        self.upscaler = None
         self.sender = ProactiveSender(context, self._decorate_error, self._debug)
         data_dir = Path(StarTools.get_data_dir("imago_fusion"))
         self.store = PersonaStore(
@@ -145,6 +148,14 @@ class ImagoFusion(Star):
         # 类提供；注入到 core.runtime 容器，调度器构造适配器时保持既有签名不变。
         runtime.configure(context=self.context, debug=self._debug, error_reporter=self._provider_error)
         self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=15))
+        # 放大复用上面这条共享 session（不新建连接池生命周期）；配置每次现算，
+        # 因此改配置不必重启插件（与插件其它读取点一致）。
+        self.upscaler = BaiduUpscaler(
+            self.session,
+            lambda: load_config(self.raw_config),
+            debug=self._scheduler_debug,
+            warn=self._upscale_warning,
+        )
         self.scheduler = TaskScheduler(lambda: load_config(self.raw_config), self.session, self._finish_task, self._provider_error, self._scheduler_debug)
         api = PageAPI(self)
         for route, handler, methods, desc in (
@@ -226,6 +237,10 @@ class ImagoFusion(Star):
             self._log_prefix(task.runtime.get("source_event")) + " " + message,
             *safe_args,
         )
+
+    def _upscale_warning(self, message, *args):
+        # 放大相关的 WARNING：只允许常量与错误码，绝不放 key / token / URL / 代理地址。
+        logger.warning("[ImagoFusion] " + message, *args)
 
     def _log_prefix(self, event=None):
         if load_config(self.raw_config).log_with_bot_id and event is not None:
@@ -1205,9 +1220,18 @@ class ImagoFusion(Star):
         # 循环外取一次配置：load_config 会重建全部节点对象，放在逐图循环里会让
         # N 张图产生 2N 次全量解析。
         result_cfg = load_config(self.raw_config)
+        # 放大配置与统计同样只在循环外取一次；开关关闭时 upscaler.apply() 立即返回，
+        # task.runtime 里不会出现 upscale 键（零副作用，见 core/upscale_client.py）。
+        upscale_cfg = result_cfg.upscale
+        upscale_state = UpscaleState()
         for result in results:
             try:
                 value = await materialize_result(self.session, result, output_dir, max_bytes=result_cfg.max_upload_bytes, block_private=result_cfg.block_private_networks)
+                # 唯一插入点：把已落盘的成品图放大后**替换** value（失败时原样返回）。
+                # 放大失败绝不写 task.errors —— 否则下面会给用户发「部分图片绘制失败。」
+                # 且调度器会把状态降级成 PARTIAL_SUCCESS。
+                if self.upscaler is not None:
+                    value = await self.upscaler.apply(task, value, output_dir, upscale_cfg, upscale_state)
                 if isinstance(value, Path): output_paths.append(value)
                 chain.append(Image.fromFileSystem(str(value)) if isinstance(value, Path) else Image.fromURL(value))
                 self._debug("%s task=%s 生成结果已落盘 index=%d bytes=%d", self._log_prefix(task.runtime.get("source_event")), task.id[:8], len(chain), value.stat().st_size if isinstance(value, Path) else 0)
@@ -1412,6 +1436,18 @@ class ImagoFusion(Star):
             logger.info(
                 "%s task=%s 终态 %s 耗时=%ds usable=%d delivery_ok=%s",
                 prefix, task.id[:8], task.state.value, elapsed, usable, delivery_ok,
+            )
+
+        # 放大汇总：只在本次任务真的碰过放大时才打（开关关闭时 runtime 里没有该键，
+        # Z0-4「零新增日志」因此成立）。必须在既有终态行**之后**。
+        upscale_stats = task.runtime.get("upscale")
+        if upscale_stats:
+            logger.info(
+                "%s task=%s 放大 成功=%d 跳过=%d 失败=%d",
+                prefix, task.id[:8],
+                upscale_stats.get("succeeded", 0),
+                len(upscale_stats.get("skipped") or []),
+                len(upscale_stats.get("failures") or []),
             )
 
         def delivery(prefix: str) -> dict:

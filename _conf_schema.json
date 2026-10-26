@@ -303,6 +303,55 @@
       }
     }
   },
+  "upscale_config": {
+    "description": "图像无损放大（百度）",
+    "type": "object",
+    "hint": "出图成功后把成品图送百度「图像无损放大」放大 2 倍再发送；失败、超时或超限一律降级为原图，不影响出图，也不影响任务状态与额度结算。默认关闭（关闭时零网络调用、零额外费用）。",
+    "items": {
+      "enable": {
+        "description": "启用无损放大",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后每张成品图多一次百度接口调用（按次计费）。密钥填在下面两项；任一为空则视为未配置，不发起任何请求。"
+      },
+      "api_key": {
+        "description": "百度 API Key",
+        "type": "string",
+        "default": "",
+        "hint": "「图像增强与特效」应用的 API Key。明文保存在插件配置中，勿外传、勿贴群或截图。必须与 Secret Key 属于同一个应用，且该应用已勾选「图像无损放大」能力。"
+      },
+      "secret_key": {
+        "description": "百度 Secret Key",
+        "type": "string",
+        "default": "",
+        "hint": "与 API Key 同属一个应用的 Secret Key。插件用两者换取 access_token（30 天有效，内存缓存，插件重载后重取一次）；日志与任务记录永不打印密钥。"
+      },
+      "max_image_mb": {
+        "description": "单张上限（MB）",
+        "type": "int",
+        "default": 4,
+        "hint": "百度接口的 base64 上限为 4M（原图约 3M 以内），超过会失败但仍计费，因此本地先跳过。范围 1-4，默认 4。"
+      },
+      "max_pixels": {
+        "description": "长宽乘积上限（像素）",
+        "type": "int",
+        "default": 4000000,
+        "hint": "百度接口要求长宽乘积不超过 2000×2000=4000000；超过本地直接跳过（发原图，省一次计费）。范围 250000-4000000，默认 4000000。"
+      },
+      "timeout_seconds": {
+        "description": "单张超时（秒）",
+        "type": "int",
+        "default": 20,
+        "hint": "单张放大的超时，范围 5-60；同时受「后台任务」里的单个任务总超时约束——剩余预算不足时自动跳过（发原图），避免把已出好的图拖成超时。"
+      },
+      "enable_proxy": {
+        "description": "放大请求走出站代理",
+        "type": "bool",
+        "default": false,
+        "hint": "开启后放大请求走插件顶层的「出站代理地址」。百度是境内公网，直连通常更快；只有本机出网必须走代理时才需要开。代理地址不会写进日志。"
+      }
+    }
+  },
   "proxy_url": {
     "description": "出站代理地址（HTTP 直连节点）",
     "type": "string",

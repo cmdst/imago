@@ -75,6 +75,27 @@ IMAGO·FUSION 是 **IMAGO·映相** 骨架与 **大香蕉（astrbot_plugin_big_b
 
 **不推荐开启**：该语法与 AstrBot 原生 provider id 形态相同（都含 `/`），一旦命名碰撞就会改变主节点的实际去向。插件已加碰撞守卫——若 `/` 前的模板名与某个 `astrbot_native` 节点 id **完全相同**，会记一条 WARNING 并**跳过覆写**，把引用留给原生节点解析（例如模板名写成 `cpa_Gemini` 而原生节点 id 就是 `cpa_Gemini`）。守卫只覆盖完全同名的情况，语义上仍建议用节点的 `available_models` 做模型回退，而不是依赖本开关。
 
+## 图像无损放大（可选，**默认关闭**）
+
+出图成功后，把每张成品图送**百度「图像无损放大」**放大 2 倍（长宽各 2 倍）后再发送到群聊。配置在插件配置页的「图像无损放大（百度）」组（`upscale_config`）。
+
+| 键 | 默认 | 说明 |
+| --- | --- | --- |
+| `enable` | **false** | 总开关。开启后**每张成品图**多一次百度调用（按次计费） |
+| `api_key` / `secret_key` | 空 | 「图像增强与特效」应用的两把 key；任一为空视为未配置，**不发任何请求** |
+| `max_image_mb` | 4 | 本地预检的 base64 上限（百度硬限 4M；原图上限 = 4 MiB × 3/4） |
+| `max_pixels` | 4000000 | 本地预检的长宽乘积上限（2000×2000） |
+| `timeout_seconds` | 20 | 单张超时（同时受任务总超时约束，剩余预算不足会自动跳过） |
+| `enable_proxy` | false | 放大请求走插件顶层的「出站代理地址」；百度是境内公网，一般不需要 |
+
+- **端点**：`https://aip.baidubce.com/rest/2.0/image-process/v1/image_quality_enhance`（`access_token` 走查询参数，表单体 `image=<base64>`，不带图片头）。鉴权：`oauth/2.0/token` 用两把 key 换 `access_token`（30 天有效，内存缓存，插件重载后重取一次）。
+- **限制**：base64 ≤ 4M、长宽乘积 ≤ 2000×2000、支持 jpg/png/bmp。超限在本地先跳过（服务端超限也会计费），并记一条 DEBUG。
+- **失败降级**：放大失败、超时、超限、额度用尽、应用未勾选该能力（`error_code=6`）等情况**一律发送原图**，任务仍判成功、额度结算不变，日志只留一条 WARNING（每类一次）。放大统计只写 `task.runtime["upscale"]`。
+- **原图保留**：放大图另存为 `task_cache/<任务 ID>/outputs/` 下的新文件（命名规则与结果图落盘一致：uuid hex + 按魔数定的后缀），原图仍在同目录（对账/回滚用，`task.json` 的 `outputs` 记的是放大后的文件，缓存清理按目录整体进行），缓存上限沿用 `storage_config.temp_cache_mb`。
+- **零副作用**：`enable=false` 时出图链路与 1.0.0 逐字节等价——零网络、零新文件、零新增日志。
+
+> 注意：「图像无损放大」与「图像清晰度增强」（`image_definition_enhance`，尺寸不变、上限 10M/最长边 5000px）是百度同产品下的**两个不同接口**，控制台需要**分别勾选**。本插件只实现前者；未勾选时调用返回 `error_code=6`。
+
 ## 命令
 
 | 命令 | 作用 |
@@ -96,11 +117,13 @@ LLM 工具：`generate_fusion_image`（普通绘图）、`generate_fusion_person
 - **参考图与结果图的下载**统一经 `core/network.py`：手动逐跳重定向（≤5 跳）、逐跳私网校验、体积上限、魔数校验。`storage_config.block_private_networks` 只约束这里，**不**约束节点 `base_url`，所以本地反代仍然可用。
 - 日志与用户可见文案统一经 `core/security.py` 脱敏：`api_key=`、裸 `key=`、`?key=` / `?apiKey=` 查询参数、`data:image/...` 载荷、完整 URL、长数字标识都会被掩码或替换。
 - 原生适配器不下载 provider 返回的引用，因此不存在「把宿主任意文件提交给上游」的路径。
+- **`upscale_config.api_key` / `secret_key` 是明文存在插件配置里的**（与 `providers[].api_keys` 同等待遇，AstrBot 的 schema 没有 password 类型）：禁止贴群、贴日志或截图；插件侧日志与任务记录永不打印这两个值、`access_token`、base64 载荷与代理地址，`access_token` 的缓存键是 `sha256(api_key + NUL + secret_key)` 的前 16 位（不拿密钥当字典键）。
+- Agent 结果图的 `fileUri` 只在**与节点 `base_url` 同域**时才补 `key` 查询参数（上游 v1.3.0 的安全修复）：中转把结果图放到第三方对象存储时，补 key 等于把密钥交给对方日志。
 
 ## 已知边界（非目标）
 
 - 不移植大香蕉的直连 HTTP 栈、`@provider_type` 注册表、smart_retry、随机 key 打乱、图床/视频/白名单/冷却等绘图管线。
-- 不引入 Gemini 原生协议的 `system_prompt` / `responseModalities` / `imageConfig`：原生路由走 OpenAI 兼容协议，这些字段不会被 AstrBot Provider 带出；需要时用提示词表达。
+- 不引入 Gemini 原生协议的 `system_prompt` / `responseModalities` 之外的参数面：原生路由走 OpenAI 兼容协议，这些字段不会被 AstrBot Provider 带出；需要时用提示词表达。**例外**：`gemini_official` HTTP 节点会把节点 `default_size`（或请求 `size`）约分成 `generationConfig.imageConfig.aspectRatio`，让尺寸配置真正生效（识别不出比例时不写该键，请求体与旧版一致）；`imageSize` 与 `custom_params` 不引入。
 - `enable_proxy` 只覆盖 HTTP 直连节点；为原生路由加代理需要在 AstrBot Provider 侧配置。
 
 ## 测试

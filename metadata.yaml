@@ -1,6 +1,6 @@
 name: imago_fusion
 display_name: IMAGO·FUSION
-version: 1.0.0
+version: 1.1.0
 author: Wolfycz
 description: IMAGO·映相 骨架 + 大香蕉（AstrBot 原生 Provider 桥接）反代网页端绘图能力的融合插件：通用绘图、Persona 出镜、绘图额度、视觉身份、多节点 fallback 与素材管理
 repo: "https://github.com/W-Wolfycz/imago"

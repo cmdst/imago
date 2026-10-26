@@ -87,6 +87,46 @@ class QuotaConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class UpscaleConfig:
+    """百度「图像无损放大」的开关、凭据与本地预检阈值（``upscale_config`` 组）。
+
+    ``enabled`` 默认 **False**：关闭时 ``core.upscale_client.BaiduUpscaler`` 在所有路径
+    上立即返回原图，零网络、零新文件、零 ``task.runtime`` 键、零新增日志。
+
+    Attributes:
+        enabled: 总开关（按次计费，默认关闭）。
+        api_key: 百度「图像增强与特效」应用的 API Key；明文存在插件配置里。
+        secret_key: 同一应用的 Secret Key。
+        max_image_mb: 本地预检的 base64 上限（MB），百度硬限 4。
+        max_pixels: 本地预检的长宽乘积上限（px²），默认 2000×2000。
+        timeout_seconds: 单张放大的超时（秒）。
+        enable_proxy: 放大请求是否走插件顶层的出站代理（``proxy_url``）。
+    """
+
+    enabled: bool = False
+    api_key: str = ""
+    secret_key: str = ""
+    max_image_mb: int = 4
+    max_pixels: int = 4_000_000
+    timeout_seconds: int = 20
+    enable_proxy: bool = False
+
+    @property
+    def configured(self) -> bool:
+        """开关打开**且**两把 key 都在：只有这时才允许发起任何百度请求。"""
+        return self.enabled and bool(self.api_key) and bool(self.secret_key)
+
+    @property
+    def max_raw_bytes(self) -> int:
+        """原图字节上限：base64 膨胀 4/3，故上限 = ``max_image_mb`` × 3/4。
+
+        默认 4 MiB ⇒ 3 145 728 B。用原图字节数判等价于判 base64 长度（单调），
+        省一次编码；见 ``core/upscale.py`` 的 ``plan()``。
+        """
+        return self.max_image_mb * 1024 * 1024 * 3 // 4
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeConfig:
     providers: tuple[ProviderConfig, ...]
     quota: QuotaConfig = field(default_factory=QuotaConfig)
@@ -115,6 +155,9 @@ class RuntimeConfig:
     # switch because such a string is also a valid AstrBot provider id
     # (``cpa_Gemini/web-gemini-image``); see ``core/config.py``.
     template_override: bool = False
+    # 百度「图像无损放大」：默认关闭。关闭时出图链路与 v1.0.0 逐字节等价
+    # （零网络、零新文件、零 runtime 键），见 ``core/upscale_client.py``。
+    upscale: UpscaleConfig = field(default_factory=UpscaleConfig)
 
 
 @dataclass(slots=True)

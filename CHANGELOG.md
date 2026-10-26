@@ -1,5 +1,29 @@
 # 更新日志
 
+## 1.1.0 — 2026-10-27
+
+**版本口径**：本版走融合版自己的 `1.1.0` 线，**不跟随上游 imago 的 minor**（上游此时是 `1.3.0`）；只从上游 `v1.2.2…v1.3.0` 的 diff 里吸收**两项 bug 修复**，并**明确排除**其删除默认模型模板/适配器（`openai_chat`、`dashscope_multimodal`）与 `custom_params` 结构重写。
+
+### 新增
+
+- **百度「图像无损放大」（`upscale_config`，默认关闭）**：出图成功后把每张成品图送 `image_quality_enhance` 放大 2 倍（长宽各 2 倍）再交付群聊，放大图另存为任务缓存目录下的新文件、**原图保留**兜底。端点、调用形状（`application/x-www-form-urlencoded` + urlencode 后的 base64，`access_token` 走查询参数）、本地预检（base64 ≤4M、长宽乘积 ≤2000×2000、jpg/png/bmp）与失败降级全部按百度文档口径实现；`access_token` 用两把 key 换取，内存缓存（30 天 − 5 分钟时钟余量），`110/111/100/HTTP 401` 失效重取 + **恰好重试一次**，并发按缓存键单飞（只打一次 token 接口）。
+- 配置组 `upscale_config` 7 键：`enable`（默认 **false**）/ `api_key` / `secret_key`（默认空）/ `max_image_mb`=4 / `max_pixels`=4000000 / `timeout_seconds`=20 / `enable_proxy`=false。键由 AstrBot 核心在插件加载时按 schema 自动补齐，**不需要手工迁移**。
+- 放大相关的 DEBUG（每图）+ INFO（每任务一条 `放大 成功=N 跳过=N 失败=N`）+ WARNING（每失败类一次）；`log_id` 只落 `task.runtime["upscale"]`。
+
+### 修复
+
+- **P0：原生节点失败不再被记成 `TypeError`**。`main.py` 把 3 参 `_provider_error(provider, exc, task)` 绑给 `runtime.configure(error_reporter=…)`，而 `runtime.report_provider_error()` 按 2 参调用 ⇒ 每次原生节点失败都在「上报失败」处抛 `TypeError`，真实原因（超时 / 4xx-5xx / 无输出）被吞掉、`attempt_errors` 从未写入（终态日志只剩 `errors=TypeError attempts=-`）、多节点 fallback 被整段跳过。线上自 2026-10-23 起累计 8 次。修法：`task` 改为可缺省（`task=None`），并新增 `test/test_runtime_hook.py` 两条守卫（签名层 + 真实 `report_provider_error()` 2 参驱动）。
+- **吸收上游 v1.3.0 的安全修复（F1）**：Gemini 结果图的 `fileUri` **只在同域**才补 `?key=`。旧实现把 key 追加到任意 URI 上，中转把结果图放到自己的对象存储时等于把用户的 Gemini key 交给第三方日志。`_file_uri_with_key(uri, api_key, api_host)` 新增 `api_host`（节点 `base_url` 的 netloc）且不给默认值；融合版既有的三处边界处理（按参数名判 `key`/`apiKey`、fragment 留在最后、无值 `?key`）全部保留。
+- **吸收上游 v1.3.0 的功能缺陷修复（F2，裁剪版）**：Gemini 节点的尺寸真正生效。v1.2.2 的 `generationConfig` 只有 `responseModalities`，节点上填的 `default_size` 对 Gemini **静默无效**（写 3:4 出来 1:1）。现在把 `size` / `default_size` 约分成 `generationConfig.imageConfig.aspectRatio`；识别不出比例时**不写**该键（请求体与旧版逐字节一致），不引入 `imageSize` 与 `custom_params`。
+
+> 上游 `1.3.0` 的变更日志只写「新增/变更」，**没有**把上面两项标成修复；F1/F2 是按 diff 语义判定的（F3「调试日志里的 size 打印错」与 `custom_params` 强耦合，本版不吸收）。
+
+### 不进本版（明确排除）
+
+- 上游删除 `providers/openai_chat.py` / `providers/dashscope.py` 及其在 `API_TYPES` / schema `api_type.options` / WebUI 校验白名单里的联动：**`openai_chat` 与 `dashscope_multimodal` 必须保留**（`test/test_core.py` 有守卫用例）。
+- 上游的 `xai_image` 适配器、`core/params.py`、`custom_params` 取代 `default_size`、配置页参数控件与 WebUI 渲染：属破坏性配置变更，本版是 bug 修复线。
+- 百炼（`dashscope_multimodal`）同类的「尺寸不生效」检查：登记为遗留，不扩面。
+
 ## 1.0.0 — 2026-10-16
 
 首次以 **IMAGO·FUSION**（注册名 `imago_fusion`）发布：以 **IMAGO·映相 v1.2.2** 为骨架，融合「大香蕉」的 **AstrBot 原生 Provider 桥接**——出图不再只能走 HTTP 直连，也可以走 AstrBot 里已经配好的 Chat Provider（反代 / 网页端模型）。
@@ -24,4 +48,4 @@
 
 ### 已知问题
 
-- **原生 Provider 失败会被记成 `TypeError`**：`main.py` 把 3 参的 `_provider_error(provider, exc, task)` 绑给 `runtime.configure(error_reporter=…)`，而 `runtime.report_provider_error()` 按 2 参调用 ⇒ 每次原生节点失败都在错误上报处抛 `TypeError`，真正的失败原因（超时 / HTTP 4xx-5xx / 无输出）被吞掉，且多节点 fallback 会被整段跳过。线上自 2026-10-23 起累计 8 次（终态日志只剩 `errors=TypeError attempts=-`）。**截至 2026-10-27 未修复**，修复方案与复现步骤见工作区手册 `astrbot_plugin_imago/AGENTS.md` §4。
+- **原生 Provider 失败会被记成 `TypeError`**：`main.py` 把 3 参的 `_provider_error(provider, exc, task)` 绑给 `runtime.configure(error_reporter=…)`，而 `runtime.report_provider_error()` 按 2 参调用 ⇒ 每次原生节点失败都在错误上报处抛 `TypeError`，真正的失败原因（超时 / HTTP 4xx-5xx / 无输出）被吞掉，且多节点 fallback 会被整段跳过。线上自 2026-10-23 起累计 8 次（终态日志只剩 `errors=TypeError attempts=-`）。**已在 1.1.0 修复**（`task` 改为可缺省 + 两条守卫测试）。
