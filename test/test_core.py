@@ -310,23 +310,30 @@ class ProviderTests(unittest.TestCase):
         self.assertEqual(values[1].data, b"image")
 
     def test_gemini_file_uri_appends_key_when_missing(self):
+        # 1.1.0：第三个参数是节点 base_url 的 netloc（同域才补 key，见 DESIGN §4 B1 / F1）。
         from imago_fusion.providers.gemini import _file_uri_with_key
+        host = "example.invalid"
         self.assertEqual(
-            _file_uri_with_key("https://example.invalid/v1beta/files/abc", "k1"),
+            _file_uri_with_key("https://example.invalid/v1beta/files/abc", "k1", host),
             "https://example.invalid/v1beta/files/abc?key=k1",
         )
         self.assertEqual(
-            _file_uri_with_key("https://example.invalid/v1beta/files/abc?alt=media", "k1"),
+            _file_uri_with_key("https://example.invalid/v1beta/files/abc?alt=media", "k1", host),
             "https://example.invalid/v1beta/files/abc?alt=media&key=k1",
         )
         # 已带 key 或 api_key 为空时原样返回
         self.assertEqual(
-            _file_uri_with_key("https://example.invalid/v1beta/files/abc?key=old", "k1"),
+            _file_uri_with_key("https://example.invalid/v1beta/files/abc?key=old", "k1", host),
             "https://example.invalid/v1beta/files/abc?key=old",
         )
         self.assertEqual(
-            _file_uri_with_key("https://example.invalid/v1beta/files/abc", ""),
+            _file_uri_with_key("https://example.invalid/v1beta/files/abc", "", host),
             "https://example.invalid/v1beta/files/abc",
+        )
+        # 跨域（中转/第三方对象存储）一律不补 key
+        self.assertEqual(
+            _file_uri_with_key("https://cdn.third-party.invalid/v1beta/files/abc", "k1", host),
+            "https://cdn.third-party.invalid/v1beta/files/abc",
         )
 
     def test_valid_responses_without_images_are_no_output(self):

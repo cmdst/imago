@@ -500,64 +500,146 @@ class TemplateOverrideGuardTests(unittest.TestCase):
 
 
 class FileUriKeyTests(unittest.TestCase):
-    """Regression tests for the Files API key-splicing fix (DESIGN §4 B1)."""
+    """Regression tests for the Files API key-splicing fix (DESIGN §4 B1).
+
+    1.1.0 吸收上游 imago v1.3.0 的 F1 修复后，第三个参数 ``api_host`` 承载「同域」
+    判据：只有与节点 ``base_url`` 同 netloc 的 fileUri 才补 key，跨域一律原样返回
+    （中转把结果图放到自己的对象存储时，补 key 等于把密钥交给第三方日志）。
+    """
 
     def setUp(self):
         from imago_fusion.providers.gemini import _file_uri_with_key
 
         self.append = _file_uri_with_key
         self.key = "AIzaTESTKEY123"
+        self.host = "relay.local"
 
     def test_plain_url_gets_the_key(self):
         self.assertEqual(
-            self.append("https://relay.local/files/abc", self.key),
+            self.append("https://relay.local/files/abc", self.key, self.host),
             "https://relay.local/files/abc?key=AIzaTESTKEY123",
         )
 
     def test_existing_query_keeps_the_key_as_a_query_parameter(self):
         self.assertEqual(
-            self.append("https://relay.local/files/abc?alt=media", self.key),
+            self.append("https://relay.local/files/abc?alt=media", self.key, self.host),
             "https://relay.local/files/abc?alt=media&key=AIzaTESTKEY123",
         )
 
     def test_monkey_parameter_is_not_mistaken_for_an_existing_key(self):
         self.assertEqual(
-            self.append("https://relay.local/files/abc?monkey=1", self.key),
+            self.append("https://relay.local/files/abc?monkey=1", self.key, self.host),
             "https://relay.local/files/abc?monkey=1&key=AIzaTESTKEY123",
         )
 
     def test_fragment_stays_last_so_the_key_is_actually_sent(self):
         self.assertEqual(
-            self.append("https://relay.local/files/abc?alt=media#frag", self.key),
+            self.append("https://relay.local/files/abc?alt=media#frag", self.key, self.host),
             "https://relay.local/files/abc?alt=media&key=AIzaTESTKEY123#frag",
         )
 
     def test_valueless_key_parameter_is_recognised(self):
         self.assertEqual(
-            self.append("https://relay.local/files/abc?key", self.key),
+            self.append("https://relay.local/files/abc?key", self.key, self.host),
             "https://relay.local/files/abc?key",
         )
 
     def test_apiKey_alias_is_recognised(self):
         self.assertEqual(
-            self.append("https://relay.local/files/abc?apiKey=zz", self.key),
+            self.append("https://relay.local/files/abc?apiKey=zz", self.key, self.host),
             "https://relay.local/files/abc?apiKey=zz",
         )
 
     def test_existing_key_is_left_alone(self):
         self.assertEqual(
-            self.append("https://relay.local/files/abc?key=other", self.key),
+            self.append("https://relay.local/files/abc?key=other", self.key, self.host),
             "https://relay.local/files/abc?key=other",
         )
 
     def test_non_http_references_are_never_modified(self):
-        self.assertEqual(self.append("base64://AAAA", self.key), "base64://AAAA")
-        self.assertEqual(self.append("", self.key), "")
+        self.assertEqual(self.append("base64://AAAA", self.key, self.host), "base64://AAAA")
+        self.assertEqual(self.append("", self.key, self.host), "")
 
     def test_empty_key_is_not_appended(self):
         self.assertEqual(
-            self.append("https://relay.local/files/abc", ""),
+            self.append("https://relay.local/files/abc", "", self.host),
             "https://relay.local/files/abc",
+        )
+
+    def test_cross_domain_uri_never_receives_the_key(self):
+        # 中转把结果图放到第三方对象存储时，绝不能把 Gemini key 拼上去（F1）。
+        self.assertEqual(
+            self.append("https://cdn.third-party.invalid/files/abc", self.key, self.host),
+            "https://cdn.third-party.invalid/files/abc",
+        )
+        self.assertEqual(
+            self.append("https://relay.local.evil.invalid/files/abc", self.key, self.host),
+            "https://relay.local.evil.invalid/files/abc",
+        )
+
+    def test_empty_host_never_appends_the_key(self):
+        # base_url 没有 netloc（空串 / 裸路径）时一律不补：宁可下载 401 也不泄密钥。
+        self.assertEqual(
+            self.append("https://relay.local/files/abc", self.key, ""),
+            "https://relay.local/files/abc",
+        )
+        self.assertEqual(
+            self.append("https://relay.local/files/abc", self.key, "   "),
+            "https://relay.local/files/abc",
+        )
+
+
+class GeminiFileUriCallSiteTests(unittest.IsolatedAsyncioTestCase):
+    """`GeminiAdapter.generate()` 必须把节点 netloc 传给 `_file_uri_with_key()`。
+
+    只测 `_file_uri_with_key` 本身不够：同域判据的入参来自 `base_url`，调用点漏传
+    就会退化成「一律不补 key」（结果图下载 401）；传错（例如传整个 URL）则会静默
+    变成「只对某些 URL 补」。这里用假 session 走一遍真实 `generate()`。
+    """
+
+    class _Response:
+        status = 200
+
+        def __init__(self, payload):
+            self.payload = payload
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_exc):
+            return False
+
+        async def json(self, content_type=None):
+            return self.payload
+
+    class _Session:
+        def __init__(self, payload):
+            self.payload = payload
+            self.calls = []
+
+        def post(self, url, **kwargs):
+            self.calls.append((url, kwargs))
+            return GeminiFileUriCallSiteTests._Response(self.payload)
+
+    async def test_same_host_file_uri_gets_the_key_but_cross_domain_does_not(self):
+        from imago_fusion.providers.gemini import GeminiAdapter
+
+        adapter = GeminiAdapter(ProviderConfig(
+            "gemini", "gemini_official", "https://relay.local/v1beta", ("k",), model="m",
+        ))
+        payload = {"candidates": [{"content": {"parts": [
+            {"fileData": {"fileUri": "https://relay.local/v1beta/files/abc"}},
+            {"fileData": {"fileUri": "https://cdn.third-party.invalid/files/abc"}},
+        ]}}]}
+        session = self._Session(payload)
+        results = await adapter.generate(session, GenerationRequest("画一张测试图"), "k1")
+        self.assertEqual(
+            results[0].url, "https://relay.local/v1beta/files/abc?key=k1",
+            "同域 fileUri 必须补 key，否则结果图下载 401",
+        )
+        self.assertEqual(
+            results[1].url, "https://cdn.third-party.invalid/files/abc",
+            "跨域 fileUri 绝不能被拼上 key（等于把密钥交给第三方存储）",
         )
 
 
