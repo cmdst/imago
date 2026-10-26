@@ -2,11 +2,49 @@ from __future__ import annotations
 
 import base64
 import binascii
+import math
+import re
 from urllib.parse import quote, parse_qsl, urlencode, urlsplit, urlunsplit
 
 from .base import ProviderAdapter
 from ..core.errors import NoOutputError, UnsupportedResponse
 from ..core.models import GenerationRequest, ImageResult
+
+# ``default_size`` 的两种合法写法：像素尺寸（``1024x1024`` / ``1024*1024``）与
+# 比例串（``3:4``）。其余值（``auto`` / 空串 / 乱码）一律不产生 aspectRatio。
+_PIXELS = re.compile(r"^(\d+)\s*[x*]\s*(\d+)$", re.IGNORECASE)
+_RATIO = re.compile(r"^\d+(?:\.\d+)?:\d+(?:\.\d+)?$")
+
+
+def _aspect_ratio(size: str) -> str:
+    """把节点 ``size`` 归一成 Gemini 的 ``aspectRatio``；无法识别返回空串。
+
+    v1.2.2 的 Gemini 请求体里**完全没有**尺寸（``generationConfig`` 只有
+    ``responseModalities``），节点上填的 ``default_size`` 对 Gemini 静默无效
+    （用户以为是 3:4，出来是 1:1）。这里把尺寸约分成比例写进
+    ``generationConfig.imageConfig.aspectRatio``（吸收上游 imago v1.3.0 的 F2，
+    轨迹见其 diff；不引入 ``custom_params``）。
+
+    Args:
+        size: 请求里的 ``size`` 或节点的 ``default_size``。
+
+    Returns:
+        比例串（``1:1`` / ``3:4`` / ``16:9``）；空串、``auto``、无法识别的写法返回
+        ``""``（调用方据此**不写** ``imageConfig``，保持请求体与 v1.2.2 一致）。
+    """
+    text = str(size or "").strip()
+    if not text:
+        return ""
+    if _RATIO.match(text):
+        return text
+    match = _PIXELS.match(text)
+    if not match:
+        return ""
+    width, height = int(match.group(1)), int(match.group(2))
+    if width <= 0 or height <= 0:
+        return ""
+    divisor = math.gcd(width, height)
+    return f"{width // divisor}:{height // divisor}"
 
 
 def _file_uri_with_key(uri: str, api_key: str, api_host: str) -> str:
@@ -62,7 +100,13 @@ class GeminiAdapter(ProviderAdapter):
     async def generate(self, session, request: GenerationRequest, api_key: str):
         parts = [{"text": request.prompt}]
         parts.extend({"inlineData": {"mimeType": image.mime_type, "data": base64.b64encode(image.data).decode()}} for image in request.references)
-        body = {"contents": [{"role": "user", "parts": parts}], "generationConfig": {"responseModalities": ["TEXT", "IMAGE"]}}
+        generation_config: dict = {"responseModalities": ["TEXT", "IMAGE"]}
+        # 尺寸真正生效（F2）：取值口径与 openai_image / custom 一致（请求优先，其次
+        # 节点默认）。识别不出比例时不写 imageConfig，保持 v1.2.2 的请求体不变。
+        ratio = _aspect_ratio(request.size or self.config.default_size)
+        if ratio:
+            generation_config["imageConfig"] = {"aspectRatio": ratio}
+        body = {"contents": [{"role": "user", "parts": parts}], "generationConfig": generation_config}
         base = self.config.base_url.rstrip("/")
         # 结果图的 fileUri 只在与节点同域时补 key（跨域＝中转/第三方存储，不泄密钥）。
         api_host = urlsplit(self.config.base_url).netloc

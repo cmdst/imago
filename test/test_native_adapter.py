@@ -87,6 +87,36 @@ class FakeProviderManager:
         return self.provider
 
 
+class FakeJsonResponse:
+    """假 aiohttp 响应：`json()` 返回预置 payload，`status` 固定 200。"""
+
+    status = 200
+
+    def __init__(self, payload) -> None:
+        self.payload = payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+    async def json(self, content_type=None):
+        return self.payload
+
+
+class FakeJsonSession:
+    """假 session：记录 `(url, kwargs)` 并返回同一个 FakeJsonResponse。"""
+
+    def __init__(self, payload) -> None:
+        self.payload = payload
+        self.calls: list[tuple[str, dict]] = []
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return FakeJsonResponse(self.payload)
+
+
 class FakeContext:
     def __init__(
         self, *, response=None, provider=None, error: Exception | None = None
@@ -641,6 +671,70 @@ class GeminiFileUriCallSiteTests(unittest.IsolatedAsyncioTestCase):
             results[1].url, "https://cdn.third-party.invalid/files/abc",
             "跨域 fileUri 绝不能被拼上 key（等于把密钥交给第三方存储）",
         )
+
+
+class GeminiAspectRatioTests(unittest.IsolatedAsyncioTestCase):
+    """Gemini 节点的尺寸必须真正生效（吸收上游 v1.3.0 的 F2，裁剪版）。
+
+    v1.2.2 的请求体 `generationConfig` 里只有 `responseModalities`，节点上填的
+    `default_size` 对 Gemini **静默无效**（写 3:4，出来 1:1）。1.1.0 把尺寸约分成
+    `generationConfig.imageConfig.aspectRatio`；识别不出比例时**不写**该键，保证
+    老配置（空 `default_size` / `auto`）的请求体与 v1.2.2 逐字节一致。
+    """
+
+    IMAGE_PART = {"inlineData": {"mimeType": "image/png", "data": "aW1hZ2U="}}
+
+    async def _generation_config(self, *, default_size: str, request_size: str = ""):
+        from imago_fusion.providers.gemini import GeminiAdapter
+
+        adapter = GeminiAdapter(ProviderConfig(
+            "gemini", "gemini_official", "https://relay.local/v1beta", ("k",),
+            model="m", default_size=default_size,
+        ))
+        session = FakeJsonSession({"candidates": [{"content": {"parts": [dict(self.IMAGE_PART)]}}]})
+        request = GenerationRequest("画一张测试图", size=request_size)
+        await adapter.generate(session, request, "k1")
+        self.assertEqual(len(session.calls), 1)
+        return session.calls[0][1]["json"]["generationConfig"]
+
+    async def test_pixel_size_is_reduced_to_an_aspect_ratio(self):
+        self.assertEqual(
+            (await self._generation_config(default_size="1024x1024"))["imageConfig"],
+            {"aspectRatio": "1:1"},
+        )
+        self.assertEqual(
+            (await self._generation_config(default_size="1024*1024"))["imageConfig"],
+            {"aspectRatio": "1:1"},
+        )
+        self.assertEqual(
+            (await self._generation_config(default_size="768x1024"))["imageConfig"],
+            {"aspectRatio": "3:4"},
+        )
+
+    async def test_ratio_string_is_passed_through(self):
+        self.assertEqual(
+            (await self._generation_config(default_size="3:4"))["imageConfig"],
+            {"aspectRatio": "3:4"},
+        )
+        self.assertEqual(
+            (await self._generation_config(default_size="16:9"))["imageConfig"],
+            {"aspectRatio": "16:9"},
+        )
+
+    async def test_unrecognised_size_keeps_the_request_body_unchanged(self):
+        # 空 / auto / 乱码：不写 imageConfig，与 v1.2.2 的请求体一致。
+        for size in ("", "  ", "auto", "自动", "1024", "x"):
+            config = await self._generation_config(default_size=size)
+            self.assertNotIn("imageConfig", config, f"size={size!r} 不应产生 imageConfig")
+            self.assertEqual(config, {"responseModalities": ["TEXT", "IMAGE"]})
+
+    async def test_request_size_wins_over_node_default(self):
+        config = await self._generation_config(default_size="1024x1024", request_size="16:9")
+        self.assertEqual(config["imageConfig"], {"aspectRatio": "16:9"})
+
+    async def test_response_modalities_survive_next_to_image_config(self):
+        config = await self._generation_config(default_size="1024x1024")
+        self.assertEqual(config["responseModalities"], ["TEXT", "IMAGE"])
 
 
 class CommonPayloadMimeTests(unittest.TestCase):
