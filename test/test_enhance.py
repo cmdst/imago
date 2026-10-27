@@ -13,7 +13,10 @@
 - E8 网络失败 / 无 ``image`` 字段 ⇒ 降级原图 + 本任务熔断 + **绝不写 task.errors**；
 - E9 token 过期（110）⇒ 失效重取 + 恰好重试一次（调用序列恰好 4 次）；
 - E10 ``error_code=6``（应用未勾选「图像清晰度增强」）⇒ 不重试、告警一次、熔断；
-- E11 输出超过 storage 上限 ⇒ 跳过、不落盘（+ 端点常量守卫见 test_core.py）。
+- E10 之后：输出超过 storage 上限 ⇒ 跳过、不落盘（spec 未给单独编号，随 E8/E10 的降级语义一并覆盖）；
+- E11 端点守卫（见**本文件** ``EnhanceEndpointGuardTests``）：``ENHANCE_URL`` 必须是
+  ``image_definition_enhance``，且 ``main.py`` / ``core/*.py`` / ``_conf_schema.json``
+  里 0 处旧端点 id。
 """
 
 import asyncio
@@ -116,6 +119,17 @@ class FakeResponse:
         return False
 
 
+def _status_sequence(value) -> tuple[deque, int]:
+    """把 ``200`` / ``[401, 200]`` 归一成 ``(队列, 末位默认值)``；``None`` ⇒ 200。
+
+    与 ``FakeSession._take()`` 配合：队列里多于一个时按调用顺序 pop，剩最后一个时
+    重复使用（最后一条状态就是「后续都这样」）。
+    """
+    values = list(value) if isinstance(value, (list, tuple)) else [value]
+    values = [200 if item is None else int(item) for item in values]
+    return deque(values), (values[-1] if values else 200)
+
+
 class _PostContext:
     """``session.post(...)`` 的异步上下文管理器（延迟/异常在这里发生）。"""
 
@@ -130,12 +144,18 @@ class _PostContext:
                 await asyncio.sleep(session.token_delay)
             if session.token_exc is not None:
                 raise session.token_exc
-            return FakeResponse(session._take(session.token_payloads, session.token_default))
+            return FakeResponse(
+                session._take(session.token_payloads, session.token_default),
+                session._take(session.token_statuses, session.token_status_default),
+            )
         if session.enhance_delay:
             await asyncio.sleep(session.enhance_delay)
         if session.enhance_exc is not None:
             raise session.enhance_exc
-        return FakeResponse(session._take(session.enhance_payloads, session.enhance_default))
+        return FakeResponse(
+            session._take(session.enhance_payloads, session.enhance_default),
+            session._take(session.enhance_statuses, session.enhance_status_default),
+        )
 
     async def __aexit__(self, *_exc):
         return False
@@ -149,6 +169,8 @@ class FakeSession:
         *,
         token=None,
         enhance=None,
+        token_status=None,
+        enhance_status=None,
         token_exc: BaseException | None = None,
         enhance_exc: BaseException | None = None,
         token_delay: float = 0.0,
@@ -160,6 +182,8 @@ class FakeSession:
         self.enhance_payloads = deque(enhance_list)
         self.token_default = token_list[-1] if token_list else None
         self.enhance_default = enhance_list[-1] if enhance_list else None
+        self.token_statuses, self.token_status_default = _status_sequence(token_status)
+        self.enhance_statuses, self.enhance_status_default = _status_sequence(enhance_status)
         self.token_exc = token_exc
         self.enhance_exc = enhance_exc
         self.token_delay = token_delay
@@ -505,7 +529,11 @@ class EnhanceTokenTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EnhanceFailureTests(unittest.IsolatedAsyncioTestCase):
-    """E8 / E10 / E11：失败与跳过的降级语义（**不碰 task.errors**）。"""
+    """E8 / E10：失败与跳过的降级语义（**不碰 task.errors**）。
+
+    含「输出超过 storage 上限」的跳过路径（spec 未单列编号）与 ``error_code=6`` 的
+    不重试/熔断路径。
+    """
 
     async def test_network_failure_degrades_and_opens_the_circuit(self):
         with TemporaryDirectory() as directory:
@@ -600,6 +628,88 @@ class EnhanceFailureTests(unittest.IsolatedAsyncioTestCase):
             self.assertIn("output_oversize", state.skipped)
             self.assertEqual(sorted(path.name for path in out_dir.iterdir()), ["origin.png"])
             self.assertEqual(state.succeeded, 0)
+
+
+class EnhanceHttpStatusTests(unittest.IsolatedAsyncioTestCase):
+    """E9 的 HTTP 状态码分支（执行级）：401 重取一次 / 500 只重试一次后降级。
+
+    与 ``EnhanceTokenTests``（响应体里的 ``error_code=110``）互补——这两条走的是
+    ``_exchange`` 的**状态码**分支：401 ⇒ token 族错误 ⇒ 失效重取后恰好重试一次；
+    HTTP ≥400 ⇒ transient ⇒ 退避 0.5 s 重试一次，仍失败则降级发原图。
+    """
+
+    async def test_http_401_refreshes_token_once_and_retries(self):
+        with TemporaryDirectory() as directory:
+            out_dir = Path(directory)
+            original = out_dir / "origin.png"
+            original.write_bytes(png_bytes())
+            enhanced = png_bytes(4, 4, b"\x00" * 16)
+            session = FakeSession(
+                token=[token_payload("A"), token_payload("B")],
+                enhance={"log_id": 7, "image": base64.b64encode(enhanced).decode()},
+                enhance_status=[401, 200],
+            )
+            debugs: list = []
+            enhancer = BaiduEnhancer(
+                session, lambda: runtime_config(), debug=debug_recorder(debugs), warn=recorder([])
+            )
+            task = make_task()
+            state = EnhanceState()
+
+            value = await enhancer.apply(task, original, out_dir, enhance_config(), state)
+
+            self.assertEqual(
+                [url for url, _ in session.calls],
+                [logic.TOKEN_URL, logic.ENHANCE_URL, logic.TOKEN_URL, logic.ENHANCE_URL],
+                "HTTP 401 ⇒ 失效重取 token 一次 + 重试增强一次（不多不少）",
+            )
+            self.assertEqual(session.enhance_calls[0][1]["params"]["access_token"], "A")
+            self.assertEqual(session.enhance_calls[1][1]["params"]["access_token"], "B")
+            # 执行级：最终真的拿到增强结果，而不是降级原图
+            self.assertIsInstance(value, Path)
+            self.assertNotEqual(value, original)
+            self.assertEqual(value.read_bytes(), enhanced)
+            self.assertEqual(state.succeeded, 1)
+            self.assertEqual(state.failures, [])
+            self.assertEqual(task.errors, [])
+            self.assertEqual(task.state, TaskState.CREATED)
+
+    async def test_http_500_twice_degrades_without_a_retry_loop(self):
+        with TemporaryDirectory() as directory:
+            out_dir = Path(directory)
+            original = out_dir / "origin.png"
+            original.write_bytes(png_bytes())
+            session = FakeSession(
+                token=token_payload(),
+                enhance=enhance_payload(),
+                enhance_status=[500, 500],
+            )
+            debugs: list = []
+            enhancer = BaiduEnhancer(
+                session, lambda: runtime_config(), debug=debug_recorder(debugs), warn=recorder([])
+            )
+            task = make_task()
+            state = EnhanceState()
+
+            value = await enhancer.apply(task, original, out_dir, enhance_config(), state)
+
+            # 失败后降级：只重试一次（transient 族），不会无限重试
+            self.assertEqual(
+                [url for url, _ in session.calls],
+                [logic.TOKEN_URL, logic.ENHANCE_URL, logic.ENHANCE_URL],
+                "HTTP 500 连续两次 ⇒ token + 增强 + 一次重试，然后放弃",
+            )
+            self.assertIs(value, original, "降级必须原样返回入参")
+            self.assertEqual(sorted(path.name for path in out_dir.iterdir()), ["origin.png"])
+            # 硬约束：不写 task.errors、不改 task.state（否则会误报「部分图片绘制失败」）
+            self.assertEqual(task.errors, [])
+            self.assertEqual(task.state, TaskState.CREATED)
+            self.assertEqual(task.runtime["enhance"]["failures"], ["transient:500"])
+            self.assertTrue(state.circuit_open, "transient 失败后本任务熔断，后续图不再尝试")
+            self.assertTrue(
+                any("失败" in message for message, _ in debugs),
+                f"必须留在 DEBUG 失败行：{debugs}",
+            )
 
 
 class EnhanceDefaultConfigTests(unittest.IsolatedAsyncioTestCase):
