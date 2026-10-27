@@ -595,7 +595,7 @@ class UpscaleApplyTests(unittest.IsolatedAsyncioTestCase):
         # 恰好到边界：本地判据放行（随后请求照常发），证明 `>` 而不是 `>=`
         session_ok = FakeSession(token=token_payload(), upscale=image_payload(128, 128))
         task, state, _, value, _ = await self._apply(
-            data=png_of_size(3_145_728), session=session_ok
+            data=png_of_size(3_145_728), session=session_ok, cfg=cfg
         )
         self.assertEqual(len(session_ok.upscale_calls), 1)
         self.assertEqual(state.succeeded, 1)
@@ -603,7 +603,7 @@ class UpscaleApplyTests(unittest.IsolatedAsyncioTestCase):
         # 越过 1 字节：连 token 都不取
         session_over = FakeSession(token=token_payload(), upscale=image_payload(128, 128))
         task, state, original, value, _ = await self._apply(
-            data=png_of_size(3_145_729), session=session_over
+            data=png_of_size(3_145_729), session=session_over, cfg=cfg
         )
         self.assertEqual(session_over.calls, [])
         self.assertIs(value, original)
@@ -830,6 +830,15 @@ class UpscaleChainTests(_ChainHarness):
         self.assertEqual(upscale_state.succeeded, 1)
         self.assertEqual(task.runtime["enhance"]["succeeded"], 1)
         self.assertEqual(task.runtime["upscale"]["succeeded"], 1)
+        # U14 的另一半：增强侧口径**未变**，仍是同样 6 个键（多一个键 = 统计口径漂移）
+        self.assertEqual(
+            set(task.runtime["enhance"]),
+            {"attempted", "succeeded", "skipped", "failures", "circuit_open", "log_id"},
+        )
+        self.assertEqual(
+            set(task.runtime["upscale"]),
+            {"attempted", "succeeded", "skipped", "failures", "circuit_open", "log_id"},
+        )
         self.assertEqual(task.state, TaskState.SUCCEEDED)
         self.assertEqual(task.errors, [])
 
@@ -923,17 +932,48 @@ class UpscaleChainTests(_ChainHarness):
 
 
 class UpscaleWiringGuardTests(unittest.TestCase):
-    """U7/U15 的**源序**半边：main.py 的两级插入点与 INFO 汇总行位置逐字钉住。
+    """U7/U15 的**源序**半边：main.py 的两级插入点与 INFO 汇总行逐字钉住。
 
     为什么是静态断言：这两处都在 ``ImagoFusion._finish_task`` 的循环体与终态日志里，
-    要执行它们得先造一个完整的 AstrBot 插件实例（本文件明令"不自建 astrbot 桩"）。
-    所以「运行期行为」由 ``UpscaleChainTests`` 保证，「插入点顺序与日志格式」由本节按
-    源码位置钉住——与既有 E11 端点守卫同一套路。
+    要执行它们得先造一个完整的 AstrBot 插件实例（本文件按 v3.10.1 明令"不自建 astrbot
+    桩"）。所以「运行期行为」由 ``UpscaleChainTests`` 保证，「插入点顺序」与「INFO 汇总
+    行的**整段调用**（含实参顺序）」由本节按源码位置钉住——与既有 E11 端点守卫同一套路。
+
+    「只断言格式串存在」不够：把 ``upscale_stats.get("succeeded", 0)`` 与
+    ``len(upscale_stats.get("skipped") or [])`` 两个实参对调，格式串与出现顺序都不变，
+    线上 INFO 行的「成功/跳过」却会静默错位（评审 t4 的 mutation F 就是这样漏过的）。
+    因此 ``EXPECTED_UPSCALE_INFO`` 把整段调用（含每个实参一行一项、顺序在内）写死。
     """
+
+    # `logger.info` 整段调用（规范化：每行 strip 后逐行比对）。任何一行被改写、两个数字
+    # 实参被对调、或多/少一个实参，都会让本列表与源码不等 ⇒ 门禁必红。
+    EXPECTED_UPSCALE_INFO = [
+        'upscale_stats = task.runtime.get("upscale")',
+        "if upscale_stats:",
+        "logger.info(",
+        '"%s task=%s 放大 成功=%d 跳过=%d 失败=%d",',
+        "prefix, task.id[:8],",
+        'upscale_stats.get("succeeded", 0),',
+        'len(upscale_stats.get("skipped") or []),',
+        'len(upscale_stats.get("failures") or []),',
+        ")",
+    ]
 
     @classmethod
     def setUpClass(cls):
         cls.source = (ROOT / "main.py").read_text("utf-8")
+
+    def test_upscale_info_call_is_pinned_verbatim_with_its_argument_order(self):
+        """U15 的 INFO 半边：整段 ``logger.info``（5 行有效代码 + 实参顺序）逐字比对。"""
+        start = self.source.index('upscale_stats = task.runtime.get("upscale")')
+        lines = [line.strip() for line in self.source[start:].splitlines()]
+        end = lines.index(")") + 1
+        self.assertEqual(
+            lines[:end],
+            self.EXPECTED_UPSCALE_INFO,
+            "放大 INFO 汇总行的调用被改写（实参顺序/文本变了）："
+            "冻结口径是 prefix, task.id[:8], succeeded, len(skipped), len(failures)",
+        )
 
     def test_materialize_then_enhance_then_upscale_in_the_same_loop(self):
         source = self.source
