@@ -556,6 +556,15 @@ class UpscaleApplyTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(session.upscale_calls), 1)
         url, kwargs = session.upscale_calls[0]
         self.assertTrue(url.startswith(logic.UPSCALE_URL))
+        # 端点 = 执行级断言：抓**实际发出的 URL** 的 host 与 path（不是只看常量）
+        parsed = urlparse(url)
+        self.assertEqual(parsed.netloc, "aip.baidubce.com")
+        self.assertEqual(parsed.path, "/rest/2.0/image-process/v1/image_quality_enhance")
+        # 放大路径全程不得出现增强端点（防「改回错误端点」的静默回退化）
+        self.assertEqual(
+            [url_ for url_, _ in session.calls if "image_definition_enhance" in url_], []
+        )
+        self.assertEqual([url_ for url_, _ in session.calls if "image_quality_enhance" not in url_ and "oauth" not in url_], [])
         self.assertEqual(kwargs["data"], {"image": base64.b64encode(data).decode()})
         # token 走查询参数、没有手写 Content-Type、不是 json=
         self.assertEqual(kwargs["params"], {"access_token": TOKEN_TEST})
@@ -844,6 +853,27 @@ class UpscaleChainTests(_ChainHarness):
         self.assertEqual(task.runtime["upscale"]["skipped"], ["pixels_too_large"])
         self.assertEqual(task.runtime["enhance"]["succeeded"], 1)
         # 任务仍 succeeded：放大跳过**不是**失败（不写 errors、不改 state）
+        self.assertEqual(task.state, TaskState.SUCCEEDED)
+        self.assertEqual(task.errors, [])
+
+    async def test_upscale_over_the_byte_limit_also_keeps_the_enhanced_output(self):
+        """U8 的字节半边：增强产物 3 145 729 B > 4M 的原图等价上限 ⇒ 放大 ``too_large`` 跳过。"""
+        big = png_of_size(3_145_729, 1000, 1000)   # 恰好越过 4M base64 的等价原图上限
+        session = FakeSession(
+            token=token_payload(),
+            enhance={"log_id": 9, "image": base64.b64encode(big).decode()},
+        )
+        task, delivered, out_dir, enhance_state, upscale_state, _, _ = await self.run_chain(
+            results=1, session=session, enhance_cfg=enhance_config(), upscale_cfg=upscale_config(),
+        )
+        # 增强级的判据是 10M（3.1 MB 远未到），放大级的判据是 4M ⇒ 只有放大被跳过
+        self.assertEqual(enhance_state.succeeded, 1)
+        self.assertEqual(session.endpoints(), ["token", "definition"])
+        self.assertEqual(upscale_state.skipped, ["too_large"])
+        self.assertEqual(upscale_state.attempted, 0)
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0].read_bytes(), big)      # 交付增强产物，不回退原图
+        self.assertEqual(task.runtime["upscale"]["skipped"], ["too_large"])
         self.assertEqual(task.state, TaskState.SUCCEEDED)
         self.assertEqual(task.errors, [])
 
