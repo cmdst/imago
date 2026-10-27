@@ -87,10 +87,10 @@ class QuotaConfig:
 
 
 @dataclass(frozen=True, slots=True)
-class UpscaleConfig:
-    """百度「图像无损放大」的开关、凭据与本地预检阈值（``upscale_config`` 组）。
+class EnhanceConfig:
+    """百度「图像无损放大」的开关、凭据与本地预检阈值（``enhance_config`` 组）。
 
-    ``enabled`` 默认 **False**：关闭时 ``core.upscale_client.BaiduUpscaler`` 在所有路径
+    ``enabled`` 默认 **False**：关闭时 ``core.enhance_client.BaiduEnhancer`` 在所有路径
     上立即返回原图，零网络、零新文件、零 ``task.runtime`` 键、零新增日志。
 
     Attributes:
@@ -121,7 +121,7 @@ class UpscaleConfig:
         """原图字节上限：base64 膨胀 4/3，故上限 = ``max_image_mb`` × 3/4。
 
         默认 4 MiB ⇒ 3 145 728 B。用原图字节数判等价于判 base64 长度（单调），
-        省一次编码；见 ``core/upscale.py`` 的 ``plan()``。
+        省一次编码；见 ``core/enhance.py`` 的 ``plan()``。
         """
         return self.max_image_mb * 1024 * 1024 * 3 // 4
 
@@ -155,9 +155,9 @@ class RuntimeConfig:
     # switch because such a string is also a valid AstrBot provider id
     # (``cpa_Gemini/web-gemini-image``); see ``core/config.py``.
     template_override: bool = False
-    # 百度「图像无损放大」：默认关闭。关闭时出图链路与 v1.0.0 逐字节等价
-    # （零网络、零新文件、零 runtime 键），见 ``core/upscale_client.py``。
-    upscale: UpscaleConfig = field(default_factory=UpscaleConfig)
+    # 百度「图像清晰度增强」：默认关闭。关闭时出图链路与 v1.0.0 逐字节等价
+    # （零网络、零新文件、零 runtime 键），见 ``core/enhance_client.py``。
+    enhance: EnhanceConfig = field(default_factory=EnhanceConfig)
 
 
 @dataclass(slots=True)

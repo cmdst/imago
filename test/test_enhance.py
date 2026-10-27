@@ -29,9 +29,9 @@ from tempfile import TemporaryDirectory
 
 import aiohttp
 
-from imago_fusion.core import upscale as logic
-from imago_fusion.core.models import DrawTask, GenerationRequest, RuntimeConfig, TaskState, UpscaleConfig
-from imago_fusion.core.upscale_client import BaiduUpscaler, UpscaleState
+from imago_fusion.core import enhance as logic
+from imago_fusion.core.models import DrawTask, GenerationRequest, RuntimeConfig, TaskState, EnhanceConfig
+from imago_fusion.core.enhance_client import BaiduEnhancer, EnhanceState
 
 TOKEN_TEST = "TOKEN_TEST"
 
@@ -55,11 +55,11 @@ def runtime_config(**overrides) -> RuntimeConfig:
     return RuntimeConfig(**values)
 
 
-def upscale_config(**overrides) -> UpscaleConfig:
+def enhance_config(**overrides) -> EnhanceConfig:
     """默认「开关打开 + 两把 key 齐全」；单条用例只覆盖自己关心的键。"""
     values = {"enabled": True, "api_key": "API_KEY_TEST", "secret_key": "SECRET_KEY_TEST"}
     values.update(overrides)
-    return UpscaleConfig(**values)
+    return EnhanceConfig(**values)
 
 
 def make_task(task_id: str = "a" * 16) -> DrawTask:
@@ -182,7 +182,7 @@ def enhance_payload(width: int = 4, height: int = 4, *, log_id: int = 7) -> dict
     return {"log_id": log_id, "image": base64.b64encode(png_bytes(width, height, b"\x00" * 16)).decode()}
 
 
-class UpscaleHappyPathTests(unittest.IsolatedAsyncioTestCase):
+class EnhanceHappyPathTests(unittest.IsolatedAsyncioTestCase):
     """UC-1：开关打开 + key 齐全 ⇒ 交付图是放大结果，原图保留。"""
 
     async def test_happy_path_writes_a_new_file_and_keeps_the_original(self):
@@ -197,13 +197,13 @@ class UpscaleHappyPathTests(unittest.IsolatedAsyncioTestCase):
             )
             debugs: list = []
             warns: list = []
-            upscaler = BaiduUpscaler(
+            enhancer = BaiduEnhancer(
                 session, lambda: runtime_config(), debug=debug_recorder(debugs), warn=recorder(warns)
             )
             task = make_task()
-            state = UpscaleState()
+            state = EnhanceState()
 
-            value = await upscaler.apply(task, original, out_dir, upscale_config(), state)
+            value = await enhancer.apply(task, original, out_dir, enhance_config(), state)
 
             # ① 返回新 Path（≠ 入参）② 内容就是放大结果 ③ 原图仍在
             self.assertIsInstance(value, Path)
@@ -213,7 +213,7 @@ class UpscaleHappyPathTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(value.parent, out_dir, "放大图必须落在任务缓存目录")
             # ④ 统计
             self.assertEqual((state.attempted, state.succeeded), (1, 1))
-            self.assertEqual(task.runtime["upscale"]["succeeded"], 1)
+            self.assertEqual(task.runtime["enhance"]["succeeded"], 1)
             self.assertEqual(task.errors, [])
             # ⑤ 两次调用：token 在前、放大在后，access_token 走查询参数
             self.assertEqual([url for url, _ in session.calls], [logic.TOKEN_URL, logic.ENHANCE_URL])
@@ -225,7 +225,7 @@ class UpscaleHappyPathTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(base64.b64decode(encoded), original.read_bytes())
             # ⑦ 日志：一条 DEBUG（含 in/out 字节与 log_id），无 WARNING
             self.assertEqual(len(debugs), 1)
-            self.assertIn("放大 完成", debugs[0][0])
+            self.assertIn("增强 完成", debugs[0][0])
             self.assertEqual(warns, [])
 
     async def test_proxy_is_passed_only_when_enabled_and_configured(self):
@@ -237,19 +237,19 @@ class UpscaleHappyPathTests(unittest.IsolatedAsyncioTestCase):
             proxy_url = "http://127.0.0.1:7890"
 
             proxied = FakeSession(token=token_payload(), enhance=enhance_payload())
-            upscaler = BaiduUpscaler(
+            enhancer = BaiduEnhancer(
                 proxied,
                 lambda: runtime_config(proxy_url=proxy_url),
                 debug=debug_recorder([]),
                 warn=recorder([]),
             )
             proxied_task = make_task()
-            await upscaler.apply(proxied_task, original, out_dir, upscale_config(enable_proxy=True), UpscaleState())
+            await enhancer.apply(proxied_task, original, out_dir, enhance_config(enable_proxy=True), EnhanceState())
             self.assertEqual([kwargs.get("proxy") for _, kwargs in proxied.calls], [proxy_url, proxy_url])
             self.assertEqual(proxied_task.errors, [])
 
             direct = FakeSession(token=token_payload(), enhance=enhance_payload())
-            upscaler = BaiduUpscaler(
+            enhancer = BaiduEnhancer(
                 direct,
                 lambda: runtime_config(proxy_url=proxy_url),
                 debug=debug_recorder([]),
@@ -257,17 +257,17 @@ class UpscaleHappyPathTests(unittest.IsolatedAsyncioTestCase):
             )
             # 开着代理但顶层地址为空 ⇒ 直连（不能把空串当代理传给 aiohttp）
             empty = FakeSession(token=token_payload(), enhance=enhance_payload())
-            upscaler_empty = BaiduUpscaler(
+            enhancer_empty = BaiduEnhancer(
                 empty, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder([])
             )
-            await upscaler_empty.apply(make_task(), original, out_dir, upscale_config(enable_proxy=True), UpscaleState())
+            await enhancer_empty.apply(make_task(), original, out_dir, enhance_config(enable_proxy=True), EnhanceState())
             self.assertEqual([kwargs.get("proxy") for _, kwargs in empty.calls], [None, None])
             # 开关没开 ⇒ 即使配了 proxy_url 也不传
-            await upscaler.apply(make_task(), original, out_dir, upscale_config(), UpscaleState())
+            await enhancer.apply(make_task(), original, out_dir, enhance_config(), EnhanceState())
             self.assertEqual([kwargs.get("proxy") for _, kwargs in direct.calls], [None, None])
 
 
-class UpscalePrecheckTests(unittest.IsolatedAsyncioTestCase):
+class EnhancePrecheckTests(unittest.IsolatedAsyncioTestCase):
     """UC-2 / UC-3：本地预检超限直接跳过，绝**不**发无效请求（省一次计费）。"""
 
     async def test_too_large_image_is_skipped_without_any_request(self):
@@ -278,11 +278,11 @@ class UpscalePrecheckTests(unittest.IsolatedAsyncioTestCase):
             original.write_bytes(png_bytes(2, 2, b"\x00" * 1_500_000))
             session = FakeSession(token=token_payload(), enhance=enhance_payload())
             debugs: list = []
-            upscaler = BaiduUpscaler(session, lambda: runtime_config(), debug=debug_recorder(debugs), warn=recorder([]))
+            enhancer = BaiduEnhancer(session, lambda: runtime_config(), debug=debug_recorder(debugs), warn=recorder([]))
             task = make_task()
-            state = UpscaleState()
+            state = EnhanceState()
 
-            value = await upscaler.apply(task, original, out_dir, upscale_config(max_image_mb=1), state)
+            value = await enhancer.apply(task, original, out_dir, enhance_config(max_image_mb=1), state)
 
             self.assertEqual(value, original, "降级必须原样返回入参")
             self.assertEqual(session.calls, [], "预检跳过必须零网络")
@@ -296,30 +296,30 @@ class UpscalePrecheckTests(unittest.IsolatedAsyncioTestCase):
             original = out_dir / "big.png"
             original.write_bytes(png_bytes(2000, 2000))  # 4 000 000 px
             session = FakeSession(token=token_payload(), enhance=enhance_payload())
-            upscaler = BaiduUpscaler(session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder([]))
+            enhancer = BaiduEnhancer(session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder([]))
             task = make_task()
 
-            state = UpscaleState()
-            value = await upscaler.apply(task, original, out_dir, upscale_config(max_pixels=1_000_000), state)
+            state = EnhanceState()
+            value = await enhancer.apply(task, original, out_dir, enhance_config(max_pixels=1_000_000), state)
             self.assertEqual(value, original)
             self.assertEqual(session.calls, [])
             self.assertEqual(state.skipped, ["too_many_pixels"])
 
             # 边界：恰好 4 000 000 px 允许（百度口径是「不超过」）
             boundary_session = FakeSession(token=token_payload(), enhance=enhance_payload())
-            boundary = BaiduUpscaler(
+            boundary = BaiduEnhancer(
                 boundary_session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder([])
             )
-            boundary_state = UpscaleState()
+            boundary_state = EnhanceState()
             value = await boundary.apply(
-                task, original, out_dir, upscale_config(max_pixels=4_000_000), boundary_state
+                task, original, out_dir, enhance_config(max_pixels=4_000_000), boundary_state
             )
             self.assertNotEqual(value, original)
             self.assertEqual(boundary_state.attempted, 1)
             self.assertEqual(boundary_state.skipped, [])
 
 
-class UpscaleGatingTests(unittest.IsolatedAsyncioTestCase):
+class EnhanceGatingTests(unittest.IsolatedAsyncioTestCase):
     """UC-4 / UC-7：未配置与关闭两条「零副作用」路径。"""
 
     async def test_enabled_without_keys_is_silent_and_warns_only_once(self):
@@ -329,19 +329,19 @@ class UpscaleGatingTests(unittest.IsolatedAsyncioTestCase):
             original.write_bytes(png_bytes(2, 2))
             session = FakeSession(token=token_payload(), enhance=enhance_payload())
             warns: list = []
-            upscaler = BaiduUpscaler(session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder(warns))
+            enhancer = BaiduEnhancer(session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder(warns))
             task = make_task()
-            cfg = upscale_config(api_key="")
+            cfg = enhance_config(api_key="")
 
-            value = await upscaler.apply(task, original, out_dir, cfg, UpscaleState())
+            value = await enhancer.apply(task, original, out_dir, cfg, EnhanceState())
             self.assertEqual(value, original)
             self.assertEqual(session.calls, [], "key 不全时连 token 接口都不能调")
-            self.assertNotIn("upscale", task.runtime, "未配置＝完全静默（不建 runtime 键）")
+            self.assertNotIn("enhance", task.runtime, "未配置＝完全静默（不建 runtime 键）")
             self.assertEqual(len(warns), 1)
             self.assertIn("API Key", warns[0][0])
 
             # 再跑一次任务：去重后不再告警
-            await upscaler.apply(task, original, out_dir, cfg, UpscaleState())
+            await enhancer.apply(task, original, out_dir, cfg, EnhanceState())
             self.assertEqual(len(warns), 1)
 
     async def test_disabled_switch_touches_nothing(self):
@@ -352,21 +352,21 @@ class UpscaleGatingTests(unittest.IsolatedAsyncioTestCase):
             session = FakeSession(token=token_payload(), enhance=enhance_payload())
             debugs: list = []
             warns: list = []
-            upscaler = BaiduUpscaler(session, lambda: runtime_config(), debug=debug_recorder(debugs), warn=recorder(warns))
+            enhancer = BaiduEnhancer(session, lambda: runtime_config(), debug=debug_recorder(debugs), warn=recorder(warns))
             task = make_task()
-            state = UpscaleState()
+            state = EnhanceState()
 
-            value = await upscaler.apply(task, original, out_dir, UpscaleConfig(), state)
+            value = await enhancer.apply(task, original, out_dir, EnhanceConfig(), state)
 
             self.assertEqual(value, original)
             self.assertEqual(session.calls, [], "开关关闭必须零网络")
-            self.assertNotIn("upscale", task.runtime)
-            self.assertEqual(state, UpscaleState(), "关闭路径不能碰统计对象")
+            self.assertNotIn("enhance", task.runtime)
+            self.assertEqual(state, EnhanceState(), "关闭路径不能碰统计对象")
             self.assertEqual(debugs, [])
             self.assertEqual(warns, [])
 
 
-class UpscaleTokenTests(unittest.IsolatedAsyncioTestCase):
+class EnhanceTokenTests(unittest.IsolatedAsyncioTestCase):
     """UC-5 / UC-11：token 失效重取（恰好一次）与并发单飞。"""
 
     async def test_expired_token_refreshes_once_and_retries_once(self):
@@ -378,11 +378,11 @@ class UpscaleTokenTests(unittest.IsolatedAsyncioTestCase):
                 token=[token_payload("A"), token_payload("B")],
                 enhance=[{"error_code": 110, "error_msg": "Access token invalid or no longer valid"}, enhance_payload()],
             )
-            upscaler = BaiduUpscaler(session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder([]))
+            enhancer = BaiduEnhancer(session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder([]))
             task = make_task()
-            state = UpscaleState()
+            state = EnhanceState()
 
-            value = await upscaler.apply(task, original, out_dir, upscale_config(), state)
+            value = await enhancer.apply(task, original, out_dir, enhance_config(), state)
 
             self.assertNotEqual(value, original, "重取 token 后重试一次应当成功")
             self.assertEqual(
@@ -399,17 +399,17 @@ class UpscaleTokenTests(unittest.IsolatedAsyncioTestCase):
             second = out_dir / "second.png"
             second.write_bytes(png_bytes(2, 2))
             calls_before = len(session.calls)
-            await upscaler.apply(task, second, out_dir, upscale_config(), UpscaleState())
+            await enhancer.apply(task, second, out_dir, enhance_config(), EnhanceState())
             self.assertEqual(len(session.token_calls), 2, "缓存命中后不得再打 token 接口")
             self.assertEqual(len(session.calls) - calls_before, 1)
 
-    async def test_concurrent_upscales_share_one_token_request(self):
+    async def test_concurrent_enhances_share_one_token_request(self):
         with TemporaryDirectory() as directory:
             out_dir = Path(directory)
             session = FakeSession(
                 token=token_payload(), enhance=enhance_payload(), token_delay=0.05
             )
-            upscaler = BaiduUpscaler(session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder([]))
+            enhancer = BaiduEnhancer(session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder([]))
 
             files = []
             for index in range(5):
@@ -418,8 +418,8 @@ class UpscaleTokenTests(unittest.IsolatedAsyncioTestCase):
                 files.append(path)
 
             async def run(path: Path):
-                return await upscaler.apply(
-                    make_task(f"{index:032x}"), path, out_dir, upscale_config(), UpscaleState()
+                return await enhancer.apply(
+                    make_task(f"{index:032x}"), path, out_dir, enhance_config(), EnhanceState()
                 )
 
             results = await asyncio.gather(*(run(path) for path in files))
@@ -432,7 +432,7 @@ class UpscaleTokenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(tokens, {TOKEN_TEST})
 
 
-class UpscaleFailureTests(unittest.IsolatedAsyncioTestCase):
+class EnhanceFailureTests(unittest.IsolatedAsyncioTestCase):
     """UC-6 / UC-8 / UC-9 / UC-10：失败与跳过的降级语义（**不碰 task.errors**）。"""
 
     async def test_network_failure_degrades_and_opens_the_circuit(self):
@@ -445,19 +445,19 @@ class UpscaleFailureTests(unittest.IsolatedAsyncioTestCase):
             session = FakeSession(
                 token=token_payload(), enhance=enhance_payload(), enhance_exc=aiohttp.ClientError("boom")
             )
-            upscaler = BaiduUpscaler(session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder([]))
+            enhancer = BaiduEnhancer(session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder([]))
             task = make_task()
-            state = UpscaleState()
+            state = EnhanceState()
 
-            value = await upscaler.apply(task, first, out_dir, upscale_config(), state)
+            value = await enhancer.apply(task, first, out_dir, enhance_config(), state)
             self.assertEqual(value, first)
             self.assertTrue(state.circuit_open, "网络失败后本任务必须熔断")
 
-            value = await upscaler.apply(task, second, out_dir, upscale_config(), state)
+            value = await enhancer.apply(task, second, out_dir, enhance_config(), state)
             self.assertEqual(value, second)
             self.assertEqual(len(session.calls), 2, "熔断后第二张图零网络（1 token + 1 放大）")
             self.assertEqual(task.errors, [], "放大失败绝不能写 task.errors")
-            failures = task.runtime["upscale"]["failures"]
+            failures = task.runtime["enhance"]["failures"]
             self.assertEqual(len(failures), 1)
             self.assertTrue(failures[0].startswith("transient"), failures)
             self.assertEqual(sorted(path.name for path in out_dir.iterdir()), ["first.png", "second.png"])
@@ -471,17 +471,17 @@ class UpscaleFailureTests(unittest.IsolatedAsyncioTestCase):
                 token=token_payload(),
                 enhance={"error_code": 216401, "error_msg": "internal error"},
             )
-            upscaler = BaiduUpscaler(session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder([]))
+            enhancer = BaiduEnhancer(session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder([]))
             task = make_task()
             task.runtime["quota_charged"] = 1
 
-            await upscaler.apply(task, original, out_dir, upscale_config(), UpscaleState())
+            await enhancer.apply(task, original, out_dir, enhance_config(), EnhanceState())
 
-            # 放大失败对任务唯一的痕迹是 runtime["upscale"]。
+            # 放大失败对任务唯一的痕迹是 runtime["enhance"]。
             self.assertEqual(task.errors, [], "task.errors 一非空，用户就会看到『部分图片绘制失败。』")
             self.assertEqual(task.state, TaskState.CREATED, "放大不得改任务状态")
             self.assertEqual(task.runtime["quota_charged"], 1)
-            self.assertEqual(task.runtime["upscale"]["circuit_open"], True)
+            self.assertEqual(task.runtime["enhance"]["circuit_open"], True)
 
     async def test_permission_error_warns_once_and_does_not_retry(self):
         with TemporaryDirectory() as directory:
@@ -493,11 +493,11 @@ class UpscaleFailureTests(unittest.IsolatedAsyncioTestCase):
                 enhance={"error_code": 6, "error_msg": "No permission to access data"},
             )
             warns: list = []
-            upscaler = BaiduUpscaler(session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder(warns))
+            enhancer = BaiduEnhancer(session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder(warns))
             task = make_task()
-            state = UpscaleState()
+            state = EnhanceState()
 
-            value = await upscaler.apply(task, original, out_dir, upscale_config(), state)
+            value = await enhancer.apply(task, original, out_dir, enhance_config(), state)
 
             self.assertEqual(value, original)
             self.assertEqual(len(session.enhance_calls), 1, "无权限不重试（重试也不会变对）")
@@ -513,16 +513,16 @@ class UpscaleFailureTests(unittest.IsolatedAsyncioTestCase):
             original.write_bytes(png_bytes(2, 2))
             session = FakeSession(token=token_payload(), enhance=enhance_payload(8, 8))
             debugs: list = []
-            upscaler = BaiduUpscaler(
+            enhancer = BaiduEnhancer(
                 session,
                 lambda: runtime_config(max_upload_bytes=16),
                 debug=debug_recorder(debugs),
                 warn=recorder([]),
             )
             task = make_task()
-            state = UpscaleState()
+            state = EnhanceState()
 
-            value = await upscaler.apply(task, original, out_dir, upscale_config(), state)
+            value = await enhancer.apply(task, original, out_dir, enhance_config(), state)
 
             self.assertEqual(value, original)
             self.assertIn("output_oversize", state.skipped)
@@ -530,10 +530,10 @@ class UpscaleFailureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(state.succeeded, 0)
 
 
-class UpscaleDefaultConfigTests(unittest.IsolatedAsyncioTestCase):
+class EnhanceDefaultConfigTests(unittest.IsolatedAsyncioTestCase):
     """默认配置（新装的真实起点）下绝不产生任何百度调用。
 
-    UC-7 用手写的 ``UpscaleConfig()``；这里改用 ``load_config({})`` 的**真实解析
+    UC-7 用手写的 ``EnhanceConfig()``；这里改用 ``load_config({})`` 的**真实解析
     结果**，防止「schema 默认值被改成 true」或「load_config 把组读错」这类改动绕过
     零副作用承诺。
     """
@@ -547,21 +547,21 @@ class UpscaleDefaultConfigTests(unittest.IsolatedAsyncioTestCase):
             original.write_bytes(png_bytes(2, 2))
             session = FakeSession(token=token_payload(), enhance=enhance_payload())
             runtime_cfg = load_config({})  # 空配置 = 用户没填过任何东西
-            upscaler = BaiduUpscaler(
+            enhancer = BaiduEnhancer(
                 session, lambda: runtime_cfg, debug=debug_recorder([]), warn=recorder([])
             )
             task = make_task()
 
-            value = await upscaler.apply(task, original, out_dir, runtime_cfg.upscale, UpscaleState())
+            value = await enhancer.apply(task, original, out_dir, runtime_cfg.enhance, EnhanceState())
 
-            self.assertFalse(runtime_cfg.upscale.enabled, "默认必须是关闭")
+            self.assertFalse(runtime_cfg.enhance.enabled, "默认必须是关闭")
             self.assertEqual(value, original)
             self.assertEqual(session.calls, [], "默认配置下不允许任何百度网络调用")
-            self.assertNotIn("upscale", task.runtime, "默认配置下不允许出现放大 runtime 键")
+            self.assertNotIn("enhance", task.runtime, "默认配置下不允许出现放大 runtime 键")
             self.assertEqual(sorted(path.name for path in out_dir.iterdir()), ["origin.png"])
 
 
-class UpscaleLogicTests(unittest.TestCase):
+class EnhanceLogicTests(unittest.TestCase):
     """纯逻辑层：编码/嗅探/预检/错误分类（不涉及 session）。"""
 
     def test_sniff_and_dimensions_cover_the_three_supported_formats(self):
@@ -600,7 +600,7 @@ class UpscaleLogicTests(unittest.TestCase):
         self.assertEqual(logic.error_code_of({"log_id": 1}), 0)
 
     def test_plan_rejects_empty_unrecognised_and_over_budget_images(self):
-        cfg = UpscaleConfig()
+        cfg = EnhanceConfig()
         self.assertEqual(logic.plan(b"", cfg, remaining=300)[1], "empty")
         self.assertEqual(logic.plan(b"RIFF\x00\x00\x00\x00WEBP", cfg, remaining=300)[1], "format")
         self.assertEqual(logic.plan(png_bytes(2, 2), cfg, remaining=300)[0], True)
@@ -608,19 +608,19 @@ class UpscaleLogicTests(unittest.TestCase):
         self.assertEqual(logic.plan(png_bytes(2, 2), cfg, remaining=cfg.timeout_seconds + 15)[1], "budget")
 
     def test_payload_decoding_reports_missing_image_and_bad_base64(self):
-        from imago_fusion.core.errors import UpscaleError, UpscaleSkipped
+        from imago_fusion.core.errors import EnhanceError, EnhanceSkipped
 
         # 文档里 image 是「否（可选）」：HTTP 200 + 无 error_code 也可能没有图
-        with self.assertRaises(UpscaleError):
+        with self.assertRaises(EnhanceError):
             logic.decode_payload({"log_id": 1})
-        with self.assertRaises(UpscaleError):
+        with self.assertRaises(EnhanceError):
             logic.decode_payload({"image": "!!!not-base64!!!"})
-        with self.assertRaises(UpscaleError) as permission:
+        with self.assertRaises(EnhanceError) as permission:
             logic.decode_payload({"error_code": 6, "error_msg": "No permission to access data"})
         self.assertEqual(permission.exception.kind, "permission")
         self.assertEqual(permission.exception.code, 6)
         # 输出超过 storage 上限 ⇒ 跳过（不是失败）
-        with self.assertRaises(UpscaleSkipped) as oversized:
+        with self.assertRaises(EnhanceSkipped) as oversized:
             logic.decode_payload(
                 {"image": base64.b64encode(png_bytes(2, 2)).decode()}, expected_max_bytes=4
             )

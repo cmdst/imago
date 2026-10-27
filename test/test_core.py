@@ -158,57 +158,57 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual((cfg.quota.checkin_quota_min, cfg.quota.checkin_quota_max), (5, 5))
 
     # C-1..C-4：百度「图像无损放大」配置解析（spec §8）。
-    def test_upscale_config_defaults_are_off_and_empty(self):
+    def test_enhance_config_defaults_are_off_and_empty(self):
         # C-1：默认关闭 + key 为空 ⇒ 不可能有任何百度网络调用。
-        upscale = load_config({}).upscale
-        self.assertFalse(upscale.enabled)
-        self.assertEqual(upscale.api_key, "")
-        self.assertEqual(upscale.secret_key, "")
-        self.assertEqual(upscale.max_image_mb, 4)
-        self.assertEqual(upscale.max_pixels, 4_000_000)
-        self.assertEqual(upscale.timeout_seconds, 20)
-        self.assertFalse(upscale.enable_proxy)
-        self.assertFalse(upscale.configured)
+        enhance = load_config({}).enhance
+        self.assertFalse(enhance.enabled)
+        self.assertEqual(enhance.api_key, "")
+        self.assertEqual(enhance.secret_key, "")
+        self.assertEqual(enhance.max_image_mb, 4)
+        self.assertEqual(enhance.max_pixels, 4_000_000)
+        self.assertEqual(enhance.timeout_seconds, 20)
+        self.assertFalse(enhance.enable_proxy)
+        self.assertFalse(enhance.configured)
 
-    def test_upscale_config_strips_keys_and_requires_both(self):
+    def test_enhance_config_strips_keys_and_requires_both(self):
         # C-2：key 去空白；两把 key 齐全且开关打开才算「已配置」。
-        cfg = load_config({"upscale_config": {
+        cfg = load_config({"enhance_config": {
             "enable": True, "api_key": " K ", "secret_key": "S",
-        }}).upscale
+        }}).enhance
         self.assertEqual(cfg.api_key, "K")
         self.assertEqual(cfg.secret_key, "S")
         self.assertTrue(cfg.configured)
         # 任一为空 ⇒ 未配置（插件视为没填，零请求）
-        self.assertFalse(load_config({"upscale_config": {
+        self.assertFalse(load_config({"enhance_config": {
             "enable": True, "api_key": "K", "secret_key": "",
-        }}).upscale.configured)
+        }}).enhance.configured)
         # 开关关闭时即使填了 key 也不算已配置
-        self.assertFalse(load_config({"upscale_config": {
+        self.assertFalse(load_config({"enhance_config": {
             "enable": False, "api_key": "K", "secret_key": "S",
-        }}).upscale.configured)
+        }}).enhance.configured)
 
-    def test_upscale_config_clamps_to_the_baidu_hard_limits(self):
+    def test_enhance_config_clamps_to_the_baidu_hard_limits(self):
         # C-3：数值按百度硬限 clamp（4M / 2000×2000 / 5-60 s），错值不许崩也不许越界。
-        cfg = load_config({"upscale_config": {
+        cfg = load_config({"enhance_config": {
             "max_image_mb": 99, "max_pixels": 10**9, "timeout_seconds": 999,
-        }}).upscale
+        }}).enhance
         self.assertEqual((cfg.max_image_mb, cfg.max_pixels, cfg.timeout_seconds), (4, 4_000_000, 60))
-        low = load_config({"upscale_config": {
+        low = load_config({"enhance_config": {
             "max_image_mb": 0, "max_pixels": 1, "timeout_seconds": 1,
-        }}).upscale
+        }}).enhance
         self.assertEqual((low.max_image_mb, low.max_pixels, low.timeout_seconds), (1, 250_000, 5))
-        bad = load_config({"upscale_config": {
+        bad = load_config({"enhance_config": {
             "max_image_mb": "abc", "max_pixels": None, "timeout_seconds": "",
-        }}).upscale
+        }}).enhance
         self.assertEqual((bad.max_image_mb, bad.max_pixels, bad.timeout_seconds), (4, 4_000_000, 20))
 
-    def test_upscale_raw_byte_limit_matches_the_base64_limit(self):
+    def test_enhance_raw_byte_limit_matches_the_base64_limit(self):
         # C-4：原图字节上限 = 4 MiB × 3/4，其 base64 恰好不超过 4 MiB。
         import base64
 
-        upscale = load_config({}).upscale
-        self.assertEqual(upscale.max_raw_bytes, 3_145_728)
-        encoded = base64.b64encode(b"x" * upscale.max_raw_bytes)
+        enhance = load_config({}).enhance
+        self.assertEqual(enhance.max_raw_bytes, 3_145_728)
+        encoded = base64.b64encode(b"x" * enhance.max_raw_bytes)
         self.assertLessEqual(len(encoded), 4 * 1024 * 1024)
 
     def test_api_types_keep_chat_and_dashscope(self):
@@ -227,11 +227,11 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(len(options), 6)
         self.assertLessEqual({"openai_chat", "dashscope_multimodal"}, set(options))
 
-    def test_upscale_schema_group_matches_the_parser(self):
-        # schema 里的 upscale_config 组与 core.config 的读取点必须一一对应：
+    def test_enhance_schema_group_matches_the_parser(self):
+        # schema 里的 enhance_config 组与 core.config 的读取点必须一一对应：
         # 「schema 有、解析不转发」= 用户填了却静默丢键。
         schema = json.loads((ROOT / "_conf_schema.json").read_text("utf-8"))
-        items = schema["upscale_config"]["items"]
+        items = schema["enhance_config"]["items"]
         self.assertEqual(
             set(items),
             {"enable", "api_key", "secret_key", "max_image_mb", "max_pixels", "timeout_seconds", "enable_proxy"},
@@ -240,7 +240,7 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(items["api_key"]["default"], "")
         self.assertEqual(items["secret_key"]["default"], "")
         # 默认值解析结果与 schema 声明一致（schema 改了但解析没跟着改会红）
-        defaults = load_config({}).upscale
+        defaults = load_config({}).enhance
         self.assertEqual(defaults.enabled, items["enable"]["default"])
         self.assertEqual(defaults.max_image_mb, items["max_image_mb"]["default"])
         self.assertEqual(defaults.max_pixels, items["max_pixels"]["default"])

@@ -57,12 +57,12 @@ class DuplicateRequest(ImagoFusionFusionError):
         super().__init__(message)
 
 
-class UpscaleError(Exception):
-    """放大失败的分类错误；``kind`` 机器可读，``code`` 为百度 ``error_code``（可能为 0）。
+class EnhanceError(Exception):
+    """增强失败的分类错误；``kind`` 机器可读，``code`` 为百度 ``error_code``（可能为 0）。
 
-    刻意不继承 :class:`ImagoFusionFusionError`：放大失败**不是**绘图失败，绝不能被
+    刻意不继承 :class:`ImagoFusionFusionError`：增强失败**不是**绘图失败，绝不能被
     ``main.py`` 的 ``task.errors`` 收下（否则用户会看到「部分图片绘制失败。」，
-    任务状态也会被降级成 ``PARTIAL_SUCCESS``）。见 ``core/upscale_client.py`` 的降级语义。
+    任务状态也会被降级成 ``PARTIAL_SUCCESS``）。见 ``core/enhance_client.py`` 的降级语义。
     """
 
     def __init__(self, kind: str, detail: str = "", *, code: int = 0) -> None:
@@ -72,8 +72,8 @@ class UpscaleError(Exception):
         self.code = code
 
 
-class UpscaleSkipped(Exception):
-    """本地预检判定「不放大」（不是失败）：``reason`` 见 ``core/upscale.plan()``。"""
+class EnhanceSkipped(Exception):
+    """本地预检判定「不增强」（不是失败）：``reason`` 见 ``core/enhance.plan()``。"""
 
     def __init__(self, reason: str, detail: str = "") -> None:
         super().__init__(detail or reason)

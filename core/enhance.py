@@ -1,6 +1,6 @@
 """百度「图像无损放大」的纯逻辑层：端点常量、本地预检、响应解析、错误分类。
 
-本模块**不发网络请求**（那是 ``core/upscale_client.py`` 的职责），也不依赖 AstrBot 或
+本模块**不发网络请求**（那是 ``core/enhance_client.py`` 的职责），也不依赖 AstrBot 或
 ``aiohttp``，因此可以在纯逻辑测试环境里直接导入（与 ``core/config.py`` 同样的约束）。
 
 端点口径（``[文档]`` 对账结论，见工作区 spec §2.1）：本版只用**图像无损放大**
@@ -21,10 +21,10 @@ import binascii
 import struct
 from typing import TYPE_CHECKING
 
-from .errors import UpscaleError, UpscaleSkipped
+from .errors import EnhanceError, EnhanceSkipped
 
 if TYPE_CHECKING:  # pragma: no cover - 只为类型检查导入
-    from .models import UpscaleConfig
+    from .models import EnhanceConfig
 
 ENHANCE_URL = "https://aip.baidubce.com/rest/2.0/image-process/v1/image_quality_enhance"
 TOKEN_URL = "https://aip.baidubce.com/oauth/2.0/token"
@@ -139,7 +139,7 @@ def encode_image(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
 
-def plan(data: bytes, cfg: "UpscaleConfig", *, remaining: float = 0.0) -> tuple[bool, str, str]:
+def plan(data: bytes, cfg: "EnhanceConfig", *, remaining: float = 0.0) -> tuple[bool, str, str]:
     """发请求前的本地预检；返回 ``(是否放大, reason, detail)``。
 
     判定顺序即 ``reason`` 的优先级：``empty`` → ``format`` → ``too_large`` →
@@ -148,7 +148,7 @@ def plan(data: bytes, cfg: "UpscaleConfig", *, remaining: float = 0.0) -> tuple[
     Args:
         data: 原图字节（此时已经落盘，``output_dir`` 里的 Path 读出来的）。
         cfg: 放大配置（阈值都带有 clamp 后的合法值）。
-        remaining: 本任务剩余的总预算（秒），见 ``core/upscale_client.py``。
+        remaining: 本任务剩余的总预算（秒），见 ``core/enhance_client.py``。
 
     Returns:
         ``(True, "", "")`` 表示可以发请求；否则 ``(False, reason, detail)``。
@@ -178,7 +178,7 @@ def plan(data: bytes, cfg: "UpscaleConfig", *, remaining: float = 0.0) -> tuple[
 def classify_error(code: int) -> str:
     """把百度 ``error_code`` 归成 ``kind``（机器可读的处置分类）。
 
-    分类含义（处置见 ``core/upscale_client.py``）：
+    分类含义（处置见 ``core/enhance_client.py``）：
 
     - ``token``：token 失效/无效/拉取失败 ⇒ 重取 + 恰好重试一次；
     - ``transient``：集群/内部错误 ⇒ 退避 0.5 s 重试一次；
@@ -227,21 +227,21 @@ def decode_payload(payload: object, *, expected_max_bytes: int = 0) -> tuple[byt
     Args:
         payload: 响应 JSON（成功时 ``{"log_id":…, "image":"<base64>"}``）。
         expected_max_bytes: 输出体积上限（``storage_config.max_upload_mb``）；
-            ``<=0`` 表示不限。超出抛 :class:`UpscaleSkipped`（跳过，不是失败）。
+            ``<=0`` 表示不限。超出抛 :class:`EnhanceSkipped`（跳过，不是失败）。
 
     Returns:
         ``(图片字节, MIME)``；MIME 由魔数判定，识别不出统一给 ``image/png``。
 
     Raises:
-        UpscaleError: ``error_code`` 非 0（分类见 :func:`classify_error`）、
+        EnhanceError: ``error_code`` 非 0（分类见 :func:`classify_error`）、
             ``image`` 缺失/不是合法 base64/为空。
-        UpscaleSkipped: 解出的图片超过输出上限。
+        EnhanceSkipped: 解出的图片超过输出上限。
     """
     if not isinstance(payload, dict):
-        raise UpscaleError("unknown", "payload_not_object")
+        raise EnhanceError("unknown", "payload_not_object")
     code = error_code_of(payload)
     if code:
-        raise UpscaleError(
+        raise EnhanceError(
             classify_error(code),
             str(payload.get("error_msg", "") or ""),
             code=code,
@@ -250,13 +250,13 @@ def decode_payload(payload: object, *, expected_max_bytes: int = 0) -> tuple[byt
     # 文档里 ``image`` 是「否（可选）」：HTTP 200 且无 error_code 也可能没有图，
     # 必须先判空，绝不写空文件。
     if not isinstance(encoded, str) or not encoded:
-        raise UpscaleError("unknown", "no_image")
+        raise EnhanceError("unknown", "no_image")
     try:
         data = base64.b64decode(encoded, validate=True)
     except (binascii.Error, ValueError, TypeError) as exc:
-        raise UpscaleError("unknown", "image_not_base64") from exc
+        raise EnhanceError("unknown", "image_not_base64") from exc
     if not data:
-        raise UpscaleError("unknown", "image_empty")
+        raise EnhanceError("unknown", "image_empty")
     if expected_max_bytes > 0 and len(data) > expected_max_bytes:
-        raise UpscaleSkipped("output_oversize", f"bytes={len(data)} limit={expected_max_bytes}")
+        raise EnhanceSkipped("output_oversize", f"bytes={len(data)} limit={expected_max_bytes}")
     return data, sniff_mime(data) or "image/png"
