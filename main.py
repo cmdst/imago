@@ -64,6 +64,7 @@ from .services.persona_store import PersonaStore
 from .services.quota_store import QuotaStore, terminal_refund_amount
 from .services.scheduler import TaskScheduler
 from .core.enhance_client import BaiduEnhancer, EnhanceState
+from .core.upscale_client import BaiduUpscaler, UpscaleState
 
 PENDING_DRAW = "🎨 收到灵感，正在绘制，请稍后…… ✨"
 PENDING_PHOTO = "📸 正在为当前人设「{persona}」拍摄，请稍后……"
@@ -104,8 +105,10 @@ class ImagoFusion(Star):
         self.raw_config = config or {}
         self.session = None
         self.scheduler = None
-        # 百度「图像清晰度增强」客户端：initialize() 里构造（需要共享 session）。
+        # 百度「图像清晰度增强」/「图像无损放大」客户端：initialize() 里构造
+        # （需要共享 session）。两级各持一份缓存、熔断与统计，互不影响。
         self.enhancer = None
+        self.upscaler = None
         self.sender = ProactiveSender(context, self._decorate_error, self._debug)
         data_dir = Path(StarTools.get_data_dir("imago_fusion"))
         self.store = PersonaStore(
@@ -155,6 +158,14 @@ class ImagoFusion(Star):
             lambda: load_config(self.raw_config),
             debug=self._scheduler_debug,
             warn=self._enhance_warning,
+        )
+        # 放大同样复用这条共享 session（不新建连接池生命周期）；开关/限值走独立的
+        # upscale_config，与增强的 enhance_config 互不读取（spec v3.7.3）。
+        self.upscaler = BaiduUpscaler(
+            self.session,
+            lambda: load_config(self.raw_config),
+            debug=self._scheduler_debug,
+            warn=self._upscale_warning,
         )
         self.scheduler = TaskScheduler(lambda: load_config(self.raw_config), self.session, self._finish_task, self._provider_error, self._scheduler_debug)
         api = PageAPI(self)
@@ -240,6 +251,11 @@ class ImagoFusion(Star):
 
     def _enhance_warning(self, message, *args):
         # 增强相关的 WARNING：只允许常量与错误码，绝不放 key / token / URL / 代理地址。
+        logger.warning("[ImagoFusion] " + message, *args)
+
+    def _upscale_warning(self, message, *args):
+        # 放大相关的 WARNING：与 _enhance_warning 同构但**独立**回调（文案带「放大 失败：」
+        # 前缀）；同样只允许常量与错误码，绝不放 key / token / URL / 代理地址。
         logger.warning("[ImagoFusion] " + message, *args)
 
     def _log_prefix(self, event=None):
@@ -1224,6 +1240,10 @@ class ImagoFusion(Star):
         # task.runtime 里不会出现 enhance 键（零副作用，见 core/enhance_client.py）。
         enhance_cfg = result_cfg.enhance
         enhance_state = EnhanceState()
+        # 放大（第 2 级）同样在循环外取配置、new 一个独立统计对象：开关关闭时
+        # upscaler.apply() 立即返回，runtime 里不会出现 upscale 键（Z0-U1..U6）。
+        upscale_cfg = result_cfg.upscale
+        upscale_state = UpscaleState()
         for result in results:
             try:
                 value = await materialize_result(self.session, result, output_dir, max_bytes=result_cfg.max_upload_bytes, block_private=result_cfg.block_private_networks)
@@ -1232,6 +1252,11 @@ class ImagoFusion(Star):
                 # 且调度器会把状态降级成 PARTIAL_SUCCESS。
                 if self.enhancer is not None:
                     value = await self.enhancer.apply(task, value, output_dir, enhance_cfg, enhance_state)
+                # 第 2 级：放大拿的是**上一级产物**（增强成功时是增强图，否则是原图）。
+                # 顺序不可交换（放大 2× 后再去噪 = 4 倍像素量且会顶爆增强的 5000px 上限）；
+                # 放大失败/跳过一律返回入参 ⇒ 保留上一级结果，绝不回退原图（v3.5.3）。
+                if self.upscaler is not None:
+                    value = await self.upscaler.apply(task, value, output_dir, upscale_cfg, upscale_state)
                 if isinstance(value, Path): output_paths.append(value)
                 chain.append(Image.fromFileSystem(str(value)) if isinstance(value, Path) else Image.fromURL(value))
                 self._debug("%s task=%s 生成结果已落盘 index=%d bytes=%d", self._log_prefix(task.runtime.get("source_event")), task.id[:8], len(chain), value.stat().st_size if isinstance(value, Path) else 0)
@@ -1448,6 +1473,18 @@ class ImagoFusion(Star):
                 enhance_stats.get("succeeded", 0),
                 len(enhance_stats.get("skipped") or []),
                 len(enhance_stats.get("failures") or []),
+            )
+        # 放大汇总：**独立成行**，紧跟增强行之后（spec v3.6.1 的冻结决定：改既有增强行
+        # 的格式会破坏生产日志按「增强 成功=」的对账；两级也可各自独立启用）。同样只在
+        # 本次任务真的碰过放大时才打（关闭时 runtime 无该键 ⇒ 零新增日志，Z0-U4）。
+        upscale_stats = task.runtime.get("upscale")
+        if upscale_stats:
+            logger.info(
+                "%s task=%s 放大 成功=%d 跳过=%d 失败=%d",
+                prefix, task.id[:8],
+                upscale_stats.get("succeeded", 0),
+                len(upscale_stats.get("skipped") or []),
+                len(upscale_stats.get("failures") or []),
             )
 
         def delivery(prefix: str) -> dict:

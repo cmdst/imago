@@ -61,9 +61,8 @@ UPSCALE_MIN_EDGE_PX = 16
 SCALE_FACTOR = 2
 
 # 本地跳过的全部 ``reason``（**恰好 7 条**，spec ``v3.4``）：前 5 条在 :func:`plan`，
-# 后 2 条在 ``core/upscale_client.BaiduUpscaler.apply`` 里判。与增强的 9 条枚举
-# （``empty`` / ``edge_too_long`` / ``aspect_too_wide`` 等）**互不冒充**：本侧没有
-# 那几条判据，增强侧也没有 ``pixels_too_large``。
+# 后 2 条在 ``core/upscale_client.BaiduUpscaler.apply`` 里判。与增强的 9 条枚举**互不
+# 冒充**：本侧没有增强那几条几何判据（增强侧也没有本侧的乘积判据）。
 SKIP_REASONS = (
     "format",
     "too_large",
@@ -129,13 +128,6 @@ def plan(data: bytes, cfg: "UpscaleConfig", *, remaining: float) -> tuple[bool, 
     return True, "", ""
 
 
-def dims_text(before: tuple[int, int] | None, after: tuple[int, int] | None) -> str:
-    """DEBUG 行里的 ``dims=`` 段：``"64x64->128x128"``；任一侧读不出时 ``"-"``。"""
-    if before is None or after is None:
-        return "-"
-    return f"{before[0]}x{before[1]}->{after[0]}x{after[1]}"
-
-
 def double_scale_ok(before: tuple[int, int] | None, after: tuple[int, int] | None) -> bool:
     """输出是否是输入的 2 倍（长宽各 2 倍，即面积 ×4）——**只做观测，绝不判失败**。
 
@@ -198,7 +190,6 @@ __all__ = [
     "UPSCALE_URL",
     "classify_error",
     "decode_payload",
-    "dims_text",
     "double_scale_ok",
     "encode_image",
     "error_code_of",

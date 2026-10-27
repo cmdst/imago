@@ -25,6 +25,7 @@
 夹具纪律：只用 ``API_KEY_TEST`` / ``SECRET_KEY_TEST`` / ``TOKEN_TEST`` 假值，**零真实网络**。
 """
 
+import asyncio
 import base64
 import struct
 import time
@@ -36,14 +37,24 @@ from urllib.parse import urlparse
 
 from imago_fusion.core import enhance as enhance_logic
 from imago_fusion.core import upscale as logic
+from imago_fusion.core.config import load_config
+from imago_fusion.core.enhance_client import BaiduEnhancer, EnhanceState
 from imago_fusion.core.errors import UpscaleError, UpscaleSkipped
 from imago_fusion.core.models import (
     DrawTask,
     EnhanceConfig,
     GenerationRequest,
+    ImageResult,
+    ProviderConfig,
     RuntimeConfig,
+    TaskStage,
+    TaskState,
     UpscaleConfig,
 )
+from imago_fusion.core.network import materialize_result
+from imago_fusion.core.upscale_client import BaiduUpscaler, UpscaleState
+from imago_fusion.services import scheduler as scheduler_module
+from imago_fusion.services.scheduler import TaskScheduler
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -318,14 +329,687 @@ class UpscalePayloadTests(unittest.TestCase):
         self.assertFalse(logic.double_scale_ok((64, 64), (96, 96)))
         self.assertTrue(logic.double_scale_ok(None, (128, 128)))
         self.assertTrue(logic.double_scale_ok((64, 64), None))
-        self.assertEqual(logic.dims_text((64, 64), (128, 128)), "64x64->128x128")
-        self.assertEqual(logic.dims_text(None, (128, 128)), "-")
         self.assertEqual(logic.SCALE_FACTOR, 2)
+        # DEBUG 行里 ``dims=`` 段的两种写法（``64x64->128x128`` / 读不出时 ``-``）由
+        # ``UpscaleLoggingTests`` 的逐字格式串钉住。
 
     def test_mime_suffix_follows_the_magic_number(self):
         self.assertEqual(logic.mime_suffix("image/png"), ".png")
         self.assertEqual(logic.mime_suffix("image/jpeg"), ".jpg")
         self.assertEqual(logic.mime_suffix("image/bmp"), ".png")
+
+
+# --------------------------------------------------------------------------- 网络层夹具
+
+
+class FakeResponse:
+    def __init__(self, payload, status: int = 200) -> None:
+        self.payload = payload
+        self.status = status
+
+    async def json(self, content_type=None):
+        return self.payload
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+def _payload_queue(value) -> tuple[deque, object]:
+    """把单值/列表归一成 ``(队列, 末位默认值)``：队列剩一个时重复使用（「后续都这样」）。"""
+    values = list(value) if isinstance(value, (list, tuple)) else [value]
+    return deque(values), (values[-1] if values else None)
+
+
+def _take(queue: deque, default):
+    if not queue:
+        return default
+    return queue.popleft() if len(queue) > 1 else queue[0]
+
+
+class _PostContext:
+    """``session.post(...)`` 的异步上下文管理器（延迟/异常在这里发生）。"""
+
+    def __init__(self, session: "FakeSession", url: str) -> None:
+        self.session = session
+        self.url = url
+
+    async def __aenter__(self):
+        session = self.session
+        if self.url.startswith(enhance_logic.TOKEN_URL):
+            if session.token_exc is not None:
+                raise session.token_exc
+            return FakeResponse(
+                _take(session.token_payloads, session.token_default),
+                _take(session.token_statuses, session.token_status_default),
+            )
+        # 先判放大端点：它是本文件的主角，且必须与增强端点互斥（U2）。
+        if self.url.startswith(logic.UPSCALE_URL):
+            if session.upscale_delay:
+                await asyncio.sleep(session.upscale_delay)
+            if session.upscale_exc is not None:
+                raise session.upscale_exc
+            return FakeResponse(
+                _take(session.upscale_payloads, session.upscale_default),
+                _take(session.upscale_statuses, session.upscale_status_default),
+            )
+        if session.enhance_delay:
+            await asyncio.sleep(session.enhance_delay)
+        if session.enhance_exc is not None:
+            raise session.enhance_exc
+        return FakeResponse(
+            _take(session.enhance_payloads, session.enhance_default),
+            _take(session.enhance_statuses, session.enhance_status_default),
+        )
+
+    async def __aexit__(self, *_exc):
+        return False
+
+
+class FakeSession:
+    """记录 ``(url, kwargs)``；按 URL 前缀返回预置响应；**零真实 IO**。
+
+    三条前缀互不重叠：token（``oauth/2.0/token``）/ 放大（``UPSCALE_URL``）/ 增强
+    （``ENHANCE_URL``）。记录里同时留了 ``kwargs``，因此「端点、载荷、token 走查询参数、
+    没有手写 Content-Type」都能被断言。
+    """
+
+    def __init__(
+        self,
+        *,
+        token=None,
+        enhance=None,
+        upscale=None,
+        token_status=None,
+        enhance_status=None,
+        upscale_status=None,
+        token_exc: BaseException | None = None,
+        enhance_exc: BaseException | None = None,
+        upscale_exc: BaseException | None = None,
+        enhance_delay: float = 0.0,
+        upscale_delay: float = 0.0,
+    ) -> None:
+        self.token_payloads, self.token_default = _payload_queue(token)
+        self.enhance_payloads, self.enhance_default = _payload_queue(enhance)
+        self.upscale_payloads, self.upscale_default = _payload_queue(upscale)
+        self.token_statuses, self.token_status_default = _payload_queue(
+            200 if token_status is None else token_status
+        )
+        self.enhance_statuses, self.enhance_status_default = _payload_queue(
+            200 if enhance_status is None else enhance_status
+        )
+        self.upscale_statuses, self.upscale_status_default = _payload_queue(
+            200 if upscale_status is None else upscale_status
+        )
+        self.token_exc = token_exc
+        self.enhance_exc = enhance_exc
+        self.upscale_exc = upscale_exc
+        self.enhance_delay = enhance_delay
+        self.upscale_delay = upscale_delay
+        self.calls: list[tuple[str, dict]] = []
+
+    @property
+    def token_calls(self):
+        return [call for call in self.calls if call[0].startswith(enhance_logic.TOKEN_URL)]
+
+    @property
+    def upscale_calls(self):
+        return [call for call in self.calls if call[0].startswith(logic.UPSCALE_URL)]
+
+    @property
+    def enhance_calls(self):
+        return [call for call in self.calls if call[0].startswith(enhance_logic.ENHANCE_URL)]
+
+    def post(self, url, **kwargs):
+        self.calls.append((url, kwargs))
+        return _PostContext(self, url)
+
+    def endpoints(self) -> list[str]:
+        """调用序列的可读前缀：``token`` / ``quality``（放大）/ ``definition``（增强）。"""
+        result = []
+        for url, _ in self.calls:
+            if url.startswith(enhance_logic.TOKEN_URL):
+                result.append("token")
+            elif url.startswith(logic.UPSCALE_URL):
+                result.append("quality")
+            else:
+                result.append("definition")
+        return result
+
+
+class DummySession:
+    """给 ``materialize_result`` 用的占位会话：结果图带 ``data`` 时它不会发任何请求。"""
+
+
+def recorder(sink: list):
+    """把 ``(message, args)`` 收进列表的 **WARNING** 回调（``warn=``）。"""
+
+    def _record(message, *args):
+        sink.append((message, args))
+
+    return _record
+
+
+def debug_recorder(sink: list):
+    """把 ``(message, args)`` 收进列表的 **DEBUG** 回调（``debug=``），形状同 ``main.py``。"""
+
+    def _record(task, message, *args):
+        sink.append((message, args))
+
+    return _record
+
+
+def token_payload(token: str = TOKEN_TEST) -> dict:
+    return {"access_token": token, "expires_in": 2592000}
+
+
+def image_payload(width: int, height: int, *, log_id: int = 7) -> dict:
+    """成功响应：``{"log_id", "image": <base64>}``（``image`` 不带 ``data:`` 头）。"""
+    return {"log_id": log_id, "image": base64.b64encode(png_bytes(width, height, b"\x00" * 16)).decode()}
+
+
+def upscaler_of(session, *, debug=None, warn=None, runtime=None) -> "BaiduUpscaler":
+    return BaiduUpscaler(
+        session,
+        lambda: runtime_config() if runtime is None else runtime,
+        debug=debug,
+        warn=warn,
+    )
+
+
+def enhancer_of(session, *, debug=None, warn=None, runtime=None) -> "BaiduEnhancer":
+    return BaiduEnhancer(
+        session,
+        lambda: runtime_config() if runtime is None else runtime,
+        debug=debug,
+        warn=warn,
+    )
+
+
+# --------------------------------------------------------------------------- 单级行为
+
+
+class UpscaleApplyTests(unittest.IsolatedAsyncioTestCase):
+    """U6/U3/U11/U14：放大单级的载荷、边界、默认零副作用与统计形状。"""
+
+    async def _apply(self, *, data: bytes, session: FakeSession, cfg=None, state=None):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        out_dir = Path(directory.name)
+        original = out_dir / "origin.png"
+        original.write_bytes(data)
+        task = make_task()
+        state = state or UpscaleState()
+        upscaler = upscaler_of(session, debug=debug_recorder([]), warn=recorder([]))
+        value = await upscaler.apply(task, original, out_dir, cfg or upscale_config(), state)
+        return task, state, original, value, out_dir
+
+    async def test_upscale_uploads_the_raw_input_and_stores_the_raw_response(self):
+        """U6（2× 语义）：输入原字节上传、响应原字节落盘，插件不做任何缩放/转码。"""
+        data = png_bytes(64, 64)
+        enlarged = png_bytes(128, 128, b"\x11" * 24)
+        session = FakeSession(token=token_payload(), upscale={"log_id": 11, "image": base64.b64encode(enlarged).decode()})
+        task, state, original, value, out_dir = await self._apply(data=data, session=session)
+        # ① 上传的载荷 == base64(输入原字节)：我们没有缩放输入
+        self.assertEqual(len(session.upscale_calls), 1)
+        url, kwargs = session.upscale_calls[0]
+        self.assertTrue(url.startswith(logic.UPSCALE_URL))
+        self.assertEqual(kwargs["data"], {"image": base64.b64encode(data).decode()})
+        # token 走查询参数、没有手写 Content-Type、不是 json=
+        self.assertEqual(kwargs["params"], {"access_token": TOKEN_TEST})
+        self.assertNotIn("headers", kwargs)
+        self.assertNotIn("json", kwargs)
+        # ② 落盘字节 == 响应解码字节；③ 尺寸恰为 2 倍（image_dimensions 读出 128×128）
+        self.assertIsInstance(value, Path)
+        self.assertNotEqual(value, original)
+        self.assertEqual(value.read_bytes(), enlarged)
+        self.assertEqual(logic.image_dimensions(value.read_bytes()), (128, 128))
+        self.assertTrue(logic.double_scale_ok(logic.image_dimensions(data), (128, 128)))
+        # ④ 后缀按响应魔数
+        self.assertEqual(value.suffix, ".png")
+        # 统计：成功 +1、log_id 落 runtime、恰好 6 键（U14）、绝不写 task.errors
+        self.assertEqual(state.succeeded, 1)
+        self.assertEqual(state.log_id, 11)
+        self.assertEqual(
+            set(task.runtime["upscale"]),
+            {"attempted", "succeeded", "skipped", "failures", "circuit_open", "log_id"},
+        )
+        self.assertEqual(task.errors, [])
+        # 原图保留（最坏情况 count=1 时目录里 2 个文件：原图 + 放大图）
+        self.assertEqual(sorted(path.name for path in out_dir.iterdir()), sorted([original.name, value.name]))
+
+    async def test_base64_4mb_boundary_is_enforced_without_any_request(self):
+        """U3 的执行级半边：恰好 3 145 728 B 放行；+1 B 跳过且**零网络**。"""
+        cfg = upscale_config()
+        # 恰好到边界：本地判据放行（随后请求照常发），证明 `>` 而不是 `>=`
+        session_ok = FakeSession(token=token_payload(), upscale=image_payload(128, 128))
+        task, state, _, value, _ = await self._apply(
+            data=png_of_size(3_145_728), session=session_ok
+        )
+        self.assertEqual(len(session_ok.upscale_calls), 1)
+        self.assertEqual(state.succeeded, 1)
+        self.assertEqual(task.runtime["upscale"]["skipped"], [])
+        # 越过 1 字节：连 token 都不取
+        session_over = FakeSession(token=token_payload(), upscale=image_payload(128, 128))
+        task, state, original, value, _ = await self._apply(
+            data=png_of_size(3_145_729), session=session_over
+        )
+        self.assertEqual(session_over.calls, [])
+        self.assertIs(value, original)
+        self.assertEqual(state.skipped, ["too_large"])
+        self.assertEqual(state.succeeded, 0)
+        self.assertEqual(task.runtime["upscale"]["skipped"], ["too_large"])
+        self.assertEqual(task.errors, [])
+
+    async def test_default_config_has_zero_side_effects(self):
+        """U11：``load_config({})`` 真实解析 ⇒ 零网络、零新文件、无 runtime 键、零日志、返回同对象。"""
+        raw_cfg = load_config({})
+        self.assertFalse(raw_cfg.upscale.enabled)
+        session = FakeSession(token=token_payload(), upscale=image_payload(128, 128))
+        debug, warns = [], []
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        out_dir = Path(directory.name)
+        original = out_dir / "origin.png"
+        original.write_bytes(png_bytes())
+        task = make_task()
+        state = UpscaleState()
+        upscaler = BaiduUpscaler(
+            session, lambda: raw_cfg, debug=debug_recorder(debug), warn=recorder(warns)
+        )
+        value = await upscaler.apply(task, original, out_dir, raw_cfg.upscale, state)
+        self.assertIs(value, original)
+        self.assertEqual(session.calls, [])                      # Z0-U1 零请求
+        self.assertEqual([path.name for path in out_dir.iterdir()], [original.name])  # Z0-U2
+        self.assertNotIn("upscale", task.runtime)                # Z0-U3
+        self.assertEqual((debug, warns), ([], []))               # Z0-U4
+        self.assertEqual(task.errors, [])                        # Z0-U6
+        self.assertIs(task.state, TaskState.CREATED)
+        self.assertIs(task.stage, TaskStage.QUEUED)
+
+    async def test_output_oversize_is_a_skip_that_keeps_the_previous_stage(self):
+        """U14 的另一半：输出超 ``storage_config.max_upload_bytes`` ⇒ 跳过（不是失败）。"""
+        session = FakeSession(token=token_payload(), upscale=image_payload(128, 128))
+        tight = runtime_config(max_upload_bytes=10)
+        task = make_task()
+        state = UpscaleState()
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        out_dir = Path(directory.name)
+        original = out_dir / "origin.png"
+        original.write_bytes(png_bytes())
+        upscaler = BaiduUpscaler(session, lambda: tight, debug=debug_recorder([]), warn=recorder([]))
+        value = await upscaler.apply(task, original, out_dir, upscale_config(), state)
+        self.assertIs(value, original)
+        self.assertEqual(state.skipped, ["output_oversize"])
+        self.assertEqual(state.failures, [])
+        self.assertEqual(task.runtime["upscale"]["skipped"], ["output_oversize"])
+
+    async def test_upgrade_is_skipped_when_keys_are_missing(self):
+        """``enable=true`` 但 key 不全 ⇒ 零网络 + 整个生命周期只 WARNING 一次（marker 独立）。"""
+        session = FakeSession(token=token_payload(), upscale=image_payload(128, 128))
+        warns: list = []
+        upscaler = upscaler_of(session, debug=debug_recorder([]), warn=recorder(warns))
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        out_dir = Path(directory.name)
+        original = out_dir / "origin.png"
+        original.write_bytes(png_bytes())
+        half = upscale_config(secret_key="")
+        task = make_task()
+        state = UpscaleState()
+        for _ in range(2):
+            self.assertIs(await upscaler.apply(task, original, out_dir, half, state), original)
+        self.assertEqual(session.calls, [])
+        self.assertEqual(len(warns), 1)
+        self.assertIn("放大 已在配置里开启", warns[0][0])
+        self.assertNotIn("upscale", task.runtime)
+
+    async def test_error_code_6_opens_only_the_upscale_circuit(self):
+        """U9 的单级半边：``error_code=6`` ⇒ 不重试、告警一次（带「放大 失败：」前缀）、熔断。"""
+        session = FakeSession(
+            token=token_payload(),
+            upscale={"error_code": 6, "error_msg": "No permission to access data"},
+        )
+        debug, warns = [], []
+        task = make_task()
+        state = UpscaleState()
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        out_dir = Path(directory.name)
+        original = out_dir / "origin.png"
+        original.write_bytes(png_bytes())
+        upscaler = upscaler_of(session, debug=debug_recorder(debug), warn=recorder(warns))
+        value = await upscaler.apply(task, original, out_dir, upscale_config(), state)
+        self.assertIs(value, original)
+        self.assertEqual(len(session.upscale_calls), 1)          # permission 不重试
+        self.assertEqual(state.failures, ["permission:6"])
+        self.assertTrue(state.circuit_open)
+        self.assertEqual(len(warns), 1)
+        self.assertTrue(warns[0][0].startswith("放大 失败："))
+        self.assertIn("图像无损放大", warns[0][0])
+        self.assertIn("error_code=6", warns[0][0])
+        self.assertEqual(task.errors, [])
+        # 熔断后第二张图不再尝试（连 token 都不取）
+        calls_before = len(session.calls)
+        self.assertIs(await upscaler.apply(task, original, out_dir, upscale_config(), state), original)
+        self.assertEqual(len(session.calls), calls_before)
+
+
+# --------------------------------------------------------------------------- 两级链路
+
+
+def chain_runner(*, session, out_dir, cfg, enhancer, upscaler, enhance_state, upscale_state, delivered: list):
+    """镜像 ``main.py._finish_task`` 的两级插入点：materialize → 增强 → 放大。"""
+
+    async def runner(task, results):
+        for result in results:
+            value = await materialize_result(
+                session, result, out_dir,
+                max_bytes=cfg.max_upload_bytes, block_private=cfg.block_private_networks,
+            )
+            if enhancer is not None:
+                value = await enhancer.apply(task, value, out_dir, cfg.enhance, enhance_state)
+            if upscaler is not None:
+                value = await upscaler.apply(task, value, out_dir, cfg.upscale, upscale_state)
+            delivered.append(value)
+        return True
+
+    return runner
+
+
+class _ChainHarness(unittest.IsolatedAsyncioTestCase):
+    """用**真实** ``TaskScheduler`` 跑一遍「适配器 → 两级链路」，验任务终态与交付物。"""
+
+    async def run_chain(
+        self,
+        *,
+        results: int,
+        session: FakeSession,
+        enhance_cfg: EnhanceConfig | None,
+        upscale_cfg: UpscaleConfig | None,
+        source_data: bytes | None = None,
+        output_dir: Path | None = None,
+    ):
+        provider = ProviderConfig(
+            "node", "custom_endpoint", "https://example.invalid", ("key",), model="model",
+        )
+        payload = source_data or png_bytes()
+        delivered: list = []
+        debug, warns = [], []
+
+        class Adapter:
+            def __init__(self, config): self.config = config
+
+            async def generate(self, request_session, request, key):
+                return [ImageResult(data=payload) for _ in range(results)]
+
+        cfg = RuntimeConfig(
+            providers=(provider,),
+            generation_timeout=300,
+            enhance=enhance_cfg or EnhanceConfig(),
+            upscale=upscale_cfg or UpscaleConfig(),
+        )
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        out_dir = output_dir or Path(directory.name)
+        enhancer = enhancer_of(session, debug=debug_recorder(debug), warn=recorder(warns), runtime=cfg)
+        upscaler = upscaler_of(session, debug=debug_recorder(debug), warn=recorder(warns), runtime=cfg)
+        enhance_state = EnhanceState()
+        upscale_state = UpscaleState()
+        runner = chain_runner(
+            session=session, out_dir=out_dir, cfg=cfg, enhancer=enhancer, upscaler=upscaler,
+            enhance_state=enhance_state, upscale_state=upscale_state, delivered=delivered,
+        )
+        finished = asyncio.Event()
+
+        async def wrapped(task, task_results):
+            try:
+                return await runner(task, task_results)
+            finally:
+                finished.set()
+
+        old = scheduler_module.ADAPTERS.get("custom_endpoint")
+        scheduler_module.ADAPTERS["custom_endpoint"] = Adapter
+        scheduler = TaskScheduler(
+            lambda: cfg, DummySession(), wrapped, lambda *_: None,
+            lambda task, message, *args: debug.append((message, args)),
+        )
+        task = DrawTask("c" * 16, "umo", GenerationRequest("x", count=results))
+        try:
+            scheduler.submit(task)
+            await asyncio.wait_for(finished.wait(), 5)
+            await asyncio.sleep(0)  # 让调度器把终态写回
+        finally:
+            await scheduler.close()
+            if old is None:
+                scheduler_module.ADAPTERS.pop("custom_endpoint", None)
+            else:
+                scheduler_module.ADAPTERS["custom_endpoint"] = old
+        return task, delivered, out_dir, enhance_state, upscale_state, debug, warns
+
+
+class UpscaleChainTests(_ChainHarness):
+    """U7/U8/U9/U10：两级顺序、载荷接力、保留上一级、独立熔断、只开一级。"""
+
+    async def test_enhance_runs_before_upscale_and_the_payload_is_relayed(self):
+        """U7：调用序 token→definition→token→quality；放大吃的是增强产物；目录恰 3 个文件。"""
+        enhanced = png_bytes(1000, 1000, b"\x22" * 16)
+        enlarged = png_bytes(2000, 2000, b"\x33" * 16)
+        session = FakeSession(
+            token=token_payload(),
+            enhance={"log_id": 7, "image": base64.b64encode(enhanced).decode()},
+            upscale={"log_id": 21, "image": base64.b64encode(enlarged).decode()},
+        )
+        task, delivered, out_dir, enhance_state, upscale_state, debug, _ = await self.run_chain(
+            results=1, session=session, enhance_cfg=enhance_config(), upscale_cfg=upscale_config(),
+        )
+        # ① 端点序列：先增强、后放大（两级各有自己的 token 请求，缓存**不共享**）
+        self.assertEqual(session.endpoints(), ["token", "definition", "token", "quality"])
+        # ② 载荷接力：放大上传的正是增强响应字节
+        self.assertEqual(
+            session.upscale_calls[0][1]["data"], {"image": base64.b64encode(enhanced).decode()}
+        )
+        # ③ 交付物是放大产物；原图与中间产物都留在目录里（恰 3 个文件）
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(delivered[0].read_bytes(), enlarged)
+        self.assertEqual(len(list(out_dir.iterdir())), 3)
+        # ④ 两级统计各自 +1，任务成功、无错误
+        self.assertEqual(enhance_state.succeeded, 1)
+        self.assertEqual(upscale_state.succeeded, 1)
+        self.assertEqual(task.runtime["enhance"]["succeeded"], 1)
+        self.assertEqual(task.runtime["upscale"]["succeeded"], 1)
+        self.assertEqual(task.state, TaskState.SUCCEEDED)
+        self.assertEqual(task.errors, [])
+
+    async def test_upscale_over_the_pixel_limit_keeps_the_enhanced_output(self):
+        """U8：增强成功、放大 ``pixels_too_large`` ⇒ 交付**增强产物**（不回退原图）、任务 succeeded。"""
+        # 增强产物 2001×2000 = 4 002 000 px > 4 000 000 ⇒ 放大本地跳过
+        session = FakeSession(token=token_payload(), enhance=image_payload(2001, 2000))
+        task, delivered, out_dir, enhance_state, upscale_state, _, _ = await self.run_chain(
+            results=1, session=session, enhance_cfg=enhance_config(), upscale_cfg=upscale_config(),
+        )
+        self.assertEqual(session.endpoints(), ["token", "definition"])  # 只 2 笔：token + 增强
+        self.assertEqual(upscale_state.skipped, ["pixels_too_large"])
+        self.assertEqual(upscale_state.succeeded, 0)
+        self.assertEqual(upscale_state.attempted, 0)
+        self.assertEqual(len(delivered), 1)
+        enhanced_path = delivered[0]
+        self.assertEqual(logic.image_dimensions(enhanced_path.read_bytes()), (2001, 2000))
+        # 交付的是增强产物：不是原图（原图 64×64），也不是放大图
+        self.assertNotEqual(logic.image_dimensions(enhanced_path.read_bytes()), (64, 64))
+        self.assertEqual(len(list(out_dir.iterdir())), 2)  # 原图 + 增强产物
+        self.assertEqual(task.runtime["upscale"]["skipped"], ["pixels_too_large"])
+        self.assertEqual(task.runtime["enhance"]["succeeded"], 1)
+        # 任务仍 succeeded：放大跳过**不是**失败（不写 errors、不改 state）
+        self.assertEqual(task.state, TaskState.SUCCEEDED)
+        self.assertEqual(task.errors, [])
+
+    async def test_circuits_are_independent_between_the_two_stages(self):
+        """U9：第 1 张放大 ``error_code=6`` ⇒ 放大熔断、增强继续；两图都交付增强产物。"""
+        session = FakeSession(
+            token=token_payload(),
+            enhance=image_payload(1000, 1000),
+            upscale={"error_code": 6, "error_msg": "No permission to access data"},
+        )
+        task, delivered, out_dir, enhance_state, upscale_state, _, warns = await self.run_chain(
+            results=2, session=session, enhance_cfg=enhance_config(), upscale_cfg=upscale_config(),
+        )
+        # 序列：token(增强) → 增强#1 → token(放大) → 放大#1(失败) → 增强#2（放大不再尝试）
+        self.assertEqual(
+            session.endpoints(), ["token", "definition", "token", "quality", "definition"]
+        )
+        self.assertEqual(upscale_state.attempted, 1)
+        self.assertEqual(upscale_state.failures, ["permission:6"])
+        self.assertTrue(upscale_state.circuit_open)
+        self.assertFalse(enhance_state.circuit_open)   # 增强的熔断标志一点没动
+        self.assertEqual(enhance_state.succeeded, 2)
+        self.assertFalse(task.runtime["enhance"]["circuit_open"])
+        # 两图都交付**增强产物**（放大失败保留上一级），尺寸都是 1000×1000
+        self.assertEqual(len(delivered), 2)
+        for path in delivered:
+            self.assertEqual(logic.image_dimensions(path.read_bytes()), (1000, 1000))
+        self.assertEqual(len(list(out_dir.iterdir())), 4)  # 2 原图 + 2 增强产物
+        self.assertEqual(task.state, TaskState.SUCCEEDED)
+        self.assertEqual(task.errors, [])
+        self.assertTrue(any("图像无损放大" in message for message, _ in warns))
+
+    async def test_upscale_alone_leaves_no_enhance_report(self):
+        """U10：增强关闭、放大开启 ⇒ 只 1 级调用，runtime 只有 ``upscale`` 键。"""
+        session = FakeSession(token=token_payload(), upscale=image_payload(128, 128))
+        task, delivered, out_dir, enhance_state, upscale_state, _, _ = await self.run_chain(
+            results=1, session=session, enhance_cfg=None, upscale_cfg=upscale_config(),
+        )
+        self.assertEqual(session.endpoints(), ["token", "quality"])
+        self.assertEqual(len(delivered), 1)
+        self.assertEqual(upscale_state.succeeded, 1)
+        self.assertEqual(enhance_state.succeeded, 0)
+        self.assertIn("upscale", task.runtime)
+        self.assertNotIn("enhance", task.runtime)
+        self.assertEqual(len(list(out_dir.iterdir())), 2)  # 原图 + 放大图
+        self.assertEqual(task.state, TaskState.SUCCEEDED)
+
+
+class UpscaleWiringGuardTests(unittest.TestCase):
+    """U7/U15 的**源序**半边：main.py 的两级插入点与 INFO 汇总行位置逐字钉住。
+
+    为什么是静态断言：这两处都在 ``ImagoFusion._finish_task`` 的循环体与终态日志里，
+    要执行它们得先造一个完整的 AstrBot 插件实例（本文件明令"不自建 astrbot 桩"）。
+    所以「运行期行为」由 ``UpscaleChainTests`` 保证，「插入点顺序与日志格式」由本节按
+    源码位置钉住——与既有 E11 端点守卫同一套路。
+    """
+
+    @classmethod
+    def setUpClass(cls):
+        cls.source = (ROOT / "main.py").read_text("utf-8")
+
+    def test_materialize_then_enhance_then_upscale_in_the_same_loop(self):
+        source = self.source
+        materialize = source.index("value = await materialize_result(")
+        enhance = source.index("value = await self.enhancer.apply(")
+        upscale = source.index("value = await self.upscaler.apply(")
+        append = source.index("if isinstance(value, Path): output_paths.append(value)")
+        self.assertLess(materialize, enhance, "增强必须在 materialize 之后")
+        self.assertLess(enhance, upscale, "放大必须在增强之后（顺序不可交换）")
+        self.assertLess(upscale, append, "放大必须在 output_paths 收集之前（否则替换不了交付物）")
+        self.assertIn("upscale_cfg = result_cfg.upscale", source)
+        self.assertIn("upscale_state = UpscaleState()", source)
+        self.assertIn("self.upscaler = BaiduUpscaler(", source)
+
+    def test_upscale_info_summary_is_its_own_line_right_after_the_enhance_one(self):
+        source = self.source
+        enhance_line = '"%s task=%s 增强 成功=%d 跳过=%d 失败=%d"'
+        upscale_line = '"%s task=%s 放大 成功=%d 跳过=%d 失败=%d"'
+        self.assertIn(enhance_line, source)
+        self.assertIn(upscale_line, source)
+        self.assertLess(source.index(enhance_line), source.index(upscale_line))
+        # 只在本次任务真的碰过放大时才打（关闭时 runtime 无该键 ⇒ 零新增 INFO 行）
+        gate = source.index('upscale_stats = task.runtime.get("upscale")')
+        self.assertLess(gate, source.index(upscale_line))
+        self.assertIn("if upscale_stats:", source[gate:source.index(upscale_line) + 200])
+
+
+class UpscaleLoggingTests(unittest.IsolatedAsyncioTestCase):
+    """U15：WARNING 每类一次 + 「放大 失败：」前缀；DEBUG 每图一条三条格式；关闭时 0 条。"""
+
+    async def _run(self, *, session: FakeSession, cfg=None, data: bytes | None = None):
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        out_dir = Path(directory.name)
+        original = out_dir / "origin.png"
+        original.write_bytes(data or png_bytes())
+        debug, warns = [], []
+        task = make_task()
+        state = UpscaleState()
+        upscaler = upscaler_of(session, debug=debug_recorder(debug), warn=recorder(warns))
+        value = await upscaler.apply(task, original, out_dir, cfg or upscale_config(), state)
+        return task, value, original, debug, warns
+
+    async def test_debug_lines_are_one_per_image_with_the_frozen_formats(self):
+        session = FakeSession(token=token_payload(), upscale=image_payload(128, 128, log_id=33))
+        task, value, _, debug, _ = await self._run(session=session)
+        self.assertEqual(len(debug), 1)
+        message, args = debug[0]
+        self.assertEqual(
+            message,
+            "放大 完成 index=%d in_bytes=%d out_bytes=%d dims=%dx%d->%dx%d cost=%.1fs log_id=%s",
+        )
+        self.assertEqual(args[0], 1)                       # index = state.succeeded
+        self.assertEqual((args[3], args[4], args[5], args[6]), (64, 64, 128, 128))
+        self.assertEqual(args[-1], 33)
+        # 读不出尺寸时该段写 dims=-（另一条逐字格式）
+        session = FakeSession(
+            token=token_payload(),
+            upscale={"log_id": 5, "image": base64.b64encode(b"\x89PNG\r\n\x1a\n" + b"\x00" * 4).decode()},
+        )
+        task, value, _, debug, _ = await self._run(session=session)
+        self.assertEqual(len(debug), 1)
+        self.assertEqual(
+            debug[0][0],
+            "放大 完成 index=%d in_bytes=%d out_bytes=%d dims=- cost=%.1fs log_id=%s",
+        )
+        # 跳过：``放大 跳过 index=%d reason=%s %s``
+        session = FakeSession(token=token_payload(), upscale=image_payload(128, 128))
+        task, value, original, debug, _ = await self._run(
+            session=session, data=png_of_size(3_145_729)
+        )
+        self.assertEqual(debug[0][0], "放大 跳过 index=%d reason=%s %s")
+        self.assertEqual(debug[0][1][1], "too_large")
+
+    async def test_failure_line_and_warning_are_emitted_once(self):
+        session = FakeSession(
+            token=token_payload(),
+            upscale={"error_code": 17, "error_msg": "Open api daily request limit reached"},
+        )
+        debug, warns = [], []
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        out_dir = Path(directory.name)
+        original = out_dir / "origin.png"
+        original.write_bytes(png_bytes())
+        task = make_task()
+        state = UpscaleState()
+        upscaler = upscaler_of(session, debug=debug_recorder(debug), warn=recorder(warns))
+        for _ in range(2):
+            await upscaler.apply(task, original, out_dir, upscale_config(), state)
+        # quota 族：不重试、告警一次、熔断；第二次连 token 都不取
+        self.assertEqual(len(warns), 1)
+        self.assertTrue(warns[0][0].startswith("放大 失败："))
+        self.assertIn("额度已用尽", warns[0][0])
+        self.assertIn("17", str(warns[0][1]))
+        self.assertEqual(debug[0][0], "放大 失败 index=%d kind=%s code=%s detail=%s")
+        self.assertEqual(debug[0][1][1], "quota")
+
+    async def test_switch_off_emits_no_log_at_all(self):
+        session = FakeSession(token=token_payload(), upscale=image_payload(128, 128))
+        task, value, original, debug, warns = await self._run(
+            session=session, cfg=UpscaleConfig()
+        )
+        self.assertIs(value, original)
+        self.assertEqual((debug, warns), ([], []))
+        self.assertEqual(session.calls, [])
 
 
 if __name__ == "__main__":
