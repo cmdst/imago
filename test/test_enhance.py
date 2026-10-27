@@ -1,21 +1,19 @@
-"""百度「图像无损放大」的行为用例（UC-1..UC-11；全部不碰网络、不碰生产）。
+"""百度「图像清晰度增强」的行为用例（E1–E11；全部不碰网络、不碰生产）。
 
 形状照抄 ``test/test_scheduler.py``：``FakeSession`` 记录 ``(url, kwargs)`` 并按 URL
 返回预置响应，``unittest.IsolatedAsyncioTestCase`` 驱动协程。**不**放进
 ``test_native_adapter.py``（那个文件自建 astrbot 桩，会互相干扰）。
 
-覆盖的契约点（spec §8）：
+覆盖的契约点（spec 变更令 v2.10）：
 
-- UC-1 正常放大：新文件落盘、原图保留、token/放大两次调用的参数形状；
-- UC-2/UC-3 本地预检超限（体积 / 长宽乘积）跳过，且**零网络**；
-- UC-4 开关开着但 key 不全 ⇒ 完全静默（连 token 都不取），告警只打一次；
-- UC-5 token 过期（110）⇒ 失效重取 + 恰好重试一次（调用序列恰好 4 次）；
-- UC-6 网络失败 ⇒ 降级原图 + 本任务熔断 + **绝不写 task.errors**；
-- UC-7 开关关闭 ⇒ 零网络、零 runtime 键、零日志、状态对象一点没动；
-- UC-8 放大失败不污染任务状态（不放「部分图片绘制失败。」）；
-- UC-9 error_code=6（应用未勾选能力）⇒ 不重试、告警一次、熔断；
-- UC-10 输出超过 storage 上限 ⇒ 跳过、不落盘；
-- UC-11 token 并发单飞（5 个并发放大只打一次 token 接口）。
+- E1 正常增强：新文件落盘、原图保留、token/增强两次调用的参数形状与端点；
+- E2–E5 本地预检超限（10MiB / 最长边 5000px / 最短边 10px / 长宽比 4:1）跳过，且**零网络**；
+- E6 开关开着但 key 不全 ⇒ 完全静默（连 token 都不取），告警只打一次；
+- E7 开关关闭 ⇒ 零网络、零 runtime 键、零日志、状态对象一点没动；
+- E8 网络失败 / 无 ``image`` 字段 ⇒ 降级原图 + 本任务熔断 + **绝不写 task.errors**；
+- E9 token 过期（110）⇒ 失效重取 + 恰好重试一次（调用序列恰好 4 次）；
+- E10 ``error_code=6``（应用未勾选「图像清晰度增强」）⇒ 不重试、告警一次、熔断；
+- E11 输出超过 storage 上限 ⇒ 跳过、不落盘（+ 端点常量守卫见 test_core.py）。
 """
 
 import asyncio
@@ -36,8 +34,12 @@ from imago_fusion.core.enhance_client import BaiduEnhancer, EnhanceState
 TOKEN_TEST = "TOKEN_TEST"
 
 
-def png_bytes(width: int = 2, height: int = 2, body: bytes = b"\x00" * 8) -> bytes:
-    """最小 PNG 头：够魔数 + IHDR 尺寸嗅探（不做真实解码）。"""
+def png_bytes(width: int = 64, height: int = 64, body: bytes = b"\x00" * 8) -> bytes:
+    """最小 PNG 头：够魔数 + IHDR 尺寸嗅探（不做真实解码）。
+
+    默认 64×64：必须同时满足官方三项几何限值（最短边 ≥10px、最长边 ≤5000px、
+    长宽比 ≤4:1），否则连 happy path 都会被本地预检拦成 ``edge_too_short``。
+    """
     return (
         b"\x89PNG\r\n\x1a\n"
         + struct.pack(">I", 13)
@@ -48,8 +50,15 @@ def png_bytes(width: int = 2, height: int = 2, body: bytes = b"\x00" * 8) -> byt
     )
 
 
+def png_of_size(total: int, width: int = 64, height: int = 64) -> bytes:
+    """造一张**恰好 total 字节**的假 PNG（头部 25 B + 填充），用于字节上限的边界断言。"""
+    header = png_bytes(width, height, b"")
+    assert total >= len(header), total
+    return header + b"\x00" * (total - len(header))
+
+
 def runtime_config(**overrides) -> RuntimeConfig:
-    """放大客户端要读的运行时配置（超时预算 / 输出上限 / 代理）。"""
+    """增强客户端要读的运行时配置（超时预算 / 输出上限 / 代理）。"""
     values = {"providers": (), "generation_timeout": 300, "max_upload_bytes": 20 * 1024 * 1024}
     values.update(overrides)
     return RuntimeConfig(**values)
@@ -183,13 +192,13 @@ def enhance_payload(width: int = 4, height: int = 4, *, log_id: int = 7) -> dict
 
 
 class EnhanceHappyPathTests(unittest.IsolatedAsyncioTestCase):
-    """UC-1：开关打开 + key 齐全 ⇒ 交付图是放大结果，原图保留。"""
+    """E1：开关打开 + key 齐全 ⇒ 交付图是增强结果（尺寸不变），原图保留。"""
 
     async def test_happy_path_writes_a_new_file_and_keeps_the_original(self):
         with TemporaryDirectory() as directory:
             out_dir = Path(directory)
             original = out_dir / "origin.png"
-            original.write_bytes(png_bytes(2, 2))
+            original.write_bytes(png_bytes())
             enhanced = png_bytes(4, 4, b"\x00" * 16)
             session = FakeSession(
                 token=token_payload(),
@@ -205,19 +214,23 @@ class EnhanceHappyPathTests(unittest.IsolatedAsyncioTestCase):
 
             value = await enhancer.apply(task, original, out_dir, enhance_config(), state)
 
-            # ① 返回新 Path（≠ 入参）② 内容就是放大结果 ③ 原图仍在
+            # ① 返回新 Path（≠ 入参）② 内容就是增强结果 ③ 原图仍在
             self.assertIsInstance(value, Path)
             self.assertNotEqual(value, original)
             self.assertEqual(value.read_bytes(), enhanced)
             self.assertTrue(original.is_file(), "原图必须保留（兜底/对账）")
-            self.assertEqual(value.parent, out_dir, "放大图必须落在任务缓存目录")
+            self.assertEqual(value.parent, out_dir, "增强图必须落在任务缓存目录")
             # ④ 统计
             self.assertEqual((state.attempted, state.succeeded), (1, 1))
             self.assertEqual(task.runtime["enhance"]["succeeded"], 1)
             self.assertEqual(task.errors, [])
-            # ⑤ 两次调用：token 在前、放大在后，access_token 走查询参数
+            # ⑤ 两次调用：token 在前、增强在后，access_token 走查询参数
             self.assertEqual([url for url, _ in session.calls], [logic.TOKEN_URL, logic.ENHANCE_URL])
             _, enhance_kwargs = session.calls[1]
+            self.assertTrue(
+                session.calls[1][0].endswith("/rest/2.0/image-process/v1/image_definition_enhance"),
+                f"端点必须换成官方 image_definition_enhance：{session.calls[1][0]}",
+            )
             self.assertEqual(enhance_kwargs["params"]["access_token"], TOKEN_TEST)
             # ⑥ 表单里的 base64 不带图片头，且与原图字节一一对应
             encoded = enhance_kwargs["data"]["image"]
@@ -233,7 +246,7 @@ class EnhanceHappyPathTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as directory:
             out_dir = Path(directory)
             original = out_dir / "origin.png"
-            original.write_bytes(png_bytes(2, 2))
+            original.write_bytes(png_bytes())
             proxy_url = "http://127.0.0.1:7890"
 
             proxied = FakeSession(token=token_payload(), enhance=enhance_payload())
@@ -268,65 +281,122 @@ class EnhanceHappyPathTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EnhancePrecheckTests(unittest.IsolatedAsyncioTestCase):
-    """UC-2 / UC-3：本地预检超限直接跳过，绝**不**发无效请求（省一次计费）。"""
+    """E2–E5：本地预检按官方限值跳过，绝**不**发无效请求（省一次计费）。"""
+
+    async def _run(self, image: bytes, **cfg_overrides):
+        """把一张图跑一遍 apply；返回 (value, original, session, state, debugs)。"""
+        directory = TemporaryDirectory()
+        self.addCleanup(directory.cleanup)
+        out_dir = Path(directory.name)
+        original = out_dir / "input.png"
+        original.write_bytes(image)
+        session = FakeSession(token=token_payload(), enhance=enhance_payload())
+        debugs: list = []
+        enhancer = BaiduEnhancer(
+            session, lambda: runtime_config(), debug=debug_recorder(debugs), warn=recorder([])
+        )
+        state = EnhanceState()
+        value = await enhancer.apply(make_task(), original, out_dir, enhance_config(**cfg_overrides), state)
+        return value, original, session, state, debugs
 
     async def test_too_large_image_is_skipped_without_any_request(self):
-        with TemporaryDirectory() as directory:
-            out_dir = Path(directory)
-            original = out_dir / "big.png"
-            # 1.5 MB 原图 > max_image_mb=1 的 3/4 MiB 字节上限（786 432 B）
-            original.write_bytes(png_bytes(2, 2, b"\x00" * 1_500_000))
-            session = FakeSession(token=token_payload(), enhance=enhance_payload())
-            debugs: list = []
-            enhancer = BaiduEnhancer(session, lambda: runtime_config(), debug=debug_recorder(debugs), warn=recorder([]))
-            task = make_task()
-            state = EnhanceState()
+        # E2：base64 ≤10M ⇒ 原图字节上限 = 10 MiB × 3/4 = 7 864 320 B
+        limit = logic.MAX_RAW_BYTES_FOR_10MB_BASE64
+        self.assertEqual(limit, 7_864_320)
 
-            value = await enhancer.apply(task, original, out_dir, enhance_config(max_image_mb=1), state)
+        value, original, session, state, _ = await self._run(png_of_size(limit + 1))
+        self.assertEqual(value, original, "降级必须原样返回入参")
+        self.assertEqual(session.calls, [], "预检跳过必须零网络")
+        self.assertEqual(state.skipped, ["too_large"])
+        self.assertEqual(sorted(path.name for path in original.parent.iterdir()), ["input.png"])
 
-            self.assertEqual(value, original, "降级必须原样返回入参")
-            self.assertEqual(session.calls, [], "预检跳过必须零网络")
-            self.assertEqual(state.skipped, ["too_large"])
-            self.assertEqual(sorted(path.name for path in out_dir.iterdir()), ["big.png"])
-            self.assertEqual(task.errors, [])
+        # 边界：恰好等于上限必须放行（百度口径是「不超过」）
+        value, original, session, state, _ = await self._run(png_of_size(limit))
+        self.assertNotEqual(value, original)
+        self.assertEqual(state.attempted, 1)
+        self.assertEqual(state.skipped, [])
 
-    async def test_too_many_pixels_is_skipped_but_the_boundary_is_allowed(self):
-        with TemporaryDirectory() as directory:
-            out_dir = Path(directory)
-            original = out_dir / "big.png"
-            original.write_bytes(png_bytes(2000, 2000))  # 4 000 000 px
-            session = FakeSession(token=token_payload(), enhance=enhance_payload())
-            enhancer = BaiduEnhancer(session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder([]))
-            task = make_task()
+    async def test_long_edge_over_limit_is_skipped_but_the_boundary_is_allowed(self):
+        # E3：最长边 ≤ 5000px
+        value, original, session, state, _ = await self._run(png_bytes(6000, 600))
+        self.assertEqual(value, original)
+        self.assertEqual(session.calls, [])
+        self.assertEqual(state.skipped, ["edge_too_long"])
 
-            state = EnhanceState()
-            value = await enhancer.apply(task, original, out_dir, enhance_config(max_pixels=1_000_000), state)
-            self.assertEqual(value, original)
-            self.assertEqual(session.calls, [])
-            self.assertEqual(state.skipped, ["too_many_pixels"])
+        # 边界：最长边恰好 5000 放行。注意必须同时满足长宽比 ≤4:1，故用 5000×1250
+        # （spec v2.10 E3 写的 5000×1000 实际是 5:1，会被 aspect_too_wide 拦下）。
+        value, original, session, state, _ = await self._run(png_bytes(5000, 1250))
+        self.assertNotEqual(value, original)
+        self.assertEqual(state.attempted, 1)
+        self.assertEqual(state.skipped, [])
 
-            # 边界：恰好 4 000 000 px 允许（百度口径是「不超过」）
-            boundary_session = FakeSession(token=token_payload(), enhance=enhance_payload())
-            boundary = BaiduEnhancer(
-                boundary_session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder([])
-            )
-            boundary_state = EnhanceState()
-            value = await boundary.apply(
-                task, original, out_dir, enhance_config(max_pixels=4_000_000), boundary_state
-            )
-            self.assertNotEqual(value, original)
-            self.assertEqual(boundary_state.attempted, 1)
-            self.assertEqual(boundary_state.skipped, [])
+    async def test_short_edge_under_limit_is_skipped(self):
+        # E4：最短边 ≥ 10px（硬下限，非配置键）
+        value, original, session, state, _ = await self._run(png_bytes(3000, 8))
+        self.assertEqual(value, original)
+        self.assertEqual(session.calls, [])
+        self.assertEqual(state.skipped, ["edge_too_short"])
+
+        # 边界：最短边恰好 10 放行（用 40×10 恰好 4:1；3000×10 会撞长宽比）
+        value, original, session, state, _ = await self._run(png_bytes(40, 10))
+        self.assertNotEqual(value, original)
+        self.assertEqual(state.attempted, 1)
+        self.assertEqual(state.skipped, [])
+
+    async def test_aspect_ratio_over_limit_is_skipped_but_the_boundary_is_allowed(self):
+        # E5：长宽比 ≤ 4:1
+        value, original, session, state, _ = await self._run(png_bytes(5000, 1000))  # 5:1
+        self.assertEqual(value, original)
+        self.assertEqual(session.calls, [])
+        self.assertEqual(state.skipped, ["aspect_too_wide"])
+
+        # 边界：恰好 4:1 允许
+        value, original, session, state, _ = await self._run(png_bytes(4000, 1000))
+        self.assertNotEqual(value, original)
+        self.assertEqual(state.attempted, 1)
+        self.assertEqual(state.skipped, [])
+
+    async def test_precheck_table_covers_every_limit_format_and_empty(self):
+        """表驱动：四条限值 + 格式 + 空图，逐条断言「不请求、不落盘、DEBUG 记 reason」。"""
+        limit = logic.MAX_RAW_BYTES_FOR_10MB_BASE64
+        cases = (
+            ("empty", b"", "empty"),
+            ("format_webp", b"RIFF\x00\x00\x00\x00WEBP" + b"\x00" * 16, "format"),
+            ("too_large", png_of_size(limit + 1), "too_large"),
+            ("edge_too_short", png_bytes(3000, 8), "edge_too_short"),
+            ("edge_too_long", png_bytes(6000, 600), "edge_too_long"),
+            ("aspect_too_wide", png_bytes(5000, 1000), "aspect_too_wide"),
+            ("allowed", png_bytes(64, 64), None),
+        )
+        for name, image, reason in cases:
+            with self.subTest(case=name):
+                value, original, session, state, debugs = await self._run(image)
+                if reason is None:
+                    self.assertNotEqual(value, original)
+                    self.assertEqual(state.attempted, 1)
+                    self.assertEqual(state.skipped, [])
+                    continue
+                self.assertEqual(value, original)
+                self.assertEqual(session.calls, [], "预检跳过必须零网络")
+                self.assertEqual(state.attempted, 0)
+                self.assertEqual(state.skipped, [reason])
+                # DEBUG 是 %-模板 + 位置参数（main.py 的 _scheduler_debug 会脱敏参数），
+                # 所以按「模板含 reason=%s 且参数里确实有该 reason」判定。
+                self.assertTrue(
+                    any("跳过" in message and reason in args for message, args in debugs),
+                    f"DEBUG 必须记下 reason={reason}：{debugs}",
+                )
+                self.assertEqual(sorted(path.name for path in original.parent.iterdir()), ["input.png"])
 
 
 class EnhanceGatingTests(unittest.IsolatedAsyncioTestCase):
-    """UC-4 / UC-7：未配置与关闭两条「零副作用」路径。"""
+    """E6 / E7：未配置与关闭两条「零副作用」路径。"""
 
     async def test_enabled_without_keys_is_silent_and_warns_only_once(self):
         with TemporaryDirectory() as directory:
             out_dir = Path(directory)
             original = out_dir / "origin.png"
-            original.write_bytes(png_bytes(2, 2))
+            original.write_bytes(png_bytes())
             session = FakeSession(token=token_payload(), enhance=enhance_payload())
             warns: list = []
             enhancer = BaiduEnhancer(session, lambda: runtime_config(), debug=debug_recorder([]), warn=recorder(warns))
@@ -348,7 +418,7 @@ class EnhanceGatingTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as directory:
             out_dir = Path(directory)
             original = out_dir / "origin.png"
-            original.write_bytes(png_bytes(2, 2))
+            original.write_bytes(png_bytes())
             session = FakeSession(token=token_payload(), enhance=enhance_payload())
             debugs: list = []
             warns: list = []
@@ -367,13 +437,13 @@ class EnhanceGatingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class EnhanceTokenTests(unittest.IsolatedAsyncioTestCase):
-    """UC-5 / UC-11：token 失效重取（恰好一次）与并发单飞。"""
+    """E9：token 失效重取（恰好一次）与并发单飞。"""
 
     async def test_expired_token_refreshes_once_and_retries_once(self):
         with TemporaryDirectory() as directory:
             out_dir = Path(directory)
             original = out_dir / "origin.png"
-            original.write_bytes(png_bytes(2, 2))
+            original.write_bytes(png_bytes())
             session = FakeSession(
                 token=[token_payload("A"), token_payload("B")],
                 enhance=[{"error_code": 110, "error_msg": "Access token invalid or no longer valid"}, enhance_payload()],
@@ -397,7 +467,7 @@ class EnhanceTokenTests(unittest.IsolatedAsyncioTestCase):
 
             # 缓存里现在是 B：下一张图不再取 token
             second = out_dir / "second.png"
-            second.write_bytes(png_bytes(2, 2))
+            second.write_bytes(png_bytes())
             calls_before = len(session.calls)
             await enhancer.apply(task, second, out_dir, enhance_config(), EnhanceState())
             self.assertEqual(len(session.token_calls), 2, "缓存命中后不得再打 token 接口")
@@ -414,7 +484,7 @@ class EnhanceTokenTests(unittest.IsolatedAsyncioTestCase):
             files = []
             for index in range(5):
                 path = out_dir / f"image_{index}.png"
-                path.write_bytes(png_bytes(2, 2))
+                path.write_bytes(png_bytes())
                 files.append(path)
 
             async def run(path: Path):
@@ -427,21 +497,21 @@ class EnhanceTokenTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(session.token_calls), 1, "并发任务只允许打一次 token 接口")
             self.assertEqual(len(session.enhance_calls), 5)
             for path, value in zip(files, results):
-                self.assertNotEqual(value, path, "5 次放大都应成功")
+                self.assertNotEqual(value, path, "5 次增强都应成功")
             tokens = {kwargs["params"]["access_token"] for _, kwargs in session.enhance_calls}
             self.assertEqual(tokens, {TOKEN_TEST})
 
 
 class EnhanceFailureTests(unittest.IsolatedAsyncioTestCase):
-    """UC-6 / UC-8 / UC-9 / UC-10：失败与跳过的降级语义（**不碰 task.errors**）。"""
+    """E8 / E10 / E11：失败与跳过的降级语义（**不碰 task.errors**）。"""
 
     async def test_network_failure_degrades_and_opens_the_circuit(self):
         with TemporaryDirectory() as directory:
             out_dir = Path(directory)
             first = out_dir / "first.png"
             second = out_dir / "second.png"
-            first.write_bytes(png_bytes(2, 2))
-            second.write_bytes(png_bytes(2, 2))
+            first.write_bytes(png_bytes())
+            second.write_bytes(png_bytes())
             session = FakeSession(
                 token=token_payload(), enhance=enhance_payload(), enhance_exc=aiohttp.ClientError("boom")
             )
@@ -455,8 +525,8 @@ class EnhanceFailureTests(unittest.IsolatedAsyncioTestCase):
 
             value = await enhancer.apply(task, second, out_dir, enhance_config(), state)
             self.assertEqual(value, second)
-            self.assertEqual(len(session.calls), 2, "熔断后第二张图零网络（1 token + 1 放大）")
-            self.assertEqual(task.errors, [], "放大失败绝不能写 task.errors")
+            self.assertEqual(len(session.calls), 2, "熔断后第二张图零网络（1 token + 1 增强）")
+            self.assertEqual(task.errors, [], "增强失败绝不能写 task.errors")
             failures = task.runtime["enhance"]["failures"]
             self.assertEqual(len(failures), 1)
             self.assertTrue(failures[0].startswith("transient"), failures)
@@ -466,7 +536,7 @@ class EnhanceFailureTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as directory:
             out_dir = Path(directory)
             original = out_dir / "origin.png"
-            original.write_bytes(png_bytes(2, 2))
+            original.write_bytes(png_bytes())
             session = FakeSession(
                 token=token_payload(),
                 enhance={"error_code": 216401, "error_msg": "internal error"},
@@ -477,9 +547,9 @@ class EnhanceFailureTests(unittest.IsolatedAsyncioTestCase):
 
             await enhancer.apply(task, original, out_dir, enhance_config(), EnhanceState())
 
-            # 放大失败对任务唯一的痕迹是 runtime["enhance"]。
+            # 增强失败对任务唯一的痕迹是 runtime["enhance"]。
             self.assertEqual(task.errors, [], "task.errors 一非空，用户就会看到『部分图片绘制失败。』")
-            self.assertEqual(task.state, TaskState.CREATED, "放大不得改任务状态")
+            self.assertEqual(task.state, TaskState.CREATED, "增强不得改任务状态")
             self.assertEqual(task.runtime["quota_charged"], 1)
             self.assertEqual(task.runtime["enhance"]["circuit_open"], True)
 
@@ -487,7 +557,7 @@ class EnhanceFailureTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as directory:
             out_dir = Path(directory)
             original = out_dir / "origin.png"
-            original.write_bytes(png_bytes(2, 2))
+            original.write_bytes(png_bytes())
             session = FakeSession(
                 token=token_payload(),
                 enhance={"error_code": 6, "error_msg": "No permission to access data"},
@@ -502,7 +572,7 @@ class EnhanceFailureTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(value, original)
             self.assertEqual(len(session.enhance_calls), 1, "无权限不重试（重试也不会变对）")
             self.assertEqual(len(warns), 1)
-            self.assertIn("图像无损放大", warns[0][0], "告警文案必须点名控制台未勾选的能力")
+            self.assertIn("图像清晰度增强", warns[0][0], "告警文案必须点名控制台未勾选的能力")
             self.assertTrue(state.circuit_open)
             self.assertEqual(state.failures, ["permission:6"])
 
@@ -510,7 +580,7 @@ class EnhanceFailureTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as directory:
             out_dir = Path(directory)
             original = out_dir / "origin.png"
-            original.write_bytes(png_bytes(2, 2))
+            original.write_bytes(png_bytes())
             session = FakeSession(token=token_payload(), enhance=enhance_payload(8, 8))
             debugs: list = []
             enhancer = BaiduEnhancer(
@@ -533,7 +603,7 @@ class EnhanceFailureTests(unittest.IsolatedAsyncioTestCase):
 class EnhanceDefaultConfigTests(unittest.IsolatedAsyncioTestCase):
     """默认配置（新装的真实起点）下绝不产生任何百度调用。
 
-    UC-7 用手写的 ``EnhanceConfig()``；这里改用 ``load_config({})`` 的**真实解析
+    E7 用手写的 ``EnhanceConfig()``；这里改用 ``load_config({})`` 的**真实解析
     结果**，防止「schema 默认值被改成 true」或「load_config 把组读错」这类改动绕过
     零副作用承诺。
     """
@@ -544,7 +614,7 @@ class EnhanceDefaultConfigTests(unittest.IsolatedAsyncioTestCase):
         with TemporaryDirectory() as directory:
             out_dir = Path(directory)
             original = out_dir / "origin.png"
-            original.write_bytes(png_bytes(2, 2))
+            original.write_bytes(png_bytes())
             session = FakeSession(token=token_payload(), enhance=enhance_payload())
             runtime_cfg = load_config({})  # 空配置 = 用户没填过任何东西
             enhancer = BaiduEnhancer(
@@ -557,7 +627,7 @@ class EnhanceDefaultConfigTests(unittest.IsolatedAsyncioTestCase):
             self.assertFalse(runtime_cfg.enhance.enabled, "默认必须是关闭")
             self.assertEqual(value, original)
             self.assertEqual(session.calls, [], "默认配置下不允许任何百度网络调用")
-            self.assertNotIn("enhance", task.runtime, "默认配置下不允许出现放大 runtime 键")
+            self.assertNotIn("enhance", task.runtime, "默认配置下不允许出现增强 runtime 键")
             self.assertEqual(sorted(path.name for path in out_dir.iterdir()), ["origin.png"])
 
 
@@ -603,9 +673,9 @@ class EnhanceLogicTests(unittest.TestCase):
         cfg = EnhanceConfig()
         self.assertEqual(logic.plan(b"", cfg, remaining=300)[1], "empty")
         self.assertEqual(logic.plan(b"RIFF\x00\x00\x00\x00WEBP", cfg, remaining=300)[1], "format")
-        self.assertEqual(logic.plan(png_bytes(2, 2), cfg, remaining=300)[0], True)
-        # 剩余预算不足（≤ 单张超时 + 15 s）时宁可不放大，避免把任务拖成超时
-        self.assertEqual(logic.plan(png_bytes(2, 2), cfg, remaining=cfg.timeout_seconds + 15)[1], "budget")
+        self.assertEqual(logic.plan(png_bytes(), cfg, remaining=300)[0], True)
+        # 剩余预算不足（≤ 单张超时 + 15 s）时宁可不增强，避免把任务拖成超时
+        self.assertEqual(logic.plan(png_bytes(), cfg, remaining=cfg.timeout_seconds + 15)[1], "budget")
 
     def test_payload_decoding_reports_missing_image_and_bad_base64(self):
         from imago_fusion.core.errors import EnhanceError, EnhanceSkipped

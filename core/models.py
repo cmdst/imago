@@ -88,7 +88,7 @@ class QuotaConfig:
 
 @dataclass(frozen=True, slots=True)
 class EnhanceConfig:
-    """百度「图像无损放大」的开关、凭据与本地预检阈值（``enhance_config`` 组）。
+    """百度「图像清晰度增强」的开关、凭据与本地预检阈值（``enhance_config`` 组）。
 
     ``enabled`` 默认 **False**：关闭时 ``core.enhance_client.BaiduEnhancer`` 在所有路径
     上立即返回原图，零网络、零新文件、零 ``task.runtime`` 键、零新增日志。
@@ -97,17 +97,19 @@ class EnhanceConfig:
         enabled: 总开关（按次计费，默认关闭）。
         api_key: 百度「图像增强与特效」应用的 API Key；明文存在插件配置里。
         secret_key: 同一应用的 Secret Key。
-        max_image_mb: 本地预检的 base64 上限（MB），百度硬限 4。
-        max_pixels: 本地预检的长宽乘积上限（px²），默认 2000×2000。
-        timeout_seconds: 单张放大的超时（秒）。
-        enable_proxy: 放大请求是否走插件顶层的出站代理（``proxy_url``）。
+        max_image_mb: 本地预检的 **base64** 上限（MB），官方硬限 10。
+        max_edge: 本地预检的**最长边**上限（px），官方 5000。
+        max_aspect: 本地预检的**长宽比**上限（长边 ÷ 短边），官方 4:1；边界 4.0 允许。
+        timeout_seconds: 单张增强的超时（秒）。
+        enable_proxy: 增强请求是否走插件顶层的出站代理（``proxy_url``）。
     """
 
     enabled: bool = False
     api_key: str = ""
     secret_key: str = ""
-    max_image_mb: int = 4
-    max_pixels: int = 4_000_000
+    max_image_mb: int = 10
+    max_edge: int = 5000
+    max_aspect: float = 4.0
     timeout_seconds: int = 20
     enable_proxy: bool = False
 
@@ -120,8 +122,9 @@ class EnhanceConfig:
     def max_raw_bytes(self) -> int:
         """原图字节上限：base64 膨胀 4/3，故上限 = ``max_image_mb`` × 3/4。
 
-        默认 4 MiB ⇒ 3 145 728 B。用原图字节数判等价于判 base64 长度（单调），
-        省一次编码；见 ``core/enhance.py`` 的 ``plan()``。
+        默认 10 MiB ⇒ 7 864 320 B（约 7.5 MiB，见
+        ``core/enhance.py`` 的 ``MAX_RAW_BYTES_FOR_10MB_BASE64``）。用原图字节数判等价
+        于判 base64 长度（单调），省一次编码；见 ``core/enhance.py`` 的 ``plan()``。
         """
         return self.max_image_mb * 1024 * 1024 * 3 // 4
 

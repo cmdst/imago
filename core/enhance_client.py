@@ -1,22 +1,22 @@
-"""百度「图像无损放大」的网络层：token 单飞缓存、放大请求、失败降级。
+"""百度「图像清晰度增强」的网络层：token 单飞缓存、增强请求、失败降级。
 
 接入点只有一处（``main.py`` 的 ``_finish_task``）：图片已经由
-``core.network.materialize_result`` 落盘成 ``Path``，这里把它放大后**另存**一份新
+``core.network.materialize_result`` 落盘成 ``Path``，这里把它增强后**另存**一份新
 文件并返回新 ``Path``（原图保留在任务缓存目录里做兜底/对账）；任何失败、超时、超限
 或本地预检跳过都**原样返回入参** ``value``。
 
 三条硬约束（每条都有代码级后果）：
 
-1. 放大失败**绝不**写 ``task.errors``。两处消费者会因此说谎：``main.py`` 会给用户
+1. 增强失败**绝不**写 ``task.errors``。两处消费者会因此说谎：``main.py`` 会给用户
    发「部分图片绘制失败。」（实际每张图都发出去了），``services/scheduler.py`` 会把
-   状态降级成 ``PARTIAL_SUCCESS``（影响额度退回判定与部署回执）。放大统计只写
+   状态降级成 ``PARTIAL_SUCCESS``（影响额度退回判定与部署回执）。增强统计只写
    ``task.runtime["enhance"]``。
 2. **绝不吞** ``asyncio.CancelledError``。``_finish_task`` 跑在调度器的
    ``asyncio.timeout(remaining)`` 里，外层超时靠 CancelledError 传播；这里只
    ``except Exception``（``TimeoutError`` 是 Exception 子类会被接住，
    ``CancelledError`` 在 3.8+ 是 BaseException，会正常上抛）。**没有** ``except
    BaseException``。
-3. 不改 ``task.state`` / ``task.stage``：放大属于 ``PROCESSING_RESULT`` 阶段。
+3. 不改 ``task.state`` / ``task.stage``：增强属于 ``PROCESSING_RESULT`` 阶段。
 
 代理：``core/network.py`` 与 ``services/scheduler._ProxySession`` 都**不动**；需要
 代理时本模块自己按「``enhance_config.enable_proxy`` 且顶层 ``proxy_url`` 非空」在
@@ -48,7 +48,7 @@ CIRCUIT_KINDS = frozenset({"token", "permission", "quota", "transient"})
 
 @dataclass
 class EnhanceState:
-    """单任务内的放大统计（每次 ``_finish_task`` new 一个，只写 ``task.runtime``）。"""
+    """单任务内的增强统计（每次 ``_finish_task`` new 一个，只写 ``task.runtime``）。"""
 
     attempted: int = 0
     succeeded: int = 0
@@ -66,7 +66,7 @@ def _int_or(value: object, default: int) -> int:
 
 
 class BaiduEnhancer:
-    """百度「图像无损放大」客户端（token 单飞缓存 + 一次放大 + 降级语义）。
+    """百度「图像清晰度增强」客户端（token 单飞缓存 + 一次增强 + 降级语义）。
 
     Args:
         session: 共享的 ``aiohttp.ClientSession``（由 ``main.initialize()`` 创建，
@@ -75,7 +75,7 @@ class BaiduEnhancer:
             ``max_upload_bytes`` / ``proxy_url``（每次现算，与插件其它地方一致）。
         debug: ``callable(task, message, *args)``，写插件 DEBUG 日志（``main.py`` 的
             ``_scheduler_debug``：脱敏 + 前缀）。
-        warn: ``callable(message, *args)``，写放大相关的 WARNING（每失败类一次）。
+        warn: ``callable(message, *args)``，写增强相关的 WARNING（每失败类一次）。
     """
 
     def __init__(self, session, config_getter, *, debug=None, warn=None) -> None:
@@ -88,7 +88,7 @@ class BaiduEnhancer:
         # 每个缓存键一把锁：并发任务只有一个协程真正打 token 接口（单飞）。
         self._locks: dict[str, asyncio.Lock] = {}
         self._warned: set[str] = set()
-        # 最近一次放大响应的 log_id：只进 task.runtime["enhance"]["log_id"]（排障用），
+        # 最近一次增强响应的 log_id：只进 task.runtime["enhance"]["log_id"]（排障用），
         # 不进 INFO 汇总行；apply() 在 await 之后同步取走，不存在跨任务串值。
         self._last_log_id: int = 0
 
@@ -111,7 +111,7 @@ class BaiduEnhancer:
         """取 ``access_token``：内存缓存 + 按缓存键单飞（并发只打一次接口）。
 
         Args:
-            cfg: 放大配置（提供 api_key / secret_key / timeout_seconds）。
+            cfg: 增强配置（提供 api_key / secret_key / timeout_seconds）。
             force: ``True`` 时无视缓存强制重取（110/111/100/401 之后恰好一次）。
             timeout: 单次 token 请求的超时；``None`` 用 ``cfg.timeout_seconds``。
                 **必须带超时**：锁跨 await 持有，挂死的连接会锁住所有并发任务。
@@ -159,7 +159,7 @@ class BaiduEnhancer:
             self._warn_once(
                 "token:credentials",
                 "增强 失败：用 API Key / Secret Key 换取 access_token 被拒（%s），"
-                "两把 key 必须属于同一个「图像增强与特效」应用；本次任务不再放大。",
+                "两把 key 必须属于同一个「图像增强与特效」应用；本次任务不再增强。",
                 redact(detail),
             )
             raise EnhanceError("token", f"token:{redact(detail)}")
@@ -171,7 +171,7 @@ class BaiduEnhancer:
     # ---------------------------------------------------------------- enhance
 
     async def enhance(self, data: bytes, cfg, *, timeout: float | None = None, runtime_cfg=None) -> tuple[bytes, str]:
-        """调一次「图像无损放大」，返回 ``(放大后的字节, MIME)``。
+        """调一次「图像清晰度增强」，返回 ``(增强后的字节, MIME)``。
 
         失败重试策略（spec §2.7）：token 族（110/111/100/HTTP 401）失效重取 + **恰好
         重试一次**；transient 族（1/2/4/216401/216630/282000、HTTP ≥400）退避 0.5 s
@@ -210,7 +210,7 @@ class BaiduEnhancer:
         return await self.token(cfg, force=True, timeout=timeout, runtime_cfg=runtime_cfg)
 
     async def _exchange(self, data: bytes, token: str, cfg, *, timeout: float | None = None, runtime_cfg=None):
-        """POST 一次放大接口，返回响应 JSON（``error_code`` 未判，交上层分类）。"""
+        """POST 一次增强接口，返回响应 JSON（``error_code`` 未判，交上层分类）。"""
         # aiohttp 的 data=dict 自动做 application/x-www-form-urlencoded 编码；
         # 不用 json=（会被拒），不手写 Content-Type（不覆盖它）。
         form = {"image": enhance_logic.encode_image(data)}
@@ -242,17 +242,17 @@ class BaiduEnhancer:
     # ------------------------------------------------------------------ apply
 
     async def apply(self, task, value, out_dir: Path, cfg, state: EnhanceState):
-        """把一张成品图放大；**永远返回一个可用的值**（失败时原样返回 ``value``）。
+        """把一张成品图增强；**永远返回一个可用的值**（失败时原样返回 ``value``）。
 
         Args:
             task: ``DrawTask``（只用 ``runtime`` 与 ``created_at``，**不改** state/stage）。
-            value: ``materialize_result`` 的返回值；只有 ``Path`` 才会放大。
+            value: ``materialize_result`` 的返回值；只有 ``Path`` 才会增强。
             out_dir: 任务输出目录（``PersonaStore.task_output_dir``）。
             cfg: ``EnhanceConfig``（``_finish_task`` 循环外只取一次）。
-            state: 本任务的放大统计（``EnhanceState``）。
+            state: 本任务的增强统计（``EnhanceState``）。
 
         Returns:
-            放大成功时是新落盘的 ``Path``；关闭/未配置/跳过/失败一律返回入参。
+            增强成功时是新落盘的 ``Path``；关闭/未配置/跳过/失败一律返回入参。
         """
         # Z0：开关关闭时连 runtime 键都不建、零网络、零日志。
         if not cfg.enabled:
@@ -261,7 +261,7 @@ class BaiduEnhancer:
             # 已开启但 key 不全 ⇒ 视为未配置：零网络，整插件生命周期只告警一次。
             self._warn_once(
                 "unconfigured",
-                "增强 已在配置里开启，但 API Key / Secret Key 未填全，本轮不放大（发送原图）。",
+                "增强 已在配置里开启，但 API Key / Secret Key 未填全，本轮不增强（发送原图）。",
             )
             return value
         if state.circuit_open or not isinstance(value, Path):
@@ -315,7 +315,7 @@ class BaiduEnhancer:
             self._record(task, state)
             self._debug_log(task, "增强 失败 index=%d kind=exception type=%s detail=%s", state.attempted, type(exc).__name__, redact(str(exc)))
             return value
-        # 走到这里说明放大成功返回了解码后的字节与 MIME（失败分支都已 return）。
+        # 走到这里说明增强成功返回了解码后的字节与 MIME（失败分支都已 return）。
         state.log_id = self._last_log_id
         max_output_bytes = self._max_output_bytes(runtime_cfg)
         if max_output_bytes > 0 and len(enhanced) > max_output_bytes:
@@ -406,7 +406,7 @@ class BaiduEnhancer:
             if exc.code == 6:
                 self._warn_once(
                     "permission:6",
-                    "增强 失败：控制台应用未勾选「图像无损放大」（error_code=6），本次任务改为发送原图。",
+                    "增强 失败：控制台应用未勾选「图像清晰度增强」（error_code=6），本次任务改为发送原图。",
                 )
             else:
                 self._warn_once(
@@ -461,5 +461,5 @@ class BaiduEnhancer:
 
 
 def mime_suffix(mime: str) -> str:
-    """放大结果的落盘后缀：只认 png/jpg，其余按 png（与 ``materialize_result`` 同风格）。"""
+    """增强结果的落盘后缀：只认 png/jpg，其余按 png（与 ``materialize_result`` 同风格）。"""
     return {"image/png": ".png", "image/jpeg": ".jpg"}.get(mime, ".png")

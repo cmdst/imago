@@ -60,6 +60,17 @@ def _int_or_default(value: Any, default: int) -> int:
         return default
 
 
+def _float_or_default(value: Any, default: float) -> float:
+    """配置浮点兜底：None/非数字回退默认；0.0 等合法值原样保留（调用方再 clamp）。
+
+    ``max_aspect`` 是浮点（4.0），用 ``int()`` 会把它截成 4 再回写，故单开一个兜底。
+    """
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def matches_template(providers: list[ProviderConfig], reference: str, *, enabled: bool) -> bool:
     """判断节点引用是否命中 ``template/model`` 覆写语法。
 
@@ -202,14 +213,16 @@ def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
         proxy_url=str(raw.get("proxy_url", "")).strip(),
         template_override=bool(raw.get("template_override", False)),
         # 百度「图像清晰度增强」：键名与 _conf_schema.json 的 enhance_config 组一一对应
-        # （7 键全部在这里读取，不允许「schema 有、解析不转发」的静默丢键）。
-        # 数值按百度硬限 clamp：base64 ≤4M、长宽乘积 ≤2000×2000、超时 5-60 s。
+        # （8 键全部在这里读取，不允许「schema 有、解析不转发」的静默丢键）。
+        # 数值按官方硬限 clamp：base64 ≤10M、最长边 ≤5000px、长宽比 ≤4:1、超时 5-60 s
+        # （最短边 10px 是硬下限，做成 core/enhance.MIN_EDGE_PX 常量、不设配置键）。
         enhance=EnhanceConfig(
             enabled=bool(enhance_raw.get("enable", False)),
             api_key=str(enhance_raw.get("api_key", "") or "").strip(),
             secret_key=str(enhance_raw.get("secret_key", "") or "").strip(),
-            max_image_mb=max(1, min(4, _int_or_default(enhance_raw.get("max_image_mb"), 4))),
-            max_pixels=max(250_000, min(4_000_000, _int_or_default(enhance_raw.get("max_pixels"), 4_000_000))),
+            max_image_mb=max(1, min(10, _int_or_default(enhance_raw.get("max_image_mb"), 10))),
+            max_edge=max(16, min(5000, _int_or_default(enhance_raw.get("max_edge"), 5000))),
+            max_aspect=max(1.0, min(4.0, _float_or_default(enhance_raw.get("max_aspect"), 4.0))),
             timeout_seconds=max(5, min(60, _int_or_default(enhance_raw.get("timeout_seconds"), 20))),
             enable_proxy=bool(enhance_raw.get("enable_proxy", False)),
         ),

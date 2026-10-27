@@ -157,15 +157,16 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(cfg.quota.daily_quota_target, 0)
         self.assertEqual((cfg.quota.checkin_quota_min, cfg.quota.checkin_quota_max), (5, 5))
 
-    # C-1..C-4：百度「图像无损放大」配置解析（spec §8）。
+    # C-1..C-4：百度「图像清晰度增强」配置解析（spec 变更令 v2.7）。
     def test_enhance_config_defaults_are_off_and_empty(self):
-        # C-1：默认关闭 + key 为空 ⇒ 不可能有任何百度网络调用。
+        # C-1：默认关闭 + key 为空 ⇒ 不可能有任何百度网络调用；8 键默认值与官方限值一致。
         enhance = load_config({}).enhance
         self.assertFalse(enhance.enabled)
         self.assertEqual(enhance.api_key, "")
         self.assertEqual(enhance.secret_key, "")
-        self.assertEqual(enhance.max_image_mb, 4)
-        self.assertEqual(enhance.max_pixels, 4_000_000)
+        self.assertEqual(enhance.max_image_mb, 10)
+        self.assertEqual(enhance.max_edge, 5000)
+        self.assertEqual(enhance.max_aspect, 4.0)
         self.assertEqual(enhance.timeout_seconds, 20)
         self.assertFalse(enhance.enable_proxy)
         self.assertFalse(enhance.configured)
@@ -187,29 +188,47 @@ class ConfigTests(unittest.TestCase):
             "enable": False, "api_key": "K", "secret_key": "S",
         }}).enhance.configured)
 
-    def test_enhance_config_clamps_to_the_baidu_hard_limits(self):
-        # C-3：数值按百度硬限 clamp（4M / 2000×2000 / 5-60 s），错值不许崩也不许越界。
+    def test_enhance_config_clamps_to_the_official_limits(self):
+        # C-3：数值按官方硬限 clamp（10M / 5000px / 4:1 / 5-60 s），错值不许崩也不许越界。
         cfg = load_config({"enhance_config": {
-            "max_image_mb": 99, "max_pixels": 10**9, "timeout_seconds": 999,
+            "max_image_mb": 99, "max_edge": 10**6, "max_aspect": 99, "timeout_seconds": 999,
         }}).enhance
-        self.assertEqual((cfg.max_image_mb, cfg.max_pixels, cfg.timeout_seconds), (4, 4_000_000, 60))
+        self.assertEqual(
+            (cfg.max_image_mb, cfg.max_edge, cfg.max_aspect, cfg.timeout_seconds),
+            (10, 5000, 4.0, 60),
+        )
         low = load_config({"enhance_config": {
-            "max_image_mb": 0, "max_pixels": 1, "timeout_seconds": 1,
+            "max_image_mb": 0, "max_edge": 1, "max_aspect": 0.1, "timeout_seconds": 1,
         }}).enhance
-        self.assertEqual((low.max_image_mb, low.max_pixels, low.timeout_seconds), (1, 250_000, 5))
+        self.assertEqual(
+            (low.max_image_mb, low.max_edge, low.max_aspect, low.timeout_seconds),
+            (1, 16, 1.0, 5),
+        )
         bad = load_config({"enhance_config": {
-            "max_image_mb": "abc", "max_pixels": None, "timeout_seconds": "",
+            "max_image_mb": "abc", "max_edge": None, "max_aspect": "", "timeout_seconds": "",
         }}).enhance
-        self.assertEqual((bad.max_image_mb, bad.max_pixels, bad.timeout_seconds), (4, 4_000_000, 20))
+        self.assertEqual(
+            (bad.max_image_mb, bad.max_edge, bad.max_aspect, bad.timeout_seconds),
+            (10, 5000, 4.0, 20),
+        )
+
+    def test_enhance_aspect_is_a_float_not_truncated_to_int(self):
+        # C-3b：max_aspect 是 float（4.0）；用 int() 兜底会截成 4 并与 schema 类型不符。
+        cfg = load_config({"enhance_config": {"max_aspect": 3.5}}).enhance
+        self.assertIsInstance(cfg.max_aspect, float)
+        self.assertEqual(cfg.max_aspect, 3.5)
+        # 字符串数字也接受（配置页可能存成字符串）
+        self.assertEqual(load_config({"enhance_config": {"max_aspect": "2.5"}}).enhance.max_aspect, 2.5)
 
     def test_enhance_raw_byte_limit_matches_the_base64_limit(self):
-        # C-4：原图字节上限 = 4 MiB × 3/4，其 base64 恰好不超过 4 MiB。
+        # C-4：原图字节上限 = 10 MiB × 3/4 = 7 864 320 B，其 base64 恰好不超过 10 MiB。
         import base64
 
         enhance = load_config({}).enhance
-        self.assertEqual(enhance.max_raw_bytes, 3_145_728)
+        self.assertEqual(enhance.max_raw_bytes, 7_864_320)
+        self.assertEqual(enhance.max_raw_bytes, 10 * 1024 * 1024 * 3 // 4)
         encoded = base64.b64encode(b"x" * enhance.max_raw_bytes)
-        self.assertLessEqual(len(encoded), 4 * 1024 * 1024)
+        self.assertLessEqual(len(encoded), 10 * 1024 * 1024)
 
     def test_api_types_keep_chat_and_dashscope(self):
         # 上游 imago v1.3.0 删了这两个 api_type；融合版必须保留（团队目标 + DESIGN §5.1）。
@@ -229,21 +248,28 @@ class ConfigTests(unittest.TestCase):
 
     def test_enhance_schema_group_matches_the_parser(self):
         # schema 里的 enhance_config 组与 core.config 的读取点必须一一对应：
-        # 「schema 有、解析不转发」= 用户填了却静默丢键。
+        # 「schema 有、解析不转发」= 用户填了却静默丢键。8 键、默认值与官方限值一致。
         schema = json.loads((ROOT / "_conf_schema.json").read_text("utf-8"))
         items = schema["enhance_config"]["items"]
         self.assertEqual(
             set(items),
-            {"enable", "api_key", "secret_key", "max_image_mb", "max_pixels", "timeout_seconds", "enable_proxy"},
+            {
+                "enable", "api_key", "secret_key", "max_image_mb",
+                "max_edge", "max_aspect", "timeout_seconds", "enable_proxy",
+            },
         )
         self.assertFalse(items["enable"]["default"])
         self.assertEqual(items["api_key"]["default"], "")
         self.assertEqual(items["secret_key"]["default"], "")
+        self.assertEqual(items["max_aspect"]["type"], "float")
         # 默认值解析结果与 schema 声明一致（schema 改了但解析没跟着改会红）
         defaults = load_config({}).enhance
         self.assertEqual(defaults.enabled, items["enable"]["default"])
+        self.assertEqual(defaults.api_key, items["api_key"]["default"])
+        self.assertEqual(defaults.secret_key, items["secret_key"]["default"])
         self.assertEqual(defaults.max_image_mb, items["max_image_mb"]["default"])
-        self.assertEqual(defaults.max_pixels, items["max_pixels"]["default"])
+        self.assertEqual(defaults.max_edge, items["max_edge"]["default"])
+        self.assertEqual(defaults.max_aspect, items["max_aspect"]["default"])
         self.assertEqual(defaults.timeout_seconds, items["timeout_seconds"]["default"])
         self.assertEqual(defaults.enable_proxy, items["enable_proxy"]["default"])
 
