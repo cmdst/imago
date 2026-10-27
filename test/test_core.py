@@ -623,4 +623,62 @@ class DuplicateRequestTests(unittest.TestCase):
         )
 
 
+class ReleaseVersionGuardTests(unittest.TestCase):
+    """版本号守卫：四处必须一致（评审 R1 的回归护栏）。
+
+    1.0.0 → 1.1.0 那次 bump 只改了 `metadata.yaml` / `__init__.py` / `main.py` 的
+    `@register`，漏了 README 文首的「版本：」行（`pin-check.sh` 只认前三处，所以门禁
+    没红）。这条用例把**四处**钉在一起：任何一处单独走掉都会红，避免下一次 bump 再漏。
+
+    只读仓库文件，不联网、不依赖 astrbot 运行时。
+    """
+
+    PLACES = ("metadata.yaml", "__init__.py", "main.py @register", "README.md")
+
+    @staticmethod
+    def _versions() -> dict[str, str]:
+        import re
+
+        metadata = (ROOT / "metadata.yaml").read_text("utf-8")
+        package = (ROOT / "__init__.py").read_text("utf-8")
+        register = next(
+            line
+            for line in (ROOT / "main.py").read_text("utf-8").splitlines()
+            if line.lstrip().startswith('@register("imago_fusion"')
+        )
+        readme = (ROOT / "README.md").read_text("utf-8")
+        return {
+            "metadata.yaml": re.search(r"^version:\s*(\S+)\s*$", metadata, re.MULTILINE).group(1),
+            "__init__.py": re.search(r"__version__\s*=\s*[\"']([^\"']+)[\"']", package).group(1),
+            # @register("imago_fusion", <author>, <desc>, <version>)：取行内最后一个带引号串。
+            "main.py @register": re.findall(r'"([^"]*)"', register)[-1],
+            "README.md": re.search(r"^- 版本：`([^`]+)`", readme, re.MULTILINE).group(1),
+        }
+
+    def test_release_version_is_synced_across_four_places(self):
+        versions = self._versions()
+        self.assertEqual(
+            set(versions),
+            set(self.PLACES),
+            f"版本号取材点变了：{sorted(versions)}",
+        )
+        for place, version in versions.items():
+            self.assertRegex(version, r"^\d+\.\d+\.\d+$", f"{place} 的版本号不是 x.y.z：{version!r}")
+        # 四处必须完全相同（不只各自合法）——这就是 bump 时最容易漏的地方。
+        self.assertEqual(
+            len(set(versions.values())),
+            1,
+            "四处版本号不一致（bump 时漏改）：" + "、".join(f"{k}={v}" for k, v in versions.items()),
+        )
+        # 当前发布线：CHANGELOG 顶部小节必须与四处版本同号（文档指针不脱钩）。
+        changelog = (ROOT / "CHANGELOG.md").read_text("utf-8")
+        heading = next(line for line in changelog.splitlines() if line.startswith("## "))
+        current = versions["metadata.yaml"]
+        self.assertIn(
+            current,
+            heading,
+            f"CHANGELOG 顶部标题 {heading!r} 与当前版本 {current} 不同步",
+        )
+
+
 if __name__ == "__main__": unittest.main()

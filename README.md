@@ -2,7 +2,7 @@
 
 IMAGO·FUSION 是 **IMAGO·映相** 骨架与 **大香蕉（astrbot_plugin_big_banana）AstrBot 原生 Provider 桥接** 的融合插件：保留映相的提示词优化、Persona 出镜、绘图额度、多节点 fallback 与素材管理，新增「走 AstrBot 已配置 Provider（反代 / 网页端模型）出图」的原生路由。
 
-- 版本：`1.0.0`（`metadata.yaml` / `__init__.py` / `main.py` 三处一致）
+- 版本：`1.1.0`（`metadata.yaml` / `__init__.py` / `main.py` 的 `@register` / 本行**四处一致**；更新内容见 `CHANGELOG.md` 顶部的 1.1.0 节）
 - AstrBot：`>=4.16,<5`
 - 依赖：`aiohttp>=3.9,<4`（不引入 Pillow：插件侧不做格式转换）
 
@@ -92,7 +92,7 @@ IMAGO·FUSION 是 **IMAGO·映相** 骨架与 **大香蕉（astrbot_plugin_big_b
 - **限制**：base64 ≤ 4M、长宽乘积 ≤ 2000×2000、支持 jpg/png/bmp。超限在本地先跳过（服务端超限也会计费），并记一条 DEBUG。
 - **失败降级**：放大失败、超时、超限、额度用尽、应用未勾选该能力（`error_code=6`）等情况**一律发送原图**，任务仍判成功、额度结算不变，日志只留一条 WARNING（每类一次）。放大统计只写 `task.runtime["upscale"]`。
 - **原图保留**：放大图另存为 `task_cache/<任务 ID>/outputs/` 下的新文件（命名规则与结果图落盘一致：uuid hex + 按魔数定的后缀），原图仍在同目录（对账/回滚用，`task.json` 的 `outputs` 记的是放大后的文件，缓存清理按目录整体进行），缓存上限沿用 `storage_config.temp_cache_mb`。
-- **零副作用**：`enable=false` 时出图链路与 1.0.0 逐字节等价——零网络、零新文件、零新增日志。
+- **零副作用**：`enable=false` 时出图链路与 **v1.0.0** 逐字节等价——零网络、零新文件、零新增日志（当前版本见文首「版本」行）。
 
 > 注意：「图像无损放大」与「图像清晰度增强」（`image_definition_enhance`，尺寸不变、上限 10M/最长边 5000px）是百度同产品下的**两个不同接口**，控制台需要**分别勾选**。本插件只实现前者；未勾选时调用返回 `error_code=6`。
 
