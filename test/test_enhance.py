@@ -31,6 +31,8 @@ from imago_fusion.core import enhance as logic
 from imago_fusion.core.models import DrawTask, GenerationRequest, RuntimeConfig, TaskState, EnhanceConfig
 from imago_fusion.core.enhance_client import BaiduEnhancer, EnhanceState
 
+ROOT = Path(__file__).resolve().parents[1]
+
 TOKEN_TEST = "TOKEN_TEST"
 
 
@@ -697,3 +699,43 @@ class EnhanceLogicTests(unittest.TestCase):
         self.assertEqual(oversized.exception.reason, "output_oversize")
         data, mime = logic.decode_payload({"image": base64.b64encode(png_bytes(2, 2)).decode()})
         self.assertEqual((data, mime), (png_bytes(2, 2), "image/png"))
+
+
+class EnhanceEndpointGuardTests(unittest.TestCase):
+    """E11：端点常量守卫（防回退到「图像无损放大」）+ 代码/配置里 0 残留。
+
+    本版把百度接口从「图像无损放大」改判为「图像清晰度增强」。这条守卫钉住两件事：
+    ① ``ENHANCE_URL`` 必须指向 ``image_definition_enhance``；
+    ② ``main.py`` / ``core/*.py`` / ``_conf_schema.json`` 里不得再出现旧端点 id
+    （README / CHANGELOG 的历史说明与 spec 文档不在扫描范围内）。
+    """
+
+    # 把旧端点 id 拆成两段拼接：本文件自己不是命中源，日后把 test/ 加进扫描面也不会自伤。
+    OLD_ENDPOINT_ID = "image_quality_" + "enhance"
+
+    def test_endpoint_constant_points_at_definition_enhance(self):
+        self.assertTrue(
+            logic.ENHANCE_URL.endswith("/rest/2.0/image-process/v1/image_definition_enhance"),
+            f"端点必须换成 image_definition_enhance：{logic.ENHANCE_URL}",
+        )
+        self.assertTrue(
+            logic.ENHANCE_URL.startswith("https://aip.baidubce.com/"),
+            f"端点域名不对：{logic.ENHANCE_URL}",
+        )
+
+    def test_repo_never_mentions_the_old_quality_endpoint(self):
+        targets = [
+            ROOT / "main.py",
+            ROOT / "_conf_schema.json",
+            *sorted((ROOT / "core").glob("*.py")),
+        ]
+        offenders = [
+            str(path.relative_to(ROOT))
+            for path in targets
+            if self.OLD_ENDPOINT_ID in path.read_text("utf-8")
+        ]
+        self.assertEqual(offenders, [], f"仍在引用旧端点 id：{offenders}")
+        self.assertIn(
+            "image_definition_enhance",
+            (ROOT / "core" / "enhance.py").read_text("utf-8"),
+        )

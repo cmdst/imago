@@ -4,11 +4,13 @@
 
 **版本口径**：本版走融合版自己的 `1.1.0` 线，**不跟随上游 imago 的 minor**（上游此时是 `1.3.0`）；只从上游 `v1.2.2…v1.3.0` 的 diff 里吸收**两项 bug 修复**，并**明确排除**其删除默认模型模板/适配器（`openai_chat`、`dashscope_multimodal`）与 `custom_params` 结构重写。
 
+**接口口径（变更令 v2）**：百度能力从草案里的「图像无损放大」（`image_quality_enhance`，长宽各放大 2 倍）**改判为「图像清晰度增强」**（`image_definition_enhance`，尺寸不变、去噪变清晰）——运营方的应用只勾选了后者；两接口在控制台分别勾选，未勾选返回 `error_code=6`。代码/配置/文档里的 `upscale`→`enhance` 命名重构与本改判同批落地（`v1.1.0` 从未发布，故**不跳版本号**）。
+
 ### 新增
 
-- **百度「图像无损放大」（`upscale_config`，默认关闭）**：出图成功后把每张成品图送 `image_quality_enhance` 放大 2 倍（长宽各 2 倍）再交付群聊，放大图另存为任务缓存目录下的新文件、**原图保留**兜底。端点、调用形状（`application/x-www-form-urlencoded` + urlencode 后的 base64，`access_token` 走查询参数）、本地预检（base64 ≤4M、长宽乘积 ≤2000×2000、jpg/png/bmp）与失败降级全部按百度文档口径实现；`access_token` 用两把 key 换取，内存缓存（30 天 − 5 分钟时钟余量），`110/111/100/HTTP 401` 失效重取 + **恰好重试一次**，并发按缓存键单飞（只打一次 token 接口）。
-- 配置组 `upscale_config` 7 键：`enable`（默认 **false**）/ `api_key` / `secret_key`（默认空）/ `max_image_mb`=4 / `max_pixels`=4000000 / `timeout_seconds`=20 / `enable_proxy`=false。键由 AstrBot 核心在插件加载时按 schema 自动补齐，**不需要手工迁移**。
-- 放大相关的 DEBUG（每图）+ INFO（每任务一条 `放大 成功=N 跳过=N 失败=N`）+ WARNING（每失败类一次）；`log_id` 只落 `task.runtime["upscale"]`。
+- **百度「图像清晰度增强」（`enhance_config`，默认关闭）**：出图成功后把每张成品图送 `image_definition_enhance`（去噪 + 优化纹理细节，**输出尺寸与输入相同**）再交付群聊，增强图另存为任务缓存目录下的新文件、**原图保留**兜底。**不是「图像无损放大」**：本插件不把图放大 2 倍。端点、调用形状（`application/x-www-form-urlencoded` + urlencode 后的 base64，`access_token` 走查询参数）、本地预检（base64 ≤10M、最短边 ≥10px、最长边 ≤5000px、长宽比 ≤4:1、jpg/png/bmp）与失败降级全部按百度文档口径实现；`access_token` 用两把 key 换取，内存缓存（30 天 − 5 分钟时钟余量），`110/111/100/HTTP 401` 失效重取 + **恰好重试一次**，并发按缓存键单飞（只打一次 token 接口）。
+- 配置组 `enhance_config` **8 键**：`enable`（默认 **false**）/ `api_key` / `secret_key`（默认空）/ `max_image_mb`=10 / `max_edge`=5000 / `max_aspect`=4.0（float）/ `timeout_seconds`=20 / `enable_proxy`=false。最短边 10px 是官方硬下限，做成常量、不占配置键。键由 AstrBot 核心在插件加载时按 schema 自动补齐，**不需要手工迁移**（生产从未部署过旧组名，见 spec v2.11）。
+- 增强相关的 DEBUG（每图 + 本地跳过的 `reason`）+ INFO（每任务一条 `增强 成功=N 跳过=N 失败=N`）+ WARNING（每失败类一次，含 `error_code=6` 时点明「控制台应用未勾选『图像清晰度增强』」）；`log_id` 只落 `task.runtime["enhance"]`，不进 INFO 汇总行。
 
 ### 修复
 
