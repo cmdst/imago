@@ -816,8 +816,15 @@ class EnhanceEndpointGuardTests(unittest.TestCase):
 
     本版把百度接口从「图像无损放大」改判为「图像清晰度增强」。这条守卫钉住两件事：
     ① ``ENHANCE_URL`` 必须指向 ``image_definition_enhance``；
-    ② ``main.py`` / ``core/*.py`` / ``_conf_schema.json`` 里不得再出现旧端点 id
+    ② **增强侧**的代码/配置里不得再出现旧端点 id
     （README / CHANGELOG 的历史说明与 spec 文档不在扫描范围内）。
+
+    v1.2.0 起扫描面从 ``core/*.py`` glob 收窄成**显式白名单**（spec 变更令 v3.10.3）：
+    新模块 ``core/upscale.py`` 的 ``UPSCALE_URL`` **就是** ``image_quality_enhance``
+    （那是 v1.2.0 新增的「图像无损放大」一级，属**功能**而非回退），glob 扫到它必然
+    误报。白名单把「增强侧的端点归增强管」这件事钉死，同时**不删任何断言、不放松**：
+    放大侧的反向守卫由 ``test/test_upscale.py::UpscaleEndpointGuardTests`` 承担
+    （放大两模块里不得出现 ``ENHANCE_URL`` 标识符）。
     """
 
     # 把旧端点 id 拆成两段拼接：本文件自己不是命中源，日后把 test/ 加进扫描面也不会自伤。
@@ -834,10 +841,17 @@ class EnhanceEndpointGuardTests(unittest.TestCase):
         )
 
     def test_repo_never_mentions_the_old_quality_endpoint(self):
+        # 显式白名单（不含 core/upscale.py 与 core/upscale_client.py：它们属于放大那一级）。
         targets = [
             ROOT / "main.py",
             ROOT / "_conf_schema.json",
-            *sorted((ROOT / "core").glob("*.py")),
+            ROOT / "core" / "enhance.py",
+            ROOT / "core" / "enhance_client.py",
+            ROOT / "core" / "models.py",
+            ROOT / "core" / "config.py",
+            ROOT / "core" / "prompting.py",
+            ROOT / "core" / "network.py",
+            ROOT / "core" / "errors.py",
         ]
         offenders = [
             str(path.relative_to(ROOT))

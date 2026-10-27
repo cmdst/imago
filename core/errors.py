@@ -81,6 +81,37 @@ class EnhanceSkipped(Exception):
         self.detail = detail
 
 
+class UpscaleError(Exception):
+    """放大失败的分类错误；``kind`` 机器可读，``code`` 为百度 ``error_code``（可能为 0）。
+
+    刻意**不复用** :class:`EnhanceError`（结构同构、类型独立）：放大与增强是两级独立
+    链路，``except EnhanceError`` 误接放大异常（或反之）会让某一级的失败被当成另一级
+    处理——例如把放大超时记进 ``task.runtime["enhance"]`` 的熔断标志里。同样刻意不
+    继承 ``ImagoFusionFusionError``：放大失败**不是**绘图失败，绝不能被 ``main.py`` 的
+    ``task.errors`` 收下（否则用户会看到「部分图片绘制失败。」，任务状态也会被降级成
+    ``PARTIAL_SUCCESS``）。见 ``core/upscale_client.py`` 的降级语义。
+    """
+
+    def __init__(self, kind: str, detail: str = "", *, code: int = 0) -> None:
+        super().__init__(detail or kind)
+        self.kind = kind  # token | transient | input | permission | quota | config | unknown
+        self.detail = detail
+        self.code = code
+
+
+class UpscaleSkipped(Exception):
+    """本地预检判定「不放大」（不是失败）：``reason`` 见 ``core/upscale.plan()``。
+
+    与 :class:`EnhanceSkipped` **互不继承**：两级跳过枚举不同（放大 7 条、增强 9 条），
+    共用类型会让「跳过原因互相冒充」在运行期静默成立。
+    """
+
+    def __init__(self, reason: str, detail: str = "") -> None:
+        super().__init__(detail or reason)
+        self.reason = reason
+        self.detail = detail
+
+
 # 创建阶段允许透出的固定文案：前缀白名单（冒号结尾的条目允许后跟数字等参数，
 # 如 "绘图额度不足: 3"、"不允许的附加参数: n"），不带冒号的只允许完全一致。
 _ALLOWED_ERROR_MESSAGES = (

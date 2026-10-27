@@ -273,6 +273,71 @@ class ConfigTests(unittest.TestCase):
         self.assertEqual(defaults.timeout_seconds, items["timeout_seconds"]["default"])
         self.assertEqual(defaults.enable_proxy, items["enable_proxy"]["default"])
 
+    def test_upscale_schema_group_matches_the_parser(self):
+        """U12：``upscale_config`` 7 键、默认值三方一致（schema ↔ dataclass ↔ load_config）。
+
+        与增强的「分别建模」硬约束配套：放大的键**不得**借用 ``enhance_config`` 的任何
+        阈值（schema 侧独立成组），且 ``enable`` 必须默认 false（零网络零费用）。
+        """
+        schema = json.loads((ROOT / "_conf_schema.json").read_text("utf-8"))
+        self.assertIn("upscale_config", schema)
+        items = schema["upscale_config"]["items"]
+        self.assertEqual(
+            set(items),
+            {
+                "enable", "api_key", "secret_key", "max_image_mb",
+                "max_pixels", "timeout_seconds", "enable_proxy",
+            },
+        )
+        self.assertEqual(items["max_image_mb"]["type"], "int")
+        self.assertEqual(items["max_pixels"]["type"], "int")
+        # dataclass 默认值 == schema 默认值（逐键）
+        from imago_fusion.core.models import UpscaleConfig
+
+        declared = UpscaleConfig()
+        for field, key in (
+            ("enabled", "enable"),
+            ("api_key", "api_key"),
+            ("secret_key", "secret_key"),
+            ("max_image_mb", "max_image_mb"),
+            ("max_pixels", "max_pixels"),
+            ("timeout_seconds", "timeout_seconds"),
+            ("enable_proxy", "enable_proxy"),
+        ):
+            with self.subTest(key=key):
+                self.assertEqual(
+                    items[key]["default"], getattr(declared, field),
+                    f"schema 默认与 UpscaleConfig 默认不一致：{key}",
+                )
+        # load_config({}) 的解析结果 == schema 默认值（解析没转发会红）
+        defaults = load_config({}).upscale
+        self.assertFalse(defaults.enabled)
+        self.assertEqual(defaults.api_key, items["api_key"]["default"])
+        self.assertEqual(defaults.secret_key, items["secret_key"]["default"])
+        self.assertEqual(defaults.max_image_mb, items["max_image_mb"]["default"])
+        self.assertEqual(defaults.max_pixels, items["max_pixels"]["default"])
+        self.assertEqual(defaults.timeout_seconds, items["timeout_seconds"]["default"])
+        self.assertEqual(defaults.enable_proxy, items["enable_proxy"]["default"])
+        # 官方硬限派生量：base64 ≤4M ⇒ 原图 3 145 728 B；乘积上限 2000×2000。
+        self.assertEqual(defaults.max_raw_bytes, 3_145_728)
+        self.assertEqual(defaults.max_pixels, 4_000_000)
+        # clamp 守卫：调高不会被接受（服务端超限也计费），调低按各自下限夹住。
+        clamped_high = load_config({
+            "upscale_config": {"max_image_mb": 99, "max_pixels": 9_999_999, "timeout_seconds": 999},
+        }).upscale
+        self.assertEqual(clamped_high.max_image_mb, 4)
+        self.assertEqual(clamped_high.max_pixels, 4_000_000)
+        self.assertEqual(clamped_high.timeout_seconds, 60)
+        clamped_low = load_config({
+            "upscale_config": {"max_image_mb": 0, "max_pixels": 1, "timeout_seconds": 1},
+        }).upscale
+        self.assertEqual(clamped_low.max_image_mb, 1)
+        self.assertEqual(clamped_low.max_pixels, 100_000)
+        self.assertEqual(clamped_low.timeout_seconds, 5)
+        # 两组配置互不串读：只填 enhance_config 不会点亮放大，反之亦然。
+        self.assertFalse(load_config({"enhance_config": {"enable": True}}).upscale.enabled)
+        self.assertFalse(load_config({"upscale_config": {"enable": True}}).enhance.enabled)
+
 
 class SecurityTests(unittest.TestCase):
 

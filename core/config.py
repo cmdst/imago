@@ -3,7 +3,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from .models import ProviderConfig, QuotaConfig, RuntimeConfig, EnhanceConfig
+from .models import ProviderConfig, QuotaConfig, RuntimeConfig, EnhanceConfig, UpscaleConfig
 
 API_TYPES = {
     "openai_image",
@@ -176,6 +176,7 @@ def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
     tasks = raw.get("task_config", {}) or {}
     storage = raw.get("storage_config", {}) or {}
     enhance_raw = raw.get("enhance_config", {}) or {}
+    upscale_raw = raw.get("upscale_config", {}) or {}
     style = _style(optimizer.get("optimizer_style", "default(通用)"))
     checkin_min = max(0, int(quota_raw.get("daily_checkin_quota_min", 1) or 0))
     checkin_max = max(checkin_min, int(quota_raw.get("daily_checkin_quota_max", 3) or 0))
@@ -225,6 +226,23 @@ def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
             max_aspect=max(1.0, min(4.0, _float_or_default(enhance_raw.get("max_aspect"), 4.0))),
             timeout_seconds=max(5, min(60, _int_or_default(enhance_raw.get("timeout_seconds"), 20))),
             enable_proxy=bool(enhance_raw.get("enable_proxy", False)),
+        ),
+        # 百度「图像无损放大」：独立配置组（`upscale_config`，7 键），**不读**
+        # `enhance_config` 的键、也不被增强读取。数值按官方硬限 clamp：base64 ≤4M
+        # （调高只会换来服务端失败+计费，故上限就是 4）、长宽乘积 ≤2000×2000、
+        # 超时 5-60 s（最短边 16px 是本地省钱守卫，做成 core/upscale.UPSCALE_MIN_EDGE_PX
+        # 常量、不设配置键）。
+        upscale=UpscaleConfig(
+            enabled=bool(upscale_raw.get("enable", False)),
+            api_key=str(upscale_raw.get("api_key", "") or "").strip(),
+            secret_key=str(upscale_raw.get("secret_key", "") or "").strip(),
+            max_image_mb=max(1, min(4, _int_or_default(upscale_raw.get("max_image_mb"), 4))),
+            max_pixels=max(
+                100_000,
+                min(4_000_000, _int_or_default(upscale_raw.get("max_pixels"), 4_000_000)),
+            ),
+            timeout_seconds=max(5, min(60, _int_or_default(upscale_raw.get("timeout_seconds"), 20))),
+            enable_proxy=bool(upscale_raw.get("enable_proxy", False)),
         ),
     )
 
