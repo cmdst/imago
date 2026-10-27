@@ -1,5 +1,32 @@
 # 更新日志
 
+## 1.2.0 — 2026-10-28
+
+**一句话**：在既有的百度「图像清晰度增强」之后，再挂一级百度**「图像无损放大」**（`image_quality_enhance`，长宽方向各放大两倍、面积 4 倍），并给参考图关系声明加一个**注入开关**（`task_config.inject_reference_note`，默认开启 = 行为零变化）。两个百度接口各自一套配置组、各自一套预检与熔断；增强那一级**行为零改动**。
+
+### 新增
+
+- **百度「图像无损放大」（`upscale_config`，7 键，默认关闭）**：出图成功、并走完（可选的）清晰度增强之后，把成品图送 `image_quality_enhance` —— **长宽各 2 倍**（面积 ×4）后再交付群聊；放大图另存为任务缓存目录下的新文件，**原图与增强图都保留**。端点、调用形状（`application/x-www-form-urlencoded` + urlencode 后的 base64，`access_token` 走查询参数，不带图片头）、本地预检（base64 ≤4M、长宽**乘积** ≤2000×2000、jpg/png/bmp，另加本地最短边 16px 省钱守卫）与失败降级全部按百度文档口径实现。
+- **两级链路（顺序写死）**：`materialize → 增强（尺寸不变） → 放大（2×） → 发送`。每级**独立预检**（判据 = 该级实际要上传的字节），放大拿的是**增强产物**（增强未成功/未开时是原图）；**任何一级的失败/跳过都保留上一级产物**，绝不回退原图。两套 `State` **各自熔断**（放大熔断不影响增强，反之亦然），预算余量复用 `core/enhance.BUDGET_MARGIN_SECONDS = 15`。
+- **配置组 `upscale_config`（7 键）**：`enable`（默认 **false**）/ `api_key` / `secret_key`（默认空）/ `max_image_mb`=4（clamp 1-4 ⇒ 原图上限 3 145 728 B）/ `max_pixels`=4000000（clamp 100000-4000000）/ `timeout_seconds`=20（clamp 5-60）/ `enable_proxy`=false。最短边 16px 是本地守卫，做成常量、不占配置键。键由 AstrBot 核心在插件加载时按 schema 自动补齐，**不需要手工迁移**。
+- **`task_config.inject_reference_note`（第 8 键，bool，默认 `true`）**：关闭后参考图关系声明与「前 N 张用户参考 / 其余人设身份」的位置补充段**一起不再追加**，最终 prompt 与 `task.request.prompt` **逐字节相等**（不留空行、不删既有文本）。默认 `true` ⇒ 升级到 1.2.0 后**行为零变化、不需要迁移**。
+- **日志**：放大汇总 INFO **独立成行**（`放大 成功=N 跳过=M 失败=K`，紧跟既有 `增强 成功=…` 行之后，**既有增强行格式一个字节没改**）；WARNING 每失败类一次、全部带 `放大 失败：` 前缀（marker 与增强不共用）；DEBUG 每图一条（`放大 完成/跳过/失败`）。放大统计只写 `task.runtime["upscale"]`（6 个字段：`attempted/succeeded/skipped/failures/circuit_open/log_id`），**不落 `task.json`**、不进 `task.errors`。
+
+### 变更
+
+- **测试伴奏（唯一触碰增强测试的地方）**：`test/test_enhance.py` 的 E11 端点守卫扫描面从 `core/*.py` glob **收窄成显式白名单**（不含 `core/upscale.py` / `core/upscale_client.py`）。断言一条没删、没跳过、没放松；放大侧的反向守卫（放大两模块里不得出现增强端点常量标识符）由新增的 `test/test_upscale.py` 承担。
+- 版本号 `1.2.0` 四处同步（`metadata.yaml` / `__init__.py` / `main.py` 的 `@register` / `README.md` 版本行）。
+
+### 非目标（本版不做）
+
+- **不改增强行为**：`core/enhance.py` / `core/enhance_client.py` / `enhance_config` 8 键 / `task.runtime["enhance"]` / 增强日志文案一字不动（唯一例外是上面那条测试扫描面收窄）。
+- 不做多级放大（4× / 8×）、不做自定义文案、不做「失败回退原图」、不用 `url` 参数、不引入 Pillow、不抽公共 `baidu_token.py`。
+- 不写生产、不重启服务、不 push / 不合并 / 不打 tag、**不真调百度接口**（全部用例走 `FakeSession`）。
+
+### 上线前必读
+
+百度控制台要在**同一个应用**里额外勾选 **「图像无损放大」**（可以和「图像清晰度增强」同时勾，两项互不排斥）；没勾选时每次调用都返回 `error_code=6`，日志出现 `放大 失败：控制台应用未勾选「图像无损放大」（error_code=6）…` —— 那是控制台没勾，**不是插件缺陷**（勾了增强 ≠ 勾了放大）。勾选后等 `access_token` 缓存自然过期（最长 30 天）或重载插件一次即可生效。
+
 ## 1.1.0 — 2026-10-27
 
 **版本口径**：本版走融合版自己的 `1.1.0` 线，**不跟随上游 imago 的 minor**（上游此时是 `1.3.0`）；只从上游 `v1.2.2…v1.3.0` 的 diff 里吸收**两项 bug 修复**，并**明确排除**其删除默认模型模板/适配器（`openai_chat`、`dashscope_multimodal`）与 `custom_params` 结构重写。

@@ -74,7 +74,7 @@ PENDING_PHOTO = "📸 正在为当前人设「{persona}」拍摄，请稍后…�
 FOREGROUND_REFERENCE_TIMEOUT = 30.0
 
 
-@register("imago_fusion", "Wolfycz", "IMAGO·FUSION：映相骨架 + AstrBot 原生 Provider（反代网页端）绘图", "1.1.0")
+@register("imago_fusion", "Wolfycz", "IMAGO·FUSION：映相骨架 + AstrBot 原生 Provider（反代网页端）绘图", "1.2.0")
 class ImagoFusion(Star):
     _STAGE_LABELS = {
         TaskStage.QUEUED: "排队中",
