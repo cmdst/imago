@@ -1,4 +1,5 @@
 import unittest
+from pathlib import Path
 
 from imago_fusion.core.prompting import (
     CAMERA_REQUEST_MARKER,
@@ -47,6 +48,25 @@ class ReferenceRelationSuffixTests(unittest.TestCase):
         self.assertIn("remaining 3 image(s)", suffix)
         self.assertIn("character identity references", suffix)
 
+
+
+class InjectionSwitchLocationTests(unittest.TestCase):
+    """`task_config.inject_reference_note` 的**唯一**改动面：注入开关不落在本模块。
+
+    spec 变更令 v3 的 I1/I2：关系声明本体与 builder 产出「基础声明 + persona 位置补充
+    段」，两段是同一个函数的两个 part ⇒ 关闭开关时两段一起消失；而开关判断只在
+    ``services/scheduler._request_for_attempt`` 那一处（运行时唯一追加点）。这条守卫
+    钉住「``core/prompting.py`` 不知道开关存在」，防止日后把判断散进 builder 造成
+    「一半关得掉、一半关不掉」。
+    """
+
+    def test_prompting_module_stays_config_free(self):
+        source = (Path(__file__).resolve().parents[1] / "core" / "prompting.py").read_text("utf-8")
+        self.assertNotIn("inject_reference_note", source)
+        self.assertIn("REFERENCE_RELATION_SUFFIX", source)
+        self.assertIn("def reference_relation_suffix(", source)
+        # 基础声明 + persona 位置补充段仍在同一个 builder 里（关开关时两段一起消失）
+        self.assertIn("character identity references.", source)
 
 
 class AutoStyleTableTests(unittest.TestCase):

@@ -161,7 +161,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         task = DrawTask("task", "umo", GenerationRequest("x", references=explicit))
         task.runtime["persona_references"] = persona
         with patch.object(scheduler_module.random, "sample") as sample:
-            request = TaskScheduler._request_for_attempt(task, provider)
+            request = TaskScheduler._request_for_attempt(task, provider, RuntimeConfig(providers=()))
         sample.assert_not_called()
         self.assertEqual(request.references, explicit)
         self.assertEqual(task.runtime["current_persona_reference_count"], 0)
@@ -184,7 +184,7 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
         task = DrawTask("task", "umo", GenerationRequest("x", references=explicit))
         task.runtime["persona_references"] = persona
         with patch.object(scheduler_module.random, "sample", return_value=persona[:2]):
-            request = TaskScheduler._request_for_attempt(task, provider)
+            request = TaskScheduler._request_for_attempt(task, provider, RuntimeConfig(providers=()))
         self.assertEqual(len(request.references), 3)
         # 采样后实际 1 张用户图 + 2 张人设图，而非全量池 3 张人设图。
         self.assertIn("The first 1 attached image(s)", request.prompt)
@@ -618,6 +618,83 @@ class SchedulerTests(unittest.IsolatedAsyncioTestCase):
                 scheduler_module.ADAPTERS.pop("astrbot_native", None)
             else:
                 scheduler_module.ADAPTERS["astrbot_native"] = old
+
+
+
+class InjectReferenceNoteSwitchTests(unittest.TestCase):
+    """U16/U17：参考图关系声明注入开关的**真假两态**（执行级，纯函数级调用面）。
+
+    ``_request_for_attempt(task, provider, cfg)`` 的第三参是调用方已解析的
+    ``RuntimeConfig``（必填、无默认值）——开关值就在里面，所以这里直接驱动真实方法，
+    不需要跑整个调度循环。
+    """
+
+    @staticmethod
+    def _fixture(*, inject: bool):
+        explicit = [
+            ImageInput(b"explicit-1", "image/png", "e1.png"),
+            ImageInput(b"explicit-2", "image/png", "e2.png"),
+        ]
+        persona = [
+            ImageInput(b"p1", "image/png", "p1.png"),
+            ImageInput(b"p2", "image/png", "p2.png"),
+            ImageInput(b"p3", "image/png", "p3.png"),
+        ]
+        provider = ProviderConfig(
+            "node", "custom_endpoint", "https://example.invalid", ("key",),
+            model="model", reference_image_limit=3,
+        )
+        prompt = "画一张测试图：海边回头，逆光"
+        task = DrawTask("task", "umo", GenerationRequest(prompt, references=explicit))
+        task.runtime["persona_references"] = persona
+        cfg = RuntimeConfig(providers=(), inject_reference_note=inject)
+        return task, provider, cfg, prompt, explicit, persona
+
+    def test_switch_off_keeps_the_prompt_byte_identical(self):
+        """U16：``inject_reference_note=False`` ⇒ 最终 prompt **逐字节**等于入参。"""
+        task, provider, cfg, prompt, explicit, persona = self._fixture(inject=False)
+        self.assertFalse(cfg.inject_reference_note)
+        with patch.object(scheduler_module.random, "sample", return_value=persona[:1]):
+            request = TaskScheduler._request_for_attempt(task, provider, cfg)
+        # 逐字节：没有尾缀、没有空行、没有被 strip 过的痕迹
+        self.assertEqual(request.prompt, prompt)
+        self.assertEqual(request.prompt.encode("utf-8"), task.request.prompt.encode("utf-8"))
+        self.assertNotIn(scheduler_module.REFERENCE_RELATION_SUFFIX, request.prompt)
+        for fragment in ("The first", "remaining", "character identity references", "Reference image(s) attached"):
+            self.assertNotIn(fragment, request.prompt)
+        self.assertFalse(request.prompt.endswith("\n"))
+        self.assertNotIn("\n\n", request.prompt)
+        # 参考图采样与计数**照旧**（可观测性不随开关丢失）
+        self.assertEqual(len(request.references), 3)  # 2 显式 + 1 采样人设
+        self.assertEqual(task.runtime["current_explicit_reference_count"], 2)
+        self.assertEqual(task.runtime["current_persona_reference_count"], 1)
+        self.assertEqual(task.runtime["current_reference_count"], 3)
+
+    def test_switch_on_matches_the_v110_output_verbatim(self):
+        """U17：``inject_reference_note=True`` ⇒ 原 prompt + "\\n\\n" + 关系声明（1.1.0 现状）。"""
+        from imago_fusion.core.prompting import reference_relation_suffix
+
+        task, provider, cfg, prompt, explicit, persona = self._fixture(inject=True)
+        self.assertTrue(cfg.inject_reference_note)
+        with patch.object(scheduler_module.random, "sample", return_value=persona[:1]):
+            request = TaskScheduler._request_for_attempt(task, provider, cfg)
+        self.assertEqual(request.prompt, f"{prompt}\n\n{reference_relation_suffix(2, 1)}")
+        self.assertIn(scheduler_module.REFERENCE_RELATION_SUFFIX, request.prompt)
+        self.assertIn("The first 2 attached image(s)", request.prompt)
+        self.assertIn("The remaining 1 image(s)", request.prompt)
+        # 默认值就是 True：不传该键时行为必须与 1.1.0 一致
+        default_task, default_provider, _, default_prompt, _, _ = self._fixture(inject=True)
+        with patch.object(scheduler_module.random, "sample", return_value=persona[:1]):
+            default_request = TaskScheduler._request_for_attempt(
+                default_task, default_provider, RuntimeConfig(providers=()),
+            )
+        self.assertEqual(default_request.prompt, f"{default_prompt}\n\n{reference_relation_suffix(2, 1)}")
+
+    def test_config_argument_is_required(self):
+        """第三参**必填**（不给默认值）：漏传必须炸，不许静默按 True/False 走。"""
+        task, provider, _, _, _, _ = self._fixture(inject=True)
+        with self.assertRaises(TypeError):
+            TaskScheduler._request_for_attempt(task, provider)  # 故意漏传第三参
 
 
 if __name__ == "__main__":

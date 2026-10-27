@@ -136,8 +136,13 @@ class TaskScheduler:
                 self.recent.pop(task_id, None)
 
     @staticmethod
-    def _request_for_attempt(task: DrawTask, provider):
-        """Build the request for one model attempt, sampling Persona references if configured."""
+    def _request_for_attempt(task: DrawTask, provider, cfg):
+        """Build the request for one model attempt, sampling Persona references if configured.
+
+        ``cfg`` 是调用方已解析好的 ``RuntimeConfig``（**必填、不给默认值**）：参考图关系
+        声明的注入开关（``task_config.inject_reference_note``）就在里面。漏传必须炸，
+        不许静默按 True/False 走 —— 这是 ``core/enhance.plan(*, remaining)`` 的同一条教训。
+        """
         explicit_references = list(task.request.references)
         persona_references = list(task.runtime.get("persona_references", []) or [])
         limit = max(0, int(getattr(provider, "reference_image_limit", 0) or 0))
@@ -151,7 +156,11 @@ class TaskScheduler:
             selected_persona = persona_references
         references = [*explicit_references, *selected_persona]
         prompt = task.request.prompt
-        if explicit_references and REFERENCE_RELATION_SUFFIX not in prompt:
+        # 注入开关（`task_config.inject_reference_note`，默认 True = 与 1.1.0 逐字节
+        # 等价）：关闭时**完全不追加** —— 最终 prompt 与 `task.request.prompt` 逐字节
+        # 相等（不删既有文本、不留空行）。`REFERENCE_RELATION_SUFFIX not in prompt`
+        # 仍是幂等守卫，但**不用它替代**开关判断（两者顺序无关、各自独立成立）。
+        if cfg.inject_reference_note and explicit_references and REFERENCE_RELATION_SUFFIX not in prompt:
             # 低优先级关系声明按本节点实际采样数量追加：前 N 张是用户指定参考、
             # 其余是人设固定图，避免模型在图片较多时默认跟随人设图（按全量池
             # 计数会在 reference_image_limit 采样后数量虚高）。
@@ -341,7 +350,9 @@ class TaskScheduler:
                 models = [""]
             for model_index, model in enumerate(models, start=1):
                 attempt = replace(provider, model=model)
-                attempt_request = self._request_for_attempt(task, attempt)
+                # ``config`` 是本函数开头（``:314``）已取好的 RuntimeConfig，不新增一次
+                # load_config（逐图重复解析的教训就在那儿）。
+                attempt_request = self._request_for_attempt(task, attempt, config)
                 task.runtime["current_provider_id"] = attempt.id
                 task.runtime["current_model"] = model
                 self.set_stage(task, TaskStage.REQUESTING_PROVIDER)

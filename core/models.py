@@ -195,6 +195,11 @@ class RuntimeConfig:
     llm_caption_cm_context: bool = False
     llm_caption_pregen: bool = False
     at_trigger_user: bool = True
+    # 参考图关系声明注入开关（`task_config.inject_reference_note`，第 8 键，默认 True）。
+    # True = 与 v1.1.0 逐字节相同（显式参考图存在时在最终 prompt 末尾追加低优先级
+    # 关系声明 + 人设位置补充段）；False = **完全不追加**，`request.prompt` 逐字节等于
+    # `task.request.prompt`（不删既有文本、不留空行）。见 `services/scheduler.py`。
+    inject_reference_note: bool = True
     max_upload_bytes: int = 20 * 1024 * 1024
     temp_cache_bytes: int = 512 * 1024 * 1024
     block_private_networks: bool = True

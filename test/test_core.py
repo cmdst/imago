@@ -338,6 +338,31 @@ class ConfigTests(unittest.TestCase):
         self.assertFalse(load_config({"enhance_config": {"enable": True}}).upscale.enabled)
         self.assertFalse(load_config({"upscale_config": {"enable": True}}).enhance.enabled)
 
+    def test_inject_reference_note_defaults_agree_everywhere(self):
+        """U18：开关默认值三方一致（schema == load_config == RuntimeConfig 默认）。"""
+        from imago_fusion.core.models import RuntimeConfig
+
+        schema = json.loads((ROOT / "_conf_schema.json").read_text("utf-8"))
+        item = schema["task_config"]["items"]["inject_reference_note"]
+        self.assertEqual(item["type"], "bool")
+        self.assertIs(item["default"], True)
+        self.assertIs(load_config({}).inject_reference_note, True)
+        self.assertIs(RuntimeConfig(providers=()).inject_reference_note, True)
+        # 显式关闭要真的落地（不是「schema 有、解析不转发」的静默丢键）
+        self.assertIs(
+            load_config({"task_config": {"inject_reference_note": False}}).inject_reference_note,
+            False,
+        )
+        # task_config 由 7 键变 8 键：新增的正是这一键，其余键名一个没动
+        self.assertEqual(
+            set(schema["task_config"]["items"]),
+            {
+                "generation_timeout", "llm_retry", "max_concurrent_tasks", "llm_caption",
+                "llm_caption_cm_context", "llm_caption_pregen", "at_trigger_user",
+                "inject_reference_note",
+            },
+        )
+
 
 class SecurityTests(unittest.TestCase):
 

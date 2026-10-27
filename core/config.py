@@ -207,6 +207,8 @@ def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
         llm_caption_cm_context=bool(tasks.get("llm_caption_cm_context", False)),
         llm_caption_pregen=bool(tasks.get("llm_caption_pregen", False)),
         at_trigger_user=bool(tasks.get("at_trigger_user", True)),
+        # 参考图关系声明注入开关：默认 True（升级到 1.2.0 后行为零变化、不需要迁移）。
+        inject_reference_note=bool(tasks.get("inject_reference_note", True)),
         max_upload_bytes=max(1, int(storage.get("max_upload_mb", 20) or 20)) * 1024 * 1024,
         temp_cache_bytes=max(16, int(storage.get("temp_cache_mb", 512) or 512)) * 1024 * 1024,
         block_private_networks=bool(storage.get("block_private_networks", True)),
