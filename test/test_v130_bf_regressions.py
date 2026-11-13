@@ -280,7 +280,7 @@ class _FakeScheduler:
         self.results = results or [ImageResult(data=PNG, mime_type="image/png")]
         self.results_by_id = results_by_id or {}
 
-    async def invoke(self, provider, request, *, timeout=None):
+    async def invoke(self, provider, request, *, timeout=None, task=None):
         self.invocations.append((provider, request, timeout))
         if provider.id in self.fail_ids:
             raise ProviderError("boom", status=500)

@@ -28,6 +28,13 @@
 - **告知与原文**：`notify_user=false` 时成功/失败/容量提示全部静默；降级 prompt 只从 prepare 入口保存的用户原文重建，原文不可证明时 `prompt_unrebuildable` 终止、零调用。
 - **提交入口**：无可用节点（全部停用或配置不完整）在扣额度、创建排队任务之前拒绝；`_conf_schema.json` 的 `api_type` 补齐第 7 型 `xai_image`。
 
+### 修复（独立评审 round 3）
+
+- **原生子请求计数（R2-01）**：`scheduler.invoke` 现在把适配器实例与任务关联，`finally` 记录成功/异常/超时/取消，遮挡编辑与最终降级共用同一计数器；`_generate` 自身计数不变，两条路径不重叠、不双算，原生节点内部 count≤4 与部分成功语义保持不变。
+- **拒绝分类冻结表（R2-02）**：补齐 `moderation_blocked`/`prohibited_content`/`invalid_image_format`/`IMAGE_SAFETY` 等冻结别名；结构化字段按 code/finishReason/blockReason 各自语义解释；无结构化证据的 prompt blocked 文本判 `text_rejected` 且优先于 safety；`block_reason=OTHER` 单独视为未知，仅与 prompt 证据同现才判 `text_rejected`。
+- **原生包装状态（R2-03）**：流式/非流式失败保留上游可信 `status`（含 SDK `response.status`，经 int/范围校验），超时与连接异常以 `source=transport` 保留排除证据；未知状态仍为 None，绝不从业务字符串伪造。
+- **HTTP 200 业务拒绝（R2-04）**：DashScope 无图 `{code: DataInspectionFailed}` 改抛结构化 `NoOutputError`（保留 200/code/source），Gemini 仅有 `finishReason`（如 `IMAGE_SAFETY`）的分支补 `200 + source=body`；这类已完成计费的请求按 `NO_OUTPUT` 结算、不退款。
+
 
 ## 1.2.0 — 2026-10-28
 

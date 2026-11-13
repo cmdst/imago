@@ -968,7 +968,7 @@ class ImagoFusion(Star):
             )
             stats["edit_calls"] = int(stats.get("edit_calls", 0)) + 1
             try:
-                results = await self.scheduler.invoke(occluder, request, timeout=timeout)
+                results = await self.scheduler.invoke(occluder, request, timeout=timeout, task=task)
             except Exception as exc:
                 logger.warning(
                     "%s task=%s 参考图降级 失败 kind=occlusion type=%s",
@@ -1019,7 +1019,9 @@ class ImagoFusion(Star):
         )
         if timeout <= 0:
             raise asyncio.TimeoutError
-        return await self.scheduler.invoke(replace(target, model=model), request, timeout=timeout)
+        return await self.scheduler.invoke(
+            replace(target, model=model), request, timeout=timeout, task=task
+        )
 
     async def _reference_fallback(self, task, config, remaining, rejection, locked):
         """S6 执行体（rev3.1 + BF-01/02/03/06/10/11）。

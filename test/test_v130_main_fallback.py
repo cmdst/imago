@@ -50,7 +50,7 @@ class FakeScheduler:
         self.invocations = []
         self.fail_target = fail_target
 
-    async def invoke(self, provider, request, *, timeout=None):
+    async def invoke(self, provider, request, *, timeout=None, task=None):
         self.invocations.append((provider, request, timeout))
         if self.fail_target and provider.id == "node_a":
             from imago_fusion.core.errors import ProviderError

@@ -308,9 +308,10 @@ _GENERIC_CODES = frozenset({
 
 _STRUCTURED_SAFETY = frozenset({
     "content_policy", "contentpolicy", "content_policy_violation", "safety",
-    "safety_violation", "moderation", "nsfw", "sensitive", "prohibited",
-    "blocked", "blocklist", "content_filter", "data_inspection_failed",
-    "datainspectionfailed", "image_safety", "spii", "recitation", "unsafe",
+    "safety_violation", "moderation", "moderation_blocked", "nsfw", "sensitive",
+    "prohibited", "prohibited_content", "blocked", "blocklist", "content_filter",
+    "data_inspection_failed", "datainspectionfailed", "image_safety",
+    "spii", "recitation", "unsafe",
 })
 _STRUCTURED_UNSUPPORTED = frozenset({
     "unsupported_image", "image_not_supported", "images_not_supported",
@@ -324,10 +325,12 @@ _STRUCTURED_TEXT_REJECTED = frozenset({
 _STRUCTURED_INVALID = frozenset({
     "invalid_image", "image_invalid", "image_too_large", "image_size_invalid",
     "invalid_image_size", "bad_image", "image_decode_failed",
-    "image_format_unsupported",
+    "image_format_unsupported", "invalid_image_format",
 })
 # finish_reason / block_reason 的字段语义：只有这些取值才是有意义的业务证据。
-_SAFETY_REASONS = frozenset({"safety", "prohibited_content", "blocklist", "spii"})
+_SAFETY_REASONS = frozenset({
+    "safety", "image_safety", "prohibited_content", "blocklist", "spii",
+})
 _TEXT_REASON_VALUES = frozenset({"blocklist", "prompt_blocked", "text_rejected"})
 _TEXT_ONLY = re.compile(
     r"(does\s+not|doesn't|not)\s+support\s+(?:image|vision)|text[- ]only|"
@@ -370,7 +373,9 @@ _SAFETY_TEXT = re.compile(
 )
 _TEXT_REJECTED = re.compile(
     r"prompt[^\n]{0,20}(?:too\s+long|exceed)|input[^\n]{0,20}too\s+long|"
-    r"max(?:imum)?\s+(?:tokens|length)|上下文.{0,10}(?:过长|超限)",
+    r"max(?:imum)?\s+(?:tokens|length)|上下文.{0,10}(?:过长|超限)|"
+    r"prompt[^\n]{0,24}(?:was\s+)?blocked|"
+    r"提示词[^\n]{0,16}(?:被拒|不合规)",
     re.I,
 )
 _NON_IMAGE_EXCLUSIONS = re.compile(
@@ -457,10 +462,16 @@ def classify_rejection(
         return RejectionVerdict("unknown", False, evidence or "transport", detail)
     if isinstance(exc, _AiohttpClientError):
         return RejectionVerdict("unknown", False, evidence or "transport", detail)
+    if source == "transport":
+        # native 适配器无法保留原异常类型时用等价排除证据（contract §6.3 排除层）。
+        return RejectionVerdict("unknown", False, evidence or "transport", detail)
     if status in EXCLUDED_STATUSES or (isinstance(status, int) and status >= 500):
         return RejectionVerdict("unknown", False, evidence or f"status:{status}", detail)
 
     # 2) 结构化判定：每个字段是否构成有效证据（OTHER 单独无效）。
+    other_only = (block.lower() == "other") and not code and not (
+        finish and finish.lower() not in {"other", "stop", "length"}
+    )
     reliable = bool(
         code
         or (finish and finish.lower() not in {"other", "stop", "length"})
@@ -472,6 +483,12 @@ def classify_rejection(
             return RejectionVerdict(kind, kind in {"image_unsupported", "image_invalid"}, evidence or "structured", detail)
         # 结构化证据可靠但无法归类：不猜、也不回落到文本正则。
         return RejectionVerdict("unknown", False, evidence or "structured", detail)
+    if other_only:
+        # contract 2c：OTHER 单独不构成任何类别；只有与 prompt 被拒文本证据
+        # 同时命中才归 text_rejected，且不得被普通 safety 文本猜走。
+        if _TEXT_REJECTED.search(raw):
+            return RejectionVerdict("text_rejected", False, evidence or "text", detail)
+        return RejectionVerdict("unknown", False, evidence or "block:OTHER", detail)
 
     # 3) 文本层：仅在状态码白名单内、且无任何结构化证据时启用（窄路径）。
     if status not in REJECTION_STATUSES:

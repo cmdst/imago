@@ -631,23 +631,37 @@ class TaskScheduler:
             return fallback
         raise no_output_error or last_error or ProviderError("所有节点都失败")
 
-    async def invoke(self, provider, request, *, timeout: float | None = None):
+    async def invoke(
+        self,
+        provider,
+        request,
+        *,
+        timeout: float | None = None,
+        task: DrawTask | None = None,
+    ):
         """单次适配器调用（供降级/遮挡链路复用 key 轮转、代理与超时语义）。
 
-        不做路由、不写 attempt_errors、不做拒绝判定；调用方负责预算与失败处理。
+        ``task`` 用于把适配器内部真实发生的子请求数（原生适配器 ``subcalls``）
+        在 ``finally`` 里累加进 ``task.runtime["native_subcalls"]``——成功、异常、
+        超时、取消都要计入，费用审计不能漏掉遮挡/最终阶段（R2-01）。正常
+        ``_generate`` 走自己的 finally，两条路径互不重叠，因此不会双算。
         """
         adapter = ADAPTERS[provider.api_type](provider)
-        key_index = self._key_indices.get(provider.id, 0)
-        key = provider.api_keys[key_index % len(provider.api_keys)] if provider.api_keys else ""
-        self._key_indices[provider.id] = key_index + 1
-        proxy_url = self.config_getter().proxy_url
-        async with asyncio.timeout(provider.timeout if timeout is None else timeout):
-            return await adapter.generate(
-                _ProxySession(self.session, proxy_url)
-                if provider.enable_proxy and proxy_url else self.session,
-                request,
-                key,
-            )
+        try:
+            key_index = self._key_indices.get(provider.id, 0)
+            key = provider.api_keys[key_index % len(provider.api_keys)] if provider.api_keys else ""
+            self._key_indices[provider.id] = key_index + 1
+            proxy_url = self.config_getter().proxy_url
+            async with asyncio.timeout(provider.timeout if timeout is None else timeout):
+                return await adapter.generate(
+                    _ProxySession(self.session, proxy_url)
+                    if provider.enable_proxy and proxy_url else self.session,
+                    request,
+                    key,
+                )
+        finally:
+            if task is not None:
+                self._record_adapter_subcalls(task, adapter)
 
     async def close(self) -> None:
         self.accepting = False

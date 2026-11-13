@@ -196,5 +196,14 @@ class GeminiAdapter(ProviderAdapter):
                     status=200,
                     source="body",
                 )
-            raise NoOutputError("Gemini 响应中没有图片", finish_reason=finish_reason)
+            if finish_reason:
+                # 带 finishReason 但无 promptFeedback 的分支同样是上游业务拒绝，
+                # 必须保留已知状态与来源（R2-04）。
+                raise NoOutputError(
+                    "Gemini 响应中没有图片",
+                    finish_reason=finish_reason,
+                    status=200,
+                    source="body",
+                )
+            raise NoOutputError("Gemini 响应中没有图片")
         return results

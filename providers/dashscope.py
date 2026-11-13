@@ -111,8 +111,9 @@ class DashScopeMultimodalAdapter(ProviderAdapter):
                 detail = f" code={code}" if code else ""
                 if message:
                     detail += f" message={message}"
-                # ``code`` 同时作为结构化字段交给拒绝分类器（如 DataInspectionFailed=安全）。
-                raise ProviderError(
+                # HTTP 200 的业务拒绝（有 code/message、无图）按契约抛结构化
+                # NoOutputError：它已完成一次计费请求，不能按 FAILED 退款（R2-04）。
+                raise NoOutputError(
                     f"DashScope{detail}",
                     status=200,
                     code=str(payload.get("code", "")),

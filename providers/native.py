@@ -22,6 +22,7 @@ Design rules (see ``DESIGN.md`` §2):
 
 from __future__ import annotations
 
+import asyncio
 import base64
 import re
 from collections.abc import AsyncIterator
@@ -308,18 +309,57 @@ class NativeAdapter(ProviderAdapter):
             if not fields["code"]:
                 # AstrBot 各版本把业务码放在 error_code / reason / status 之一；
                 # 只取第一个非空值作为 code，不把整段文本当证据（BF-05）。
-                for key in ("error_code", "reason", "status"):
+                for key in ("error_code", "reason"):
                     value = getter(key)
                     if value not in (None, ""):
                         fields["code"] = str(value)
                         break
         return fields
 
+    @staticmethod
+    def _status_of(source: Any) -> int | None:
+        """取可信 HTTP 状态：只认 int（拒绝 bool/字符串/业务文本），未知保持 None。"""
+        candidates: list[Any] = [source]
+        response = getattr(source, "response", None)
+        if response is not None:
+            candidates.append(response)
+        for item in candidates:
+            for attr in ("status", "status_code"):
+                value = getattr(item, attr, None)
+                if (
+                    isinstance(value, int)
+                    and not isinstance(value, bool)
+                    and 100 <= value <= 599
+                ):
+                    return value
+        return None
+
+    @staticmethod
+    def _is_transport_error(exc: BaseException) -> bool:
+        """超时/连接类失败：保留等价排除证据，绝不包装成可降级业务拒绝。"""
+        if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+            return True
+        name = type(exc).__name__
+        module = type(exc).__module__ or ""
+        return module.startswith("aiohttp") and any(
+            token in name for token in ("Client", "Server", "Connection", "Connector")
+        )
+
     @classmethod
-    def _exception_kwargs(cls, exc: BaseException) -> dict[str, str]:
-        """从上游异常上提取结构化拒绝字段（无则全空，由分类器判 unknown）。"""
+    def _exception_kwargs(cls, exc: BaseException) -> dict[str, Any]:
+        """从上游异常上提取结构化拒绝字段（无则全空，由分类器判 unknown）。
+
+        R2-03：保留上游可信 ``status``（含 SDK ``response.status``/``status_code``，
+        经类型校验），并让超时/连接异常以 ``source=transport`` 保留排除证据；
+        未知状态保持 None，绝不从业务字符串伪造 HTTP 状态。
+        """
+        if cls._is_transport_error(exc):
+            return {"source": "transport"}
         fields = cls._reason_fields(exc)
-        payload = {key: value for key, value in fields.items() if value}
+        payload: dict[str, Any] = {key: value for key, value in fields.items() if value}
+        status = cls._status_of(exc)
+        if status is not None:
+            payload["status"] = status
         if payload:
             payload["source"] = "native"
         return payload
