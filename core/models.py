@@ -201,7 +201,7 @@ class ReferenceFallbackConfig:
         notify_user: 是否在结果尾部告知本次参考图未被使用（默认 True）。
     """
 
-    enabled: bool = False
+    enable: bool = False
     max_extra_attempts: int = 1
     caption_max_chars: int = 200
     vision_timeout_seconds: int = 20

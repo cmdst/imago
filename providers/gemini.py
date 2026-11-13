@@ -112,7 +112,9 @@ class GeminiAdapter(ProviderAdapter):
             {"inlineData": {"mimeType": image.mime_type, "data": base64.b64encode(image.data).decode()}}
             for image in request.references
         )
-        params = self.merged_params(request, reserved=self._dedicated)
+        params = self.merged_params(request, reserved={"size"})
+        # image_size 有专属容器（imageConfig.imageSize），先取出再记其余无容器键。
+        image_size = str(params.pop("image_size", "") or "").strip().upper()
         self.log_param_errors()
         for key in params:
             self._debug(
@@ -125,7 +127,6 @@ class GeminiAdapter(ProviderAdapter):
         image_config: dict = {}
         if ratio:
             image_config["aspectRatio"] = ratio
-        image_size = str(params.get("image_size", "") or "").strip().upper()
         if image_size and image_size in {"512", "1K", "2K", "4K"}:
             image_config["imageSize"] = image_size
         if image_config:

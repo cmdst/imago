@@ -410,19 +410,23 @@ def classify_rejection(
     # 2) 判定层：结构化证据优先；``block_reason=OTHER`` 单独 = unknown。
     if normalized == {"other"}:
         return RejectionVerdict("unknown", False, evidence or "structured", detail)
+    # 结构化 text_rejected（prompt 被拒）：恒不可降级，且与 safety 互斥时优先
+    # （rev3.1 §6.3 第 3 条：证据同现时 text_rejected 优先）。
+    if normalized & _STRUCTURED_TEXT_REJECTED:
+        return RejectionVerdict("text_rejected", False, evidence or "structured", detail)
     if normalized & _STRUCTURED_SAFETY:
         return RejectionVerdict("safety", False, evidence or "structured", detail)
     if normalized & _STRUCTURED_UNSUPPORTED:
         return RejectionVerdict("image_unsupported", True, evidence or "structured", detail)
     if normalized & _STRUCTURED_INVALID:
         return RejectionVerdict("image_invalid", True, evidence or "structured", detail)
-    # 结构化 text_rejected（prompt 被拒）：恒不可降级，且优先于 safety。
-    if normalized & _STRUCTURED_TEXT_REJECTED:
-        return RejectionVerdict("text_rejected", False, evidence or "structured", detail)
 
     lowered = raw
     # 3) 文本层：text_rejected 与 safety 互斥，证据同现时 text_rejected 优先。
-    if _TEXT_REJECTED.search(lowered) or _NON_IMAGE_EXCLUSIONS.search(lowered):
+    # 鉴权/额度/模型不存在等否定词优先排除：即使 HTTP 400 也不能当成图片拒绝。
+    if _NON_IMAGE_EXCLUSIONS.search(lowered):
+        return RejectionVerdict("unknown", False, evidence or "text", detail)
+    if _TEXT_REJECTED.search(lowered):
         return RejectionVerdict("text_rejected", False, evidence or "text", detail)
     if _SAFETY_TEXT.search(lowered):
         return RejectionVerdict("safety", False, evidence or "text", detail)

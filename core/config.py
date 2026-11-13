@@ -285,7 +285,7 @@ def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
         # 参考图文字降级（`reference_fallback_config`，5 键，默认关闭）：关闭时
         # 与 v1.2.0 逐字节等价，不产生任何额外请求/文件/费用（契约 F6）。
         reference_fallback=ReferenceFallbackConfig(
-            enabled=bool(reference_fallback_raw.get("enable", False)),
+            enable=bool(reference_fallback_raw.get("enable", False)),
             max_extra_attempts=max(
                 0, min(1, _int_or_default(reference_fallback_raw.get("max_extra_attempts"), 1)),
             ),

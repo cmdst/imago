@@ -402,41 +402,39 @@ class TaskScheduler:
             reason = "no_snapshot"
         elif not str(getattr(config, "vision_provider_id", "") or "").strip():
             reason = "no_vision_provider"
-        elif remaining < float(fb.vision_timeout_seconds) + 15 + 20:
-            reason = "budget"
         else:
+            # rev3.1：容量类判定与预算无关——容量不够/安全容量不足是终态原因，
+            # 必须在 budget 之前给出，不能被"剩余预算不足"掩盖（AC-41/83）。
+            references = list(locked["request"].references)
+            n = len(references)
+            occluder = str(getattr(exp, "occluder_provider_id", "") or "").strip() if exp else ""
+            occluder_node = next(
+                (item for item in config.providers if item.id == occluder), None,
+            ) if occluder else None
+            occluder_ready = bool(
+                exp and exp.enable and occluder_node is not None
+                and occluder_node.enabled and self._provider_complete(occluder_node)
+            )
+            capacity = max(1, min(int(exp.max_images), 3)) if occluder_ready else 0
+            kind = rejection.get("kind")
             target = next(
                 (item for item in config.providers if item.id == locked["provider_id"]),
                 None,
             )
-            if target is None or not target.enabled or not self._provider_complete(target):
+            if occluder_ready and n > capacity and kind == "safety":
+                # 安全拒绝不允许退化成"只传部分图"，容量不够就终止。
+                reason = "capacity_safety"
+            elif n > CAPTION_MAX_IMAGES:
+                # 技术拒绝且图数超出摘要容量 → 整组文字也做不了。
+                reason = "capacity_over_caption"
+            elif not n:
+                reason = "no_references"
+            elif remaining < float(fb.vision_timeout_seconds) + 15 + 20:
+                reason = "budget"
+            elif target is None or not target.enabled or not self._provider_complete(target):
                 reason = "target_disabled"
-            else:
-                references = list(locked["request"].references)
-                n = len(references)
-                occluder = str(getattr(exp, "occluder_provider_id", "") or "").strip() if exp else ""
-                occluder_node = next(
-                    (item for item in config.providers if item.id == occluder), None,
-                ) if occluder else None
-                occluder_ready = bool(
-                    exp and exp.enable and occluder_node is not None
-                    and occluder_node.enabled and self._provider_complete(occluder_node)
-                )
-                kind = rejection.get("kind")
-                if occluder_ready:
-                    capacity = max(1, min(int(exp.max_images), 3))
-                    if n > capacity and kind == "safety":
-                        # 安全拒绝不允许退化成"只传部分图"，容量不够就终止。
-                        reason = "capacity_safety"
-                    elif n > CAPTION_MAX_IMAGES:
-                        # rev3.1：技术拒绝且图数超出摘要容量 → 整组文字也做不了。
-                        reason = "capacity_over_caption"
-                elif kind == "safety":
-                    reason = "safety_needs_occlusion"
-                elif n > CAPTION_MAX_IMAGES:
-                    reason = "capacity_over_caption"
-                elif not n:
-                    reason = "no_references"
+            elif kind == "safety" and not occluder_ready:
+                reason = "safety_needs_occlusion"
         if reason:
             self.debug(
                 task, "task=%s 参考图降级 跳过 reason=%s", task.id[:8], reason,
@@ -467,7 +465,10 @@ class TaskScheduler:
     async def _generate(self, task: DrawTask, remaining: float | None = None) -> list[ImageResult]:
         config = self.config_getter()
         if remaining is None:
-            deadline = task.created_at + float(config.generation_timeout)
+            # created_at 缺省（直接构造 DrawTask 的测试/工具路径）时从"现在"起算，
+            # 避免 0 + timeout - now 得到负数而把所有任务误判成预算不足。
+            started = float(task.created_at or time.monotonic())
+            deadline = started + float(config.generation_timeout)
             remaining = deadline - time.monotonic()
         proxy_url = config.proxy_url
         # v1.3.0 F1：停用节点完全不参与路由；"完整"口径与 load_config 一致。
