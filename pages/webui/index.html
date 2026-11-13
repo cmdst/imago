@@ -38,7 +38,20 @@
     </section>
 
     <section id="tab-providers" class="panel">
-      <div class="provider-management"><div class="provider-intro"><div><p class="eyebrow">节点管理</p><h2>调用顺序</h2><p>点击节点左侧图标设置主节点（⭐）；未设置或无效时第一个有效节点为主节点，其余节点按列表顺序调用。</p></div><button id="add-provider" type="button">新建节点</button></div><div id="provider-list" class="provider-list"><p class="empty">正在读取节点……</p></div></div>
+      <div class="provider-management">
+        <div class="provider-intro">
+          <div>
+            <p class="eyebrow">节点管理</p>
+            <h2>渠道、顺序与参考图策略</h2>
+            <p>点击节点左侧图标设置主节点（⭐）；停用节点不参与调用，配置会保留。主节点失效时，自动按回退顺序选择第一个启用且完整的节点。</p>
+          </div>
+          <button id="add-provider" type="button">新建节点</button>
+        </div>
+        <div id="provider-summary" class="provider-summary" role="status"></div>
+        <div id="provider-warnings" class="provider-warnings" aria-live="polite"></div>
+        <div id="provider-list" class="provider-list"><p class="empty">正在读取节点……</p></div>
+        <div id="config-groups" class="config-groups"></div>
+      </div>
     </section>
 
     <section id="tab-quotas" class="panel">

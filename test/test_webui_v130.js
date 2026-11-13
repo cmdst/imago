@@ -1,0 +1,449 @@
+#!/usr/bin/env node
+/**
+ * IMAGO·FUSION v1.3.0 管理台前端回归（无第三方依赖）。
+ *
+ * 用 Node 内置 `vm` 载入真实的 `pages/webui/app.js`，配一个最小 DOM 桩与假 Bridge，
+ * 断言“字段表从 catalog 来、保存载荷无损、停用/主节点/参数错误/移动端样式”等行为。
+ * 由 `test/test_webui_v130.py` 以子进程调用，也可单独运行：`node test/test_webui_v130.js`。
+ */
+'use strict';
+
+const assert = require('assert');
+const fs = require('fs');
+const path = require('path');
+const vm = require('vm');
+
+const ROOT = path.resolve(__dirname, '..');
+const APP = path.join(ROOT, 'pages', 'webui', 'app.js');
+const CSS = path.join(ROOT, 'pages', 'webui', 'style.css');
+const HTML = path.join(ROOT, 'pages', 'webui', 'index.html');
+
+let passed = 0;
+function check(name, fn) {
+  try {
+    fn();
+    passed += 1;
+    console.log('PASS ' + name);
+  } catch (error) {
+    console.error('FAIL ' + name);
+    console.error(error && error.stack ? error.stack : error);
+    process.exitCode = 1;
+  }
+}
+
+/* ------------------------------------------------------------ 最小 DOM 桩 */
+function makeElement(tag) {
+  const el = {
+    tagName: tag,
+    id: '',
+    innerHTML: '',
+    textContent: '',
+    value: '',
+    files: [],
+    disabled: false,
+    hidden: false,
+    checked: false,
+    type: 'text',
+    style: {},
+    dataset: {},
+    parent: null,
+    listeners: {},
+    children: []
+  };
+  el.classList = {
+    set: new Set(),
+    toggle(name, force) {
+      const on = force === undefined ? !this.set.has(name) : Boolean(force);
+      if (on) this.set.add(name); else this.set.delete(name);
+      return on;
+    },
+    add(name) { this.set.add(name); },
+    remove(name) { this.set.delete(name); },
+    contains(name) { return this.set.has(name); }
+  };
+  el.addEventListener = (type, handler) => { (el.listeners[type] = el.listeners[type] || []).push(handler); };
+  el.setAttribute = (key, value) => { el[key] = value; };
+  el.getAttribute = key => el[key] ?? null;
+  el.focus = () => {};
+  el.matches = selector => selector === '[data-fallback-vision]' ? Boolean(el.dataset.fallbackVision !== undefined) : false;
+  el.querySelector = () => null;
+  el.querySelectorAll = () => [];
+  el.closest = () => el.parent;
+  el.appendChild = child => { child.parent = el; el.children.push(child); };
+  Object.defineProperty(el, 'textContent', {
+    get() { return el._text || ''; },
+    set(value) {
+      el._text = String(value);
+      el._html = String(value).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+    }
+  });
+  Object.defineProperty(el, 'innerHTML', {
+    get() { return el._html || ''; },
+    set(value) { el._html = String(value); }
+  });
+  return el;
+}
+
+const IDS = [
+  'notice', 'save-config', 'save-quotas', 'persona-search', 'persona-select', 'persona-title',
+  'persona-prompt', 'persona-summary', 'summary-mode', 'summary-count', 'rebuild', 'upload',
+  'save-summary', 'gallery', 'provider-list', 'provider-summary', 'provider-warnings',
+  'config-groups', 'add-provider', 'optimizer-provider', 'vision-provider', 'quota-list',
+  'quota-policy', 'quota-count', 'add-quota-row', 'reference-files'
+];
+const elements = {};
+for (const id of IDS) {
+  elements[id] = makeElement('div');
+  elements[id].id = id;
+}
+
+const document = {
+  querySelector(selector) {
+    if (selector.startsWith('#')) return elements[selector.slice(1)] || null;
+    return null;
+  },
+  querySelectorAll() { return []; },
+  createElement(tag) { return makeElement(tag); },
+  addEventListener() {},
+  documentElement: { dataset: {} },
+  body: { classList: { set: new Set(), toggle(name, force) { if (force) this.set.add(name); else this.set.delete(name); } } }
+};
+
+/* ------------------------------------------------------------ 夹具（与后端 catalog 形状一致） */
+function field(key, label, control, type, extra) {
+  return Object.assign({ key, label, control, type, default: '', options: [], placeholder: '', help: '说明', max_length: null }, extra || {});
+}
+const CATALOG = {
+  version: 1,
+  api_types: [
+    { value: 'openai_image', label: 'OpenAI 图像接口', param_mode: 'typed',
+      fields: [field('size', '尺寸 / 比例', 'text', 'str', { placeholder: '1024x1024' }),
+               field('quality', '生成质量', 'select', 'str', { options: ['', 'auto', 'low', 'medium', 'high', 'xhigh', 'max'] })],
+      capabilities: { quality: 'quality', thinking: 'complexity', references: true } },
+    { value: 'openai_chat', label: 'OpenAI Chat 接口', param_mode: 'typed', fields: [], capabilities: { quality: 'none', thinking: 'reasoning_effort', references: true } },
+    { value: 'gemini_official', label: 'Gemini 官方接口', param_mode: 'typed', fields: [field('image_size', '输出分辨率', 'select', 'str', { options: ['', '512', '1K', '2K', '4K'] })], capabilities: { quality: 'none', thinking: 'thinking_level', references: true } },
+    { value: 'dashscope_multimodal', label: '百炼多模态', param_mode: 'typed', fields: [], capabilities: { quality: 'none', thinking: 'none', references: true } },
+    { value: 'custom_endpoint', label: '自定义 JSON 接口', param_mode: 'free', fields: [], capabilities: { quality: 'none', thinking: 'none', references: true } },
+    { value: 'astrbot_native', label: 'AstrBot 原生 Provider', param_mode: 'ignored', fields: [], capabilities: { quality: 'none', thinking: 'none', references: true } },
+    { value: 'xai_image', label: 'xAI 图像接口', param_mode: 'typed', fields: [field('resolution', '分辨率档', 'select', 'str', { options: ['', '1k', '1.5k', '2k'] })], capabilities: { quality: 'none', thinking: 'none', references: true } }
+  ],
+  thinking_values: ['', 'off', 'low', 'medium', 'high', 'max'],
+  thinking_labels: { '': '跟随默认（不发送）', off: '关闭', low: '低', medium: '中', high: '高', max: '最高（协议支持时映射到 xhigh）' },
+  groups: [
+    { key: 'reference_fallback_config', payload: 'reference_fallback', label: '参考图文字降级', description: '被拒时改走文字', fields: [
+      { key: 'enable', label: '启用降级', control: 'switch', type: 'bool', default: false, help: '默认关闭' },
+      { key: 'max_extra_attempts', label: '额外次数', control: 'number', type: 'int', default: 1, min: 0, max: 1, help: '0..1' },
+      { key: 'caption_max_chars', label: '描述长度', control: 'number', type: 'int', default: 200, min: 80, max: 400, help: '80..400' }
+    ] },
+    { key: 'experimental_reference_config', payload: 'experimental_reference', label: '实验：参考图被拒后先遮挡再重绘',
+      description: '拒绝后的降级阶段用另配节点做遮挡编辑；不外传原图，只外传遮挡后的处理图。', depends_on: { payload: 'reference_fallback', field: 'enable', message: '实验遮挡依赖「参考图文字降级」：请先开启该组，实验功能才会生效。' },
+      fields: [
+        { key: 'enable', label: '实验：参考图被拒后先遮挡再重绘', control: 'switch', type: 'bool', default: false, help: '关闭时代码路径不可达' },
+        { key: 'occluder_provider_id', label: '遮挡编辑节点', control: 'provider_select', type: 'str', default: '', help: '只列已启用且配置完整的节点' },
+        { key: 'occlusion_prompt', label: '遮挡提示词', control: 'textarea', type: 'str', default: '在你认为的敏感部位用滑稽表情挡住；只做不透明覆盖，不要描述或还原被遮挡内容。', max_length: 500, help: '实际发送追加固定后缀' },
+        { key: 'max_images', label: '最多处理图片数（实验成本上限）', control: 'number', type: 'int', default: 1, min: 1, max: 3, help: '超过该值不调用遮挡编辑，不是删图许可' },
+        { key: 'timeout_seconds', label: '单张遮挡编辑超时（秒）', control: 'number', type: 'int', default: 20, min: 5, max: 60, help: 'min(本值, 剩余预算-15)' },
+        { key: 'caption_max_chars', label: '产物摘要长度上限（字符）', control: 'number', type: 'int', default: 200, min: 80, max: 400, help: '只描述未被遮挡部分' }
+      ] }
+  ]
+};
+const SNAPSHOT = {
+  success: true, ok: true,
+  providers: [
+    { id: 'main', api_type: 'openai_image', enabled: true, thinking: 'high',
+      custom_params: 'size=1536x1024\nfoo=bar', params: { size: '1536x1024', foo: 'bar' },
+      param_errors: [{ line: 2, key: 'foo', reason: 'unknown_for_type', message: '未知键透传' }],
+      param_mode: 'typed', capabilities: { quality: 'quality', thinking: 'complexity', references: true },
+      model: 'gpt-image', reference_image_limit: 0, available_models: [], base_url: 'https://a.invalid',
+      api_keys_configured: true, default_size: '1024x1024', timeout: 180, astrbot_provider_id: '',
+      stream: false, enable_proxy: false, fallback_order: 0, complete: true, primary: true, primary_disabled: false },
+    { id: 'old<主>', api_type: 'astrbot_native', enabled: false, thinking: '', custom_params: '',
+      params: {}, param_errors: [], param_mode: 'ignored', capabilities: { quality: 'none', thinking: 'none', references: true },
+      model: '', reference_image_limit: 0, available_models: [], base_url: '', api_keys_configured: false,
+      default_size: '1024x1024', timeout: 180, astrbot_provider_id: 'cpa/x', stream: true,
+      enable_proxy: false, fallback_order: 1, complete: true, primary: false, primary_disabled: true }
+  ],
+  catalog: CATALOG,
+  reference_fallback: { enable: false, max_extra_attempts: 1, caption_max_chars: 200, vision_timeout_seconds: 20, notify_user: true, vision_provider_id: '', vision_provider_ready: false },
+  experimental_reference: { enable: false, occluder_provider_id: '', occlusion_prompt: '在你认为的敏感部位用滑稽表情挡住；只做不透明覆盖，不要描述或还原被遮挡内容。', max_images: 1, timeout_seconds: 20, caption_max_chars: 200, dependency_ready: false, occluder_ready: false },
+  primary_provider_id: 'main',
+  stored_primary_provider_id: 'old<主>',
+  chat_providers: [], optimizer_provider_id: '', vision_provider_id: ''
+};
+
+/* ------------------------------------------------------------ 载入 app.js */
+const posted = [];
+const window = {
+  addEventListener() {},
+  document,
+  AstrBotPluginPage: {
+    ready: async () => {},
+    onContext() {},
+    apiGet: async endpoint => {
+      if (endpoint === 'personas') return { success: true, personas: [] };
+      if (endpoint === 'providers') return SNAPSHOT;
+      if (endpoint === 'quotas') return { success: true, quotas: [] };
+      return { success: true };
+    },
+    apiPost: async (endpoint, body) => {
+      posted.push({ endpoint, body });
+      return { success: true, ok: true, message: '节点配置已保存', warnings: [{ code: 'param_invalid_value', key: 'timeout', message: '超时无效' }], data: SNAPSHOT };
+    }
+  }
+};
+window.window = window;
+const sandbox = {
+  window, document, console, setTimeout, Promise, JSON, Set, Map, Number, String, Boolean,
+  Math, Array, Object, Error, RegExp, encodeURIComponent, decodeURIComponent,
+  FileReader: class { readAsDataURL() { this.onerror(new Error('no file')); } }
+};
+vm.createContext(sandbox);
+vm.runInContext(fs.readFileSync(APP, 'utf8'), sandbox, { filename: APP });
+const ui = window.__imagoWebui;
+
+function sleep(ms) { return new Promise(resolve => setTimeout(resolve, ms)); }
+async function waitReady() {
+  for (let index = 0; index < 50; index += 1) {
+    if (ui.state.providers.length && elements['provider-list'].innerHTML.includes('provider-node')) return;
+    await sleep(10);
+  }
+  throw new Error('页面初始化超时：provider-list 未渲染');
+}
+
+(async () => {
+  await waitReady();
+  const html = elements['provider-list'].innerHTML;
+  const groupsHtml = elements['config-groups'].innerHTML;
+
+  check('初始化后渲染两个节点且主节点取自有效值', () => {
+    assert.strictEqual(ui.state.providers.length, 2);
+    assert.strictEqual(ui.state.primary, 'main');
+    assert.strictEqual(ui.state.storedPrimary, 'old<主>');
+    assert.ok(html.includes('provider-node'));
+  });
+
+  check('存储主节点停用时展示“当前生效”提示', () => {
+    const summary = elements['provider-summary'].innerHTML;
+    assert.ok(summary.includes('存储主节点'));
+    assert.ok(summary.includes('当前生效'));
+    assert.ok(summary.includes('main'));
+  });
+
+  check('节点启用开关与停用徽章存在', () => {
+    assert.ok(html.includes('data-field="enabled"'));
+    assert.ok(html.includes('已停用'));
+    assert.ok(html.includes('badge-off'));
+  });
+
+  check('接口类型下拉来自 catalog（7 项，含 xai_image，不硬编码）', () => {
+    const select = html.match(/<select data-field="api_type">([\s\S]*?)<\/select>/)[1];
+    const values = [...select.matchAll(/<option value="([^"]*)"/g)].map(match => match[1]);
+    assert.deepStrictEqual(values, CATALOG.api_types.map(item => item.value));
+    assert.ok(values.includes('xai_image'));
+    assert.ok(html.includes('xAI 图像接口'));
+  });
+
+  check('质量与分辨率控件由字段表生成', () => {
+    assert.ok(html.includes('data-param="quality"'));
+    assert.ok(html.includes('data-control="select"'));
+    assert.ok(html.includes('option value="xhigh"'));
+    assert.ok(html.includes('data-param="size"'));
+  });
+
+  check('thinking 下拉来自 vocab（6 值）且带协议承载说明', () => {
+    const select = html.match(/<select data-field="thinking">([\s\S]*?)<\/select>/)[1];
+    assert.strictEqual((select.match(/<option/g) || []).length, 6);
+    assert.ok(html.includes('complexity'));
+    assert.ok(html.includes('留空 = 不发送'));
+  });
+
+  check('高级参数原文与参数错误可见（未知行保留）', () => {
+    assert.ok(html.includes('data-field="custom_params"'));
+    assert.ok(html.includes('size=1536x1024'));
+    assert.ok(html.includes('foo'));
+    assert.ok(html.includes('当前接口不支持'));
+  });
+
+  check('原生节点独有字段按条件渲染', () => {
+    const nativeBlock = html.split('data-index="1"')[1] || '';
+    assert.ok(nativeBlock.includes('data-field="astrbot_provider_id"'));
+    assert.ok(nativeBlock.includes('data-field="stream"'));
+    const imageBlock = html.split('data-index="0"')[1].split('data-index="1"')[0];
+    assert.ok(!imageBlock.includes('data-field="astrbot_provider_id"'));
+  });
+
+  check('节点名做 HTML 转义（防注入）', () => {
+    assert.ok(html.includes('old&lt;主&gt;'));
+    assert.ok(!html.includes('old<主>'));
+  });
+
+  check('普通降级组按 catalog 渲染', () => {
+    assert.ok(groupsHtml.includes('参考图文字降级'));
+    assert.ok(groupsHtml.includes('data-group-field="enable"'));
+    assert.ok(groupsHtml.includes('data-group-field="max_extra_attempts"'));
+    assert.ok(groupsHtml.includes('默认关闭'));
+  });
+
+  check('实验组六键渲染；降级关闭时置灰并给出依赖提示', () => {
+    assert.ok(groupsHtml.includes('实验：参考图被拒后先遮挡再重绘'));
+    assert.ok(groupsHtml.includes('data-group-field="occluder_provider_id"'));
+    assert.ok(groupsHtml.includes('data-group-field="occlusion_prompt"'));
+    assert.ok(groupsHtml.includes('data-group-field="max_images"'));
+    assert.ok(groupsHtml.includes('data-group-field="timeout_seconds"'));
+    assert.ok(groupsHtml.includes('data-group-field="caption_max_chars"'));
+    assert.ok(groupsHtml.includes('实验遮挡依赖「参考图文字降级」'));
+    assert.ok(groupsHtml.includes('class="card config-card is-blocked"'));
+    assert.ok(groupsHtml.includes('data-group-field="enable" type="checkbox"  disabled'.replace('  ', ' ')) || groupsHtml.includes('disabled'));
+    assert.ok(!groupsHtml.includes('只取失败尝试'));
+    assert.ok(groupsHtml.includes('实验成本上限'));
+    assert.ok(!groupsHtml.includes('丢弃'));
+    assert.ok(!/只处理前|只取前/.test(groupsHtml));
+  });
+
+  check('降级开启后实验组解除置灰（依赖来自快照）', () => {
+    ui.state.referenceFallback.enable = true;
+    ui.renderGroups();
+    const enabled = elements['config-groups'].innerHTML;
+    assert.ok(!enabled.includes('card config-card is-blocked'));
+    assert.ok(!enabled.includes('disabled'));
+    assert.ok(enabled.includes('data-group-field="occluder_provider_id"'));
+  });
+
+  check('遮挡节点下拉只列启用且完整的节点，并标出失效的已选值', () => {
+    ui.state.experimental.occluder_provider_id = 'old<主>';
+    ui.renderGroups();
+    const select = elements['config-groups'].innerHTML.match(/<select data-group-field="occluder_provider_id"[^>]*>([\s\S]*?)<\/select>/)[0];
+    assert.ok(select.includes('value="main"'));
+    assert.ok(select.includes('value="old&lt;主&gt;"'));
+    assert.ok(select.includes('（不可用）'));
+    assert.ok(elements['config-groups'].innerHTML.includes('当前遮挡节点已停用或配置不完整'));
+    ui.state.providers[1].enabled = true;
+    ui.renderGroups();
+    assert.ok(!elements['config-groups'].innerHTML.includes('（不可用）'));
+    ui.state.providers[1].enabled = false;
+    ui.state.experimental.occluder_provider_id = '';
+    ui.renderGroups();
+  });
+
+  check('新接口类型无需改前端即可出现（catalog 驱动）', () => {
+    const extended = JSON.parse(JSON.stringify(CATALOG));
+    extended.api_types.push({ value: 'future_type', label: '未来接口', param_mode: 'typed', fields: [], capabilities: { quality: 'none', thinking: 'none', references: false } });
+    ui.applySnapshot(Object.assign({}, SNAPSHOT, { catalog: extended }));
+    const rendered = elements['provider-list'].innerHTML;
+    assert.ok(rendered.includes('future_type'));
+    assert.ok(rendered.includes('未来接口'));
+    ui.applySnapshot(SNAPSHOT);
+  });
+
+  check('typed 参数写入保留未知行与其他已知行', () => {
+    const node = ui.state.providers[0];
+    node.custom_params = 'size=1536x1024\nfoo=bar';
+    ui.setParamValue(node, 'quality', 'high', 'select');
+    assert.strictEqual(node.custom_params, 'quality=high\nsize=1536x1024\nfoo=bar');
+    ui.setParamValue(node, 'quality', '', 'select');
+    assert.strictEqual(node.custom_params, 'size=1536x1024\nfoo=bar');
+    assert.ok(!node.custom_params.includes('quality'));
+  });
+
+  check('保存载荷含 v1.3.0 节点新键且不含只读字段', () => {
+    const payload = ui.buildProviderPayload();
+    const entry = payload.providers[0];
+    ['enabled', 'thinking', 'custom_params', 'api_keys', 'fallback_order', 'timeout', 'default_size'].forEach(key => {
+      assert.ok(Object.prototype.hasOwnProperty.call(entry, key), '缺少键 ' + key);
+    });
+    assert.ok(!Object.prototype.hasOwnProperty.call(entry, 'params'));
+    assert.ok(!Object.prototype.hasOwnProperty.call(entry, 'capabilities'));
+    assert.strictEqual(JSON.stringify(entry.api_keys), '[]');
+    assert.strictEqual(entry.astrbot_provider_id, '');
+    assert.strictEqual(entry.stream, false);
+  });
+
+  check('保存载荷的降级组不带只读依赖字段', () => {
+    const payload = ui.buildProviderPayload();
+    assert.strictEqual(JSON.stringify(Object.keys(payload.reference_fallback).sort()), JSON.stringify(['caption_max_chars', 'enable', 'max_extra_attempts', 'notify_user', 'vision_timeout_seconds']));
+  });
+
+  check('保存载荷的实验组含六键且不含派生字段', () => {
+    const payload = ui.buildProviderPayload();
+    assert.strictEqual(JSON.stringify(Object.keys(payload.experimental_reference).sort()), JSON.stringify(['caption_max_chars', 'enable', 'max_images', 'occluder_provider_id', 'occlusion_prompt', 'timeout_seconds']));
+    assert.ok(!('dependency_ready' in payload.experimental_reference));
+    assert.ok(!('occluder_ready' in payload.experimental_reference));
+  });
+
+  check('改实验开关会标脏并同步组状态', () => {
+    const card = makeElement('article');
+    card.dataset.payload = 'experimental_reference';
+    const target = makeElement('input');
+    target.dataset.groupField = 'enable';
+    target.type = 'checkbox';
+    target.checked = true;
+    target.closest = selector => selector === '[data-payload]' ? card : null;
+    ui.syncGroupField(target);
+    assert.strictEqual(ui.state.experimental.enable, true);
+    assert.strictEqual(ui.state.dirty, true);
+    assert.strictEqual(ui.buildProviderPayload().experimental_reference.enable, true);
+    ui.state.experimental.enable = false;
+    ui.renderGroups();
+  });
+
+  check('改动字段会标脏并更新 payload', () => {
+    const nodeElement = makeElement('article');
+    nodeElement.dataset.index = '0';
+    const target = makeElement('input');
+    target.dataset.field = 'thinking';
+    target.value = 'low';
+    target.type = 'text';
+    target.parent = nodeElement;
+    nodeElement.closest = () => nodeElement;
+    target.closest = () => nodeElement;
+    ui.syncProviderField(target);
+    assert.strictEqual(ui.state.providers[0].thinking, 'low');
+    assert.strictEqual(ui.state.dirty, true);
+    const payload = ui.buildProviderPayload();
+    assert.strictEqual(payload.providers[0].thinking, 'low');
+  });
+
+  check('保存后应用返回快照并展示 warnings', async () => {
+    elements['save-config'].listeners.click[0]();
+    await sleep(50);
+    assert.ok(posted.length >= 1);
+    assert.strictEqual(posted[posted.length - 1].endpoint, 'providers/save');
+    assert.ok(elements['provider-warnings'].innerHTML.includes('超时无效'));
+  });
+
+  check('style.css 仅一个 max-width 断点且新字段区在窄屏单列', () => {
+    const css = fs.readFileSync(CSS, 'utf8');
+    const breaks = css.match(/@media\s*\(max-width/g) || [];
+    assert.strictEqual(breaks.length, 1);
+    assert.ok(css.includes('@media(max-width:760px)'));
+    const mobile = css.slice(css.indexOf('@media(max-width:760px)'));
+    assert.ok(mobile.includes('.field-grid'));
+    assert.ok(mobile.includes('.group-fields'));
+    assert.ok(mobile.includes('grid-template-columns:1fr'));
+  });
+
+  check('index.html 引入新增容器且不含内联脚本', () => {
+    const source = fs.readFileSync(HTML, 'utf8');
+    ['provider-summary', 'provider-warnings', 'config-groups', 'provider-list'].forEach(id => {
+      assert.ok(source.includes('id="' + id + '"'), '缺少 #' + id);
+    });
+    assert.ok(!/<script(?![^>]*src=)/.test(source));
+  });
+
+  check('app.js 不复制字段表（无 7 类型硬编码数组）', () => {
+    const source = fs.readFileSync(APP, 'utf8');
+    assert.ok(!source.includes("'openai_image','openai_chat'"));
+    assert.ok(!source.includes('"openai_image","openai_chat"'));
+    assert.ok(!source.includes("quality:'high'"));
+  });
+
+  if (process.exitCode) {
+    console.error('前端回归失败：' + passed + ' 项通过，存在失败项');
+    process.exit(1);
+  }
+  console.log('PASS 全部 ' + passed + ' 项前端回归');
+})().catch(error => {
+  console.error('FAIL 测试运行异常');
+  console.error(error && error.stack ? error.stack : error);
+  process.exit(1);
+});
