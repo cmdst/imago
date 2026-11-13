@@ -406,19 +406,20 @@ class TestProvidersSave:
         assert status == 200
         assert env[2]["providers"][0]["api_keys"] == ["sk-new"]
 
-        # FF-08/合同：显式清空必须同时停用（UI 会先二次确认再自动停用），
-        # 仍然启用却要求清空 → 整单拒绝，绝不落盘“启用但缺 key”的节点。
+        # FF-R2-01：显式 clear 是唯一清空通道；HTTP 节点即使请求 enabled=true，
+        # 服务端也必须落成“已停用”，不能假成功。
         status, payload = save(env, {"providers": [{
             "id": "main", "api_type": "openai_image", "clear_api_keys": True,
         }]})
-        assert status == 400
-        assert payload["error"]["code"] == "node_incomplete"
-        assert env[2]["providers"][0]["api_keys"] == ["sk-new"]
+        assert status == 200, payload
+        assert env[2]["providers"][0]["api_keys"] == []
+        assert env[2]["providers"][0]["enabled"] is False
 
-        status, _payload = save(env, {"providers": [{
-            "id": "main", "api_type": "openai_image", "clear_api_keys": True, "enabled": False,
+        # 已经清空并停用的 HTTP 节点，后续普通保存仍然合法（空 keys 不清、不报错）。
+        status, payload = save(env, {"providers": [{
+            "id": "main", "api_type": "openai_image", "model": "gpt-image-2",
         }]})
-        assert status == 200
+        assert status == 200, payload
         assert env[2]["providers"][0]["api_keys"] == []
         assert env[2]["providers"][0]["enabled"] is False
 
@@ -521,6 +522,131 @@ class TestProvidersSave:
         }]})
         assert status == 200
         assert any(w["code"] == "thinking_ignored" for w in payload["warnings"])
+
+
+# ---------------------------------------------------------------- t24 / r3 回归
+@pytest.fixture()
+def env_disk(tmp_path):
+    """真实配置文件 + 内存 store：用于验证成功后才落盘、失败零写入。"""
+
+    raw = RawConfig(base_config(), path=tmp_path / "imago_fusion_config.json")
+    raw.save_config()
+    app, plugin = build_app(raw)
+    return app, plugin, raw
+
+
+def disk_config(env):
+    path = env[2].path
+    assert path is not None
+    return json.loads(path.read_text(encoding="utf-8"))
+
+
+class TestRepairR3:
+    def test_http_clear_forces_disabled_and_disk_key_count_zero(self, env_disk):
+        status, payload = save(env_disk, {"providers": [{
+            "id": "main", "api_type": "openai_image",
+            "clear_api_keys": True, "enabled": True,
+        }]})
+        assert status == 200, payload
+        stored = env_disk[2]["providers"][0]
+        assert stored["api_keys"] == []
+        assert stored["enabled"] is False
+        on_disk = disk_config(env_disk)["providers"][0]
+        assert on_disk["api_keys"] == []
+        assert on_disk["enabled"] is False
+        client_main = next(item for item in payload["providers"] if item["id"] == "main")
+        assert client_main["api_keys_configured"] is False
+
+    def test_native_clear_keeps_enabled_provider_and_stream(self, env_disk):
+        env_disk[2]["providers"][1]["enabled"] = True
+        env_disk[2].save_config()
+        status, payload = save(env_disk, {"providers": [{
+            "id": "native", "api_type": "astrbot_native",
+            "clear_api_keys": True,
+            "enabled": False, "stream": False, "astrbot_provider_id": "other/provider",
+        }]})
+        assert status == 200, payload
+        stored = env_disk[2]["providers"][1]
+        assert stored["api_keys"] == []
+        assert stored["enabled"] is True
+        assert stored["astrbot_provider_id"] == "cpa/gemini"
+        assert stored["stream"] is True
+        on_disk = disk_config(env_disk)["providers"][1]
+        assert on_disk["enabled"] is True
+        assert on_disk["astrbot_provider_id"] == "cpa/gemini"
+        assert on_disk["stream"] is True
+
+    def test_missing_api_type_rejects_without_any_write(self, env_disk):
+        before_memory = copy.deepcopy(dict(env_disk[2]))
+        before_disk = disk_config(env_disk)
+        status, payload = save(env_disk, {"providers": [{"id": "main", "model": "changed"}]})
+        assert status == 400
+        assert payload["error"]["code"] == "missing_field"
+        assert payload["error"]["field"] == "api_type"
+        assert dict(env_disk[2]) == before_memory
+        assert disk_config(env_disk) == before_disk
+        assert env_disk[2].saved == 1
+        assert env_disk[1].store.calls == []
+
+    def test_missing_id_and_non_string_shapes_reject_atomically(self, env_disk):
+        before_memory = copy.deepcopy(dict(env_disk[2]))
+        before_disk = disk_config(env_disk)
+        cases = [
+            ({"model": "changed"}, "missing_field", "id"),
+            ({"id": 7, "api_type": "openai_image"}, "invalid_id", "id"),
+            ({"id": "main", "api_type": None}, "invalid_api_type", "api_type"),
+            ({"id": "main", "api_type": ["openai_image"]}, "invalid_api_type", "api_type"),
+        ]
+        for node, code, field in cases:
+            status, payload = save(env_disk, {"providers": [node]})
+            assert status == 400, (node, payload)
+            assert payload["error"]["code"] == code
+            assert payload["error"]["field"] == field
+            assert dict(env_disk[2]) == before_memory
+            assert disk_config(env_disk) == before_disk
+        assert env_disk[2].saved == 1
+        assert env_disk[1].store.calls == []
+
+    @pytest.mark.parametrize("bad", [{"bad": True}, ["not", "text"], 42, None])
+    def test_group_text_rejects_non_string_and_keeps_old(self, env_disk, bad):
+        status, payload = save(env_disk, {"experimental_reference": {
+            "enable": True,
+            "occluder_provider_id": "main",
+            "occlusion_prompt": bad,
+        }})
+        assert status == 200, payload
+        stored = env_disk[2]["experimental_reference_config"]
+        # 该字段保留旧值，不把 dict/list 的 repr 写进配置；同请求的其它合法字段仍可保存。
+        assert stored["occlusion_prompt"] == "默认遮挡提示词。"
+        assert disk_config(env_disk)["experimental_reference_config"]["occlusion_prompt"] == "默认遮挡提示词。"
+        warns = [w for w in payload["warnings"]
+                 if w["code"] == "param_invalid_value"
+                 and str(w.get("key", "")).endswith(".occlusion_prompt")]
+        assert warns, payload["warnings"]
+
+    def test_group_text_absent_keeps_and_empty_string_clears(self, env_disk):
+        status, payload = save(env_disk, {"experimental_reference": {
+            "enable": True, "occluder_provider_id": "main",
+        }})
+        assert status == 200, payload
+        assert env_disk[2]["experimental_reference_config"]["occlusion_prompt"] == "默认遮挡提示词。"
+
+        status, payload = save(env_disk, {"experimental_reference": {
+            "enable": True, "occluder_provider_id": "main", "occlusion_prompt": "",
+        }})
+        assert status == 200, payload
+        assert env_disk[2]["experimental_reference_config"]["occlusion_prompt"] == ""
+        assert disk_config(env_disk)["experimental_reference_config"]["occlusion_prompt"] == ""
+
+    def test_new_http_node_without_key_still_rejected(self, env_disk):
+        before_memory = copy.deepcopy(dict(env_disk[2]))
+        status, payload = save(env_disk, {"providers": [{
+            "id": "brand-new", "api_type": "openai_image",
+            "base_url": "https://api.invalid/v1", "model": "gpt-image-1",
+        }]})
+        assert status == 400
+        assert payload["error"]["code"] == "node_incomplete"
+        assert dict(env_disk[2]) == before_memory
 
 
 # ---------------------------------------------------------------- 配置组

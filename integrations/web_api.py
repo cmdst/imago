@@ -366,7 +366,11 @@ def _coerce_group_value(
         if field.get("max") is not None:
             converted = min(float(field["max"]), converted)
         return converted, True
-    text = _text(value)
+    # FF-R2-02：strict 模式下文本字段只接收真正的字符串；对象/数组/数字等
+    # 一律字段级拒绝（保留旧值 + 由调用方给出该 key 的 warning），不做 repr 落盘。
+    if strict and not isinstance(value, str):
+        return None, False
+    text = value if isinstance(value, str) else _text(value)
     limit = field.get("max_length")
     if limit:
         text = text[: int(limit)]
@@ -693,8 +697,11 @@ class PageAPI:
                 if not isinstance(item, Mapping):
                     return _err("节点配置格式无效", 400, code="invalid_request", index=index)
 
-                # FF-03/FF-04：ID 与接口类型必须是严格文本；不在这里做任何 str() 温柔强转。
-                raw_id = item.get("id", _MISSING)
+                # FF-03/FF-04 / FF-R2-02：ID 与接口类型必须“存在且为合法文本”；
+                # 缺失与非法都属于结构性错误，整单 400、两份持久化零写入。
+                if "id" not in item:
+                    return _err("节点缺少 ID", 400, code="missing_field", field="id", index=index)
+                raw_id = item.get("id")
                 if not isinstance(raw_id, str):
                     return _err("节点 ID 必须是文本", 400, code="invalid_id", field="id", index=index)
                 provider_id = raw_id.strip()
@@ -722,19 +729,24 @@ class PageAPI:
                 old = old_by_id.get(provider_id, {})
                 is_new = provider_id not in old_by_id
                 old_api_type = str(old.get("api_type", "")).strip()
-                if "api_type" in item:
-                    raw_type = item.get("api_type")
-                    if not isinstance(raw_type, str):
-                        return _err(
-                            f"节点「{provider_id}」的接口类型必须是文本",
-                            400,
-                            code="invalid_api_type",
-                            field="api_type",
-                            index=index,
-                        )
-                    api_type = raw_type.strip()
-                else:
-                    api_type = old_api_type
+                if "api_type" not in item:
+                    return _err(
+                        f"节点「{provider_id}」缺少接口类型",
+                        400,
+                        code="missing_field",
+                        field="api_type",
+                        index=index,
+                    )
+                raw_type = item.get("api_type")
+                if not isinstance(raw_type, str):
+                    return _err(
+                        f"节点「{provider_id}」的接口类型必须是文本",
+                        400,
+                        code="invalid_api_type",
+                        field="api_type",
+                        index=index,
+                    )
+                api_type = raw_type.strip()
                 if api_type not in known_types:
                     return _err(
                         f"节点「{provider_id}」的接口类型无效",
@@ -879,6 +891,19 @@ class PageAPI:
                     api_keys = submitted_keys
                 else:
                     api_keys = stored_keys
+
+                if clear_keys and not native:
+                    # 服务端兜底：显式清空 HTTP key 必须落成“已停用”，
+                    # 不接受客户端“清空但仍启用”的组合。
+                    enabled = False
+
+                # FF-R2-01：显式清空按类型分治。HTTP 节点由服务端强制停用；
+                # 原生节点只清休眠的 HTTP key，不改原有 enabled / provider / stream
+                # （即使请求里带了相反的值）。成功回包后前端用 snapshot 复位临时 flag。
+                if clear_keys and native:
+                    enabled = stored_enabled
+                    astrbot_provider_id = str(old.get("astrbot_provider_id", "")).strip()
+                    stream = _as_bool(old.get("stream", False), False)[0]
 
                 base_url = text_field("base_url", str(old.get("base_url", "")).strip(), label="接口地址")
                 model = text_field("model", str(old.get("model", "")).strip(), label="模型")

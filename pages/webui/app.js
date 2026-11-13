@@ -157,7 +157,7 @@ function renderProvider(item,index){
   const primaryTouch=item.primary?'':'title="设置为主节点"';
   const toggleClass=item.primary?'active':item.complete?'complete':'incomplete';
   const keyHint=item.api_keys_configured?' · 已配置（留空 = 保留）':' · 未配置';
-  const clearKeys=item.api_keys_configured?`<label class="check-line warn-line"><input type="checkbox" data-field="clear_api_keys" ${item.clear_api_keys?'checked':''}> 清空已保存的 API Key（勾选后保存会先二次确认；确认清空时该节点会被自动停用）</label>`:'';
+  const clearKeys=item.api_keys_configured?`<label class="check-line warn-line"><input type="checkbox" data-field="clear_api_keys" ${item.clear_api_keys?'checked':''}> 清空已保存的 API Key（保存前二次确认；HTTP 节点清空后会由服务端强制停用，原生节点只清休眠 key）</label>`:'';
   const idField=item.isNew
     ? `<label>节点 ID<input data-field="id" value="${attr(item.id||'')}"><span class="hint">新增节点可连续键入；ID 需唯一。</span></label>`
     : `<label>节点 ID<input data-field="id" value="${attr(item.id||'')}" readonly aria-readonly="true"><span class="hint">已有节点的 ID 只读：要换名请新增节点并显式删除旧节点，避免密钥与历史配置错位。</span></label>`;
@@ -449,26 +449,29 @@ function cancelClearFlags(){
   for(const item of state.providers)item.clear_api_keys=false;
   renderProviders();
 }
-function confirmClearAndDisable(ids){
+function clearConfirmMessage(nodes){
+  // FF-R2-01：确认文案必须区分 HTTP 与 native —— 前者清空后会被强制停用，
+  // 后者只清休眠的 HTTP key，原生鉴权、节点启停与流式设置都不变。
+  const http=nodes.filter(item=>item.api_type!=='astrbot_native').map(item=>item.id);
+  const native=nodes.filter(item=>item.api_type==='astrbot_native').map(item=>item.id);
+  const lines=[];
+  if(http.length)lines.push(`HTTP 节点（${http.join('、')}）：将清空已保存的 API Key，并由服务端强制停用该节点；停用后无法发起调用。`);
+  if(native.length)lines.push(`原生节点（${native.join('、')}）：只清空休眠的 HTTP API Key；原生 Provider 鉴权、节点启停与流式设置保持不变。`);
+  return `${lines.join('\n')}\n\n清空后不可恢复，确认继续？`;
+}
+function confirmClear(nodes){
   const confirmFn=typeof window.confirm==='function'?window.confirm:null;
   if(!confirmFn)return false;
-  return Boolean(confirmFn(`将清空以下节点的已保存 API Key，并自动停用该节点：\n${ids.join('、')}\n\n清空后该节点无法发起调用；确认继续？`));
+  return Boolean(confirmFn(clearConfirmMessage(nodes)));
 }
 async function saveProviderConfig(){
-  // FF-08：破坏性的“清空密钥”必须先单独确认；确认后自动停用，避免“启用但缺 key”的不完整节点。
+  // FF-R2-01：确认后保留 clear_api_keys 到 POST；成功回包前不本地清空/改启停。
+  // 取消则复位临时标志并零 POST。
   const clearing=pendingClearNodes();
-  if(clearing.length){
-    if(!confirmClearAndDisable(clearing.map(item=>item.id))){
-      cancelClearFlags();
-      notify('已取消清空密钥；未发送任何清空请求',false);
-      return;
-    }
-    for(const item of state.providers){
-      if(!item.clear_api_keys)continue;
-      item.clear_api_keys=false;
-      item.enabled=false;
-    }
-    renderProviders();
+  if(clearing.length&&!confirmClear(clearing)){
+    cancelClearFlags();
+    notify('已取消清空密钥；未发送任何清空请求',false);
+    return;
   }
   const result=await apiPost('providers/save',buildProviderPayload());
   if(!result.success){notify(result.message||'保存失败',true);return}
@@ -596,7 +599,7 @@ $('#upload').addEventListener('click',async()=>{const files=[...$('#reference-fi
 window.addEventListener('beforeunload',event=>{if(!state.dirty&&!state.quotaDirty)return;event.preventDefault();event.returnValue=''});
 
 /* 测试钩子：Node vm 回归直接调用真实渲染/装配逻辑（对线上无副作用）。 */
-window.__imagoWebui={state,catalogEntry,catalogLabel,paramFields,capabilitiesOf,qualityText,thinkingCapText,referencesText,thinkingValues,thinkingLabel,normalizeProvider,renderProviders,renderGroups,buildProviderPayload,applySnapshot,syncProviderField,syncGroupField,setParamValue};
+window.__imagoWebui={state,catalogEntry,catalogLabel,paramFields,capabilitiesOf,qualityText,thinkingCapText,referencesText,thinkingValues,thinkingLabel,normalizeProvider,renderProviders,renderGroups,buildProviderPayload,applySnapshot,syncProviderField,syncGroupField,setParamValue,clearConfirmMessage};
 
 (async()=>{
   try{

@@ -504,27 +504,42 @@ async function waitReady() {
     ui.renderProviders();
   });
 
-  check('FF-08 清空密钥需二次确认；确认后自动停用该节点', async () => {
-    const released = ui.state.providers[0];
+  check('FF-R2-01 确认文案区分 HTTP 强制停用与 native 保留鉴权/启停', () => {
+    const httpMsg = ui.clearConfirmMessage([{ id: 'main', api_type: 'openai_image' }]);
+    assert.ok(httpMsg.includes('强制停用'), 'HTTP 文案必须说明服务端强制停用');
+    assert.ok(httpMsg.includes('无法发起调用'));
+    const nativeMsg = ui.clearConfirmMessage([{ id: 'old<主>', api_type: 'astrbot_native' }]);
+    assert.ok(nativeMsg.includes('原生 Provider 鉴权'), nativeMsg);
+    assert.ok(nativeMsg.includes('节点启停'), nativeMsg);
+    assert.ok(!nativeMsg.includes('强制停用该节点'), 'native 不应被描述为强制停用');
+  });
+
+  check('FF-R2-01 取消零 POST；确认后 clear flag 进入 POST 并保留到成功', async () => {
+    ui.applySnapshot(SNAPSHOT);
+    let released = ui.state.providers.find(item => item.id === 'main');
+    released.api_keys_configured = true;
     released.clear_api_keys = true;
     const postedBefore = posted.length;
     window.confirm = () => false;
     elements['save-config'].listeners.click[0]();
     await sleep(30);
     assert.strictEqual(posted.length, postedBefore, '取消时不得发送保存请求');
-    assert.strictEqual(released.clear_api_keys, false);
-    assert.notStrictEqual(released.enabled, false);
+    released = ui.state.providers.find(item => item.id === 'main');
+    assert.strictEqual(released.clear_api_keys, false, '取消后应复位临时 flag');
+    assert.strictEqual(released.enabled, true, '取消不得本地改启停');
 
-    released.clear_api_keys = true;
     released.api_keys_configured = true;
+    released.clear_api_keys = true;
+    released.enabled = true;
     window.confirm = () => true;
     elements['save-config'].listeners.click[0]();
-    await sleep(30);
+    await sleep(50);
     const body = posted[posted.length - 1].body;
     const entry = body.providers.find(item => item.id === 'main');
-    assert.strictEqual(entry.enabled, false);
-    assert.ok(!('clear_api_keys' in entry), '清空确认后应转成“已停用 + 空 key”，不再带破坏性 flag');
-    assert.strictEqual(JSON.stringify(entry.api_keys), '[]');
+    assert.strictEqual(entry.clear_api_keys, true, '确认后必须把 clear flag 带进 POST');
+    assert.strictEqual(entry.enabled, true, '服务端负责强制停用，前端不得伪造 enabled=false');
+    const after = ui.state.providers.find(item => item.id === 'main');
+    assert.strictEqual(after.clear_api_keys, false, '成功回包后应由 snapshot 复位临时 flag');
   });
 
   check('FF-03 删除只提交显式名单（旧快照有、当前列表没有的 ID）', () => {
