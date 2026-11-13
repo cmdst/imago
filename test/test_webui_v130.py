@@ -25,16 +25,19 @@ JS_TEST = REPO_ROOT / "test" / "test_webui_v130.js"
 
 # ---------------------------------------------------------------- 夹具
 class RawConfig(dict):
-    """模拟 AstrBot 的配置对象：dict + save_config()，可注入写盘失败。"""
+    """模拟 AstrBot 的配置对象：dict + save_config()，可注入写盘失败与真实落盘文件。"""
 
-    def __init__(self, data):
+    def __init__(self, data, path=None):
         super().__init__(copy.deepcopy(data))
         self.saved = 0
         self.fail = False
+        self.path = Path(path) if path else None
 
     def save_config(self):
         if self.fail:
             raise RuntimeError("disk full")
+        if self.path is not None:
+            self.path.write_text(json.dumps(dict(self), ensure_ascii=False, indent=2), encoding="utf-8")
         self.saved += 1
 
 
@@ -42,11 +45,15 @@ class Store:
     def __init__(self, primary="main"):
         self.primary = primary
         self.calls = []
+        self.fail_next = False
 
     def get_primary_provider_id(self):
         return self.primary
 
     def set_primary_provider_id(self, value):
+        if self.fail_next:
+            self.fail_next = False
+            raise RuntimeError("store unavailable")
         self.primary = value
         self.calls.append(value)
 
@@ -240,8 +247,12 @@ class TestProvidersRead:
     def test_occluder_description_says_original_image_is_sent(self, env):
         groups = {group["key"]: group for group in get_state(env)["catalog"]["groups"]}
         description = groups["experimental_reference_config"]["description"]
-        assert "会把参考原图发给" in description
-        assert "费用另计" in description
+        assert "参考原图会发送给所选遮挡节点" in description
+        # FF-10：原文“额外的一次生图调用”会低估最多 max_images 笔逐图编辑。
+        assert "额外的一次生图调用" not in description
+        assert "最多 max_images" in description
+        assert "至多一次最终生成" in description
+        assert "单独计费" in description
         assert "不外传原图" not in description
 
     def test_get_never_echoes_api_keys(self, env):
@@ -395,11 +406,21 @@ class TestProvidersSave:
         assert status == 200
         assert env[2]["providers"][0]["api_keys"] == ["sk-new"]
 
-        status, _payload = save(env, {"providers": [{
+        # FF-08/合同：显式清空必须同时停用（UI 会先二次确认再自动停用），
+        # 仍然启用却要求清空 → 整单拒绝，绝不落盘“启用但缺 key”的节点。
+        status, payload = save(env, {"providers": [{
             "id": "main", "api_type": "openai_image", "clear_api_keys": True,
+        }]})
+        assert status == 400
+        assert payload["error"]["code"] == "node_incomplete"
+        assert env[2]["providers"][0]["api_keys"] == ["sk-new"]
+
+        status, _payload = save(env, {"providers": [{
+            "id": "main", "api_type": "openai_image", "clear_api_keys": True, "enabled": False,
         }]})
         assert status == 200
         assert env[2]["providers"][0]["api_keys"] == []
+        assert env[2]["providers"][0]["enabled"] is False
 
     def test_type_switch_keeps_shared_fields_and_zeroes_native_only(self, env):
         status, payload = save(env, {"providers": [{
@@ -605,6 +626,198 @@ class TestConfigGroups:
         assert env[2]["experimental_reference_config"]["enable"] is True
         assert payload["experimental_reference"]["dependency_ready"] is True
         assert env[2].saved == 1
+
+
+# ---------------------------------------------------------------- 复审修复回归（t16）
+class TestRepairFindings:
+    """覆盖 t6 复审 FF-01…FF-10 的前端/接口行为（逐条对应正式报告）。"""
+
+    # FF-01：普通保存不得把“当前生效”误存为“用户已选主节点”。
+    def test_unrelated_save_without_primary_keeps_stored_primary(self, env):
+        status, payload = save(env, {"providers": [
+            {"id": "main", "api_type": "openai_image", "enabled": False},
+            {"id": "native", "api_type": "astrbot_native", "enabled": True,
+             "astrbot_provider_id": "cpa/gemini"},
+        ]})
+        assert status == 200
+        assert env[1].store.primary == "main"
+        assert payload["stored_primary_provider_id"] == "main"
+        # 存储主节点已停用 → 当前生效按 fallback_order 落到 native，但存储值不动。
+        assert payload["primary_provider_id"] == "native"
+
+    # FF-02：HTTP → native 不得丢弃休眠密钥；切回来仍可用；只有显式 clear 才清空。
+    def test_http_to_native_keeps_dormant_keys_and_round_trips(self, env):
+        status, _payload = save(env, {"providers": [{
+            "id": "main", "api_type": "astrbot_native", "astrbot_provider_id": "cpa/gemini",
+        }]})
+        assert status == 200
+        main = next(item for item in env[2]["providers"] if item["id"] == "main")
+        assert main["api_keys"] == ["sk-main", "sk-backup"]
+        assert main["stream"] is False
+
+        status, payload = save(env, {"providers": [{"id": "main", "api_type": "openai_image"}]})
+        assert status == 200
+        main = next(item for item in env[2]["providers"] if item["id"] == "main")
+        assert main["api_keys"] == ["sk-main", "sk-backup"]
+        state = get_state(env)
+        main_state = next(item for item in state["providers"] if item["id"] == "main")
+        assert main_state["api_keys_configured"] is True
+        assert main_state["complete"] is True
+
+    # FF-03：改名不会“偷走”旧节点密钥；新 ID 只能作为完整的新节点显式新增。
+    def test_new_complete_id_is_added_without_stealing_old_keys(self, env):
+        status, payload = save(env, {"providers": [{
+            "id": "renamed", "api_type": "openai_image",
+            "base_url": "https://api.invalid/v2", "api_keys": ["sk-renamed"],
+        }]})
+        assert status == 200
+        ids = [item["id"] for item in env[2]["providers"]]
+        assert "main" in ids and "renamed" in ids
+        main = next(item for item in env[2]["providers"] if item["id"] == "main")
+        assert main["api_keys"] == ["sk-main", "sk-backup"]
+        assert any(w["code"] == "new_node_no_key_inheritance" for w in payload["warnings"])
+        state = get_state(env)
+        assert all("api_keys" not in item for item in state["providers"])
+
+    def test_rename_attempt_without_complete_config_is_rejected(self, env):
+        before = copy.deepcopy(dict(env[2]))
+        status, payload = save(env, {"providers": [{
+            "id": "main-renamed", "api_type": "openai_image",
+        }]})
+        assert status == 400
+        assert payload["error"]["code"] == "node_incomplete"
+        assert dict(env[2]) == before
+
+    # FF-04：严格形状 + 字段级拒绝；致命项整单原子。
+    def test_invalid_string_fields_are_field_level_rejected(self, env):
+        status, payload = save(env, {"providers": [{
+            "id": "main", "api_type": "openai_image",
+            "thinking": 5, "base_url": 123, "api_keys": 7, "enabled": "maybe", "timeout": "soon",
+        }]})
+        assert status == 200
+        warned = {w["key"] for w in payload["warnings"] if w["code"] == "param_invalid_value"}
+        assert {"thinking", "base_url", "api_keys", "enabled", "timeout"} <= warned
+        main = next(item for item in env[2]["providers"] if item["id"] == "main")
+        assert main["thinking"] == "high"
+        assert main["base_url"] == "https://api.invalid/v1"
+        assert main["api_keys"] == ["sk-main", "sk-backup"]
+        assert main["enabled"] is True
+        assert main["timeout"] == 180
+
+    def test_invalid_id_and_api_type_are_fatal_whole_order(self, env):
+        before = copy.deepcopy(dict(env[2]))
+        status, payload = save(env, {"providers": [{"id": 123, "api_type": "openai_image"}]})
+        assert status == 400
+        assert payload["error"]["code"] == "invalid_id"
+        assert dict(env[2]) == before
+        status, payload = save(env, {"providers": [{"id": "main", "api_type": 5}]})
+        assert status == 400
+        assert payload["error"]["code"] == "invalid_api_type"
+        assert dict(env[2]) == before
+
+    def test_later_invalid_node_blocks_whole_save(self, env):
+        before = copy.deepcopy(dict(env[2]))
+        status, payload = save(env, {"providers": [
+            {"id": "main", "api_type": "openai_image", "timeout": 90},
+            {"id": "fresh", "api_type": "openai_image", "base_url": "https://api.invalid/2"},
+        ]})
+        assert status == 400
+        assert payload["error"]["field"] == "api_keys"
+        assert dict(env[2]) == before
+
+    # FF-05：旧配置里的字符串 "false"/"0" 不能被 bool() 当 true。
+    def test_legacy_false_strings_are_not_truthy_in_snapshot(self, env):
+        env[2]["providers"][0]["enable_proxy"] = "false"
+        env[2]["providers"][1]["stream"] = "false"
+        env[2]["providers"][1]["enable_proxy"] = "0"
+        state = get_state(env)
+        main = next(item for item in state["providers"] if item["id"] == "main")
+        native = next(item for item in state["providers"] if item["id"] == "native")
+        assert main["enable_proxy"] is False
+        assert native["stream"] is False
+        assert native["enable_proxy"] is False
+        env[2]["providers"][0]["enable_proxy"] = "1"
+        main = next(item for item in get_state(env)["providers"] if item["id"] == "main")
+        assert main["enable_proxy"] is True
+
+    # FF-06：两份持久化（配置 + 主节点存储）任一步失败都要回滚到保存前。
+    def test_store_failure_restores_config_file_and_memory(self, tmp_path):
+        cfg_path = tmp_path / "imago_fusion_config.json"
+        raw = RawConfig(base_config(), path=cfg_path)
+        raw.save_config()
+        before_file = cfg_path.read_text(encoding="utf-8")
+        before = copy.deepcopy(dict(raw))
+        app, plugin = build_app(raw)
+        env = (app, plugin, raw)
+        plugin.store.fail_next = True
+        status, payload = save(env, {
+            "providers": [{"id": "main", "api_type": "openai_image", "timeout": 90}],
+            "primary_provider_id": "native",
+        })
+        assert status == 500
+        assert payload["error"]["code"] == "primary_store_failed"
+        assert payload["error"]["rollback"] == "ok"
+        assert cfg_path.read_text(encoding="utf-8") == before_file
+        assert dict(raw) == before
+        assert plugin.store.primary == "main"
+        assert raw["providers"][0]["timeout"] == 180
+
+    def test_config_write_failure_keeps_memory_and_disk(self, tmp_path):
+        cfg_path = tmp_path / "imago_fusion_config.json"
+        raw = RawConfig(base_config(), path=cfg_path)
+        raw.save_config()
+        before_file = cfg_path.read_text(encoding="utf-8")
+        before = copy.deepcopy(dict(raw))
+        app, plugin = build_app(raw)
+        env = (app, plugin, raw)
+        raw.fail = True
+        status, payload = save(env, {"providers": [{
+            "id": "main", "api_type": "openai_image", "timeout": 90,
+        }]})
+        assert status == 500
+        assert payload["error"]["code"] == "config_write_failed"
+        assert cfg_path.read_text(encoding="utf-8") == before_file
+        assert dict(raw) == before
+
+    # FF-09：告警必须说明 xAI quality 实际会透传，不能伪称“不会发送”。
+    def test_xai_quality_warning_matches_real_send_body(self, env):
+        status, payload = save(env, {"providers": [{
+            "id": "main", "api_type": "xai_image", "custom_params": "quality=high",
+        }]})
+        assert status == 200
+        warning = next(
+            w for w in payload["warnings"]
+            if w["code"] == "param_unsupported_for_type" and w["key"] == "quality"
+        )
+        assert warning["passthrough"] is True
+        assert "会原样透传" in warning["message"]
+        assert "不会发送" not in warning["message"]
+        stored = next(item for item in env[2]["providers"] if item["id"] == "main")
+        from imago_fusion.core.models import GenerationRequest, ProviderConfig
+        from imago_fusion.providers.xai_image import XaiImageAdapter
+
+        config = ProviderConfig(
+            id="main",
+            api_type="xai_image",
+            base_url=stored["base_url"],
+            api_keys=tuple(stored["api_keys"]),
+            custom_params=stored["custom_params"],
+        )
+        options = XaiImageAdapter(config)._node_options(GenerationRequest(prompt="p"))
+        assert options.get("quality") == "high"
+
+    def test_native_quality_is_not_sent(self, env):
+        status, payload = save(env, {"providers": [{
+            "id": "main", "api_type": "astrbot_native", "astrbot_provider_id": "cpa/gemini",
+            "custom_params": "quality=high",
+        }]})
+        assert status == 200
+        warning = next(
+            w for w in payload["warnings"]
+            if w["code"] == "param_unsupported_for_type" and w["key"] == "quality"
+        )
+        assert warning["passthrough"] is False
+        assert "不会被发送" in warning["message"]
 
 
 # ---------------------------------------------------------------- 前端静态契约

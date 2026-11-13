@@ -19,16 +19,21 @@ const CSS = path.join(ROOT, 'pages', 'webui', 'style.css');
 const HTML = path.join(ROOT, 'pages', 'webui', 'index.html');
 
 let passed = 0;
+let chain = Promise.resolve();
 function check(name, fn) {
-  try {
-    fn();
-    passed += 1;
-    console.log('PASS ' + name);
-  } catch (error) {
-    console.error('FAIL ' + name);
-    console.error(error && error.stack ? error.stack : error);
-    process.exitCode = 1;
-  }
+  // 串行等待每个用例（含异步 DOM/Bridge 用例），避免并发导致的 posted 状态串台。
+  chain = chain.then(async () => {
+    try {
+      await fn();
+      passed += 1;
+      console.log('PASS ' + name);
+    } catch (error) {
+      console.error('FAIL ' + name);
+      console.error(error && error.stack ? error.stack : error);
+      process.exitCode = 1;
+    }
+  });
+  return chain;
 }
 
 /* ------------------------------------------------------------ 最小 DOM 桩 */
@@ -104,7 +109,8 @@ const document = {
   },
   querySelectorAll() { return []; },
   createElement(tag) { return makeElement(tag); },
-  addEventListener() {},
+  listeners: {},
+  addEventListener(type, handler) { (this.listeners[type] = this.listeners[type] || []).push(handler); },
   documentElement: { dataset: {} },
   body: { classList: { set: new Set(), toggle(name, force) { if (force) this.set.add(name); else this.set.delete(name); } } }
 };
@@ -454,6 +460,81 @@ async function waitReady() {
     assert.strictEqual(payload.providers[0].thinking, 'low');
   });
 
+  check('FF-01 未点选主节点时普通保存不提交 primary_provider_id', () => {
+    assert.ok(!('primary_provider_id' in ui.buildProviderPayload()));
+    const fake = makeElement('button');
+    fake.dataset.primary = '0';
+    fake.closest = selector => selector === '[data-primary]' ? fake : null;
+    document.listeners.click[0]({ target: fake });
+    assert.strictEqual(ui.state.primaryChosen, true);
+    assert.strictEqual(ui.buildProviderPayload().primary_provider_id, ui.state.primary);
+    ui.state.primaryChosen = false;
+  });
+
+  check('FF-07 已有节点 ID 只读；新增节点连续键入不重渲染', () => {
+    assert.ok(html.includes('已有节点的 ID 只读'));
+    const before = elements['provider-list'].innerHTML;
+    assert.ok(/data-field="id"[^>]*readonly/.test(before));
+    elements['add-provider'].listeners.click[0]();
+    const index = ui.state.providers.length - 1;
+    assert.strictEqual(ui.state.providers[index].isNew, true);
+    const root = elements['provider-list'];
+    let htmlValue = root.innerHTML;
+    let renders = 0;
+    Object.defineProperty(root, 'innerHTML', {
+      configurable: true,
+      get() { return htmlValue; },
+      set(value) { renders += 1; htmlValue = String(value); }
+    });
+    const nodeElement = makeElement('article');
+    nodeElement.dataset.index = String(index);
+    nodeElement.closest = () => nodeElement;
+    const fieldInput = makeElement('input');
+    fieldInput.dataset.field = 'id';
+    fieldInput.type = 'text';
+    fieldInput.closest = () => nodeElement;
+    renders = 0;
+    fieldInput.value = 'my-node';
+    ui.syncProviderField(fieldInput);
+    fieldInput.value = 'my-node-2';
+    ui.syncProviderField(fieldInput);
+    assert.strictEqual(renders, 0, 'ID 输入过程中不应整体重渲染');
+    assert.strictEqual(ui.state.providers[index].id, 'my-node-2');
+    ui.state.providers.pop();
+    ui.renderProviders();
+  });
+
+  check('FF-08 清空密钥需二次确认；确认后自动停用该节点', async () => {
+    const released = ui.state.providers[0];
+    released.clear_api_keys = true;
+    const postedBefore = posted.length;
+    window.confirm = () => false;
+    elements['save-config'].listeners.click[0]();
+    await sleep(30);
+    assert.strictEqual(posted.length, postedBefore, '取消时不得发送保存请求');
+    assert.strictEqual(released.clear_api_keys, false);
+    assert.notStrictEqual(released.enabled, false);
+
+    released.clear_api_keys = true;
+    released.api_keys_configured = true;
+    window.confirm = () => true;
+    elements['save-config'].listeners.click[0]();
+    await sleep(30);
+    const body = posted[posted.length - 1].body;
+    const entry = body.providers.find(item => item.id === 'main');
+    assert.strictEqual(entry.enabled, false);
+    assert.ok(!('clear_api_keys' in entry), '清空确认后应转成“已停用 + 空 key”，不再带破坏性 flag');
+    assert.strictEqual(JSON.stringify(entry.api_keys), '[]');
+  });
+
+  check('FF-03 删除只提交显式名单（旧快照有、当前列表没有的 ID）', () => {
+    ui.applySnapshot(SNAPSHOT);
+    ui.state.providers = ui.state.providers.filter(item => item.id !== 'old<主>');
+    const payload = ui.buildProviderPayload();
+    assert.strictEqual(JSON.stringify(payload.deleted_provider_ids), JSON.stringify(['old<主>']));
+    ui.applySnapshot(SNAPSHOT);
+  });
+
   check('保存后应用返回快照并展示 warnings', async () => {
     elements['save-config'].listeners.click[0]();
     await sleep(50);
@@ -505,6 +586,7 @@ async function waitReady() {
     });
   }
 
+  await chain;
   if (process.exitCode) {
     console.error('前端回归失败：' + passed + ' 项通过，存在失败项');
     process.exit(1);

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import copy
 from collections.abc import Mapping
 from typing import Any
 
@@ -27,12 +28,15 @@ def _err(
     code: str = "",
     field: str = "",
     index: int | None = None,
+    **extra: Any,
 ):
     error: dict[str, Any] = {"code": code or "invalid_request", "message": message}
     if field:
         error["field"] = field
     if index is not None:
         error["index"] = index
+    # 回滚结果等结构化诊断（FF-06）：不隐藏“磁盘/存储是否已回滚”，方便前端如实提示。
+    error.update({key: value for key, value in extra.items() if value is not None})
     return jsonify({"success": False, "ok": False, "message": message, "error": error}), status
 
 
@@ -73,7 +77,10 @@ GROUP_DEFS: dict[str, dict[str, Any]] = {
     "reference_fallback_config": {
         "payload": "reference_fallback",
         "label": "参考图文字降级",
-        "description": "当节点明确拒绝参考图时，改用一次纯文字请求重绘；默认关闭，关闭时不产生任何额外调用。",
+        "description": (
+            "当节点明确拒绝参考图时，把完整参考图集合改写成纯文字请求重绘；技术性拒绝最多额外 1 次，"
+            "安全类拒绝直接停止；未知原因不猜测。默认关闭，关闭时不产生任何额外调用。"
+        ),
         "fields": [
             {
                 "key": "enable",
@@ -81,7 +88,10 @@ GROUP_DEFS: dict[str, dict[str, Any]] = {
                 "control": "switch",
                 "type": "bool",
                 "default": False,
-                "help": "只在节点明确拒绝图片输入时触发（400/413/415/422 + 图片相关特征）；超时、429、401、未知 400 都不触发。",
+                "help": (
+                    "优先使用结构化业务证据（响应体 code / finish_reason 等，HTTP 200 响应体内的业务拒绝也算）；"
+                    "仅有状态码或文本特征时只当辅助证据；未知原因不猜测。超时、429、401 不触发。"
+                ),
             },
             {
                 "key": "max_extra_attempts",
@@ -91,7 +101,7 @@ GROUP_DEFS: dict[str, dict[str, Any]] = {
                 "default": 1,
                 "min": 0,
                 "max": 1,
-                "help": "硬上限 1；0 = 只记录拒绝事件，不再重试。",
+                "help": "硬上限 1；0 = 只记录拒绝事件，不再重试；安全类拒绝即使还有剩余次数也直接停止。",
             },
             {
                 "key": "caption_max_chars",
@@ -127,9 +137,11 @@ GROUP_DEFS: dict[str, dict[str, Any]] = {
         "payload": "experimental_reference",
         "label": "实验：参考图被拒后先遮挡再重绘",
         "description": (
-            "拒绝后的降级阶段，会把参考原图发给所选遮挡节点做遮挡编辑，再把遮挡产物与对应描述提交给原目标节点；"
-            "只有遮挡产物和对应描述会提交给原目标。遮挡编辑是额外的一次生图调用（费用另计）；"
-            "不做任何本地图像处理。依赖「参考图文字降级」开启。"
+            "仅在拒绝后的降级阶段生效：把本次失败尝试的完整参考图集合发给另配的遮挡编辑节点，"
+            "逐图编辑（最多 max_images 张，每笔按供应商单独计费），再对产物识图生成与遮挡图一致的描述；"
+            "随后至多一次最终生成把遮挡产物与描述提交给原目标（原目标只收到遮挡产物和描述）。"
+            "参考图数量超过上限、或遇到容量/安全限制时，按契约改纯文字或停止，不会悄悄丢弃部分参考图。"
+            "参考原图会发送给所选遮挡节点；插件不做任何本地图像处理。依赖「参考图文字降级」开启。"
         ),
         "depends_on": {
             "payload": "reference_fallback",
@@ -562,8 +574,9 @@ class PageAPI:
                     "default_size": str(item.get("default_size", "1024x1024")),
                     "timeout": _safe_int(item.get("timeout"), 180, 10),
                     "astrbot_provider_id": str(item.get("astrbot_provider_id", "")).strip(),
-                    "stream": bool(item.get("stream", False)),
-                    "enable_proxy": bool(item.get("enable_proxy", False)),
+                    # FF-05：旧配置里可能是字符串 "false"/"0"；不能用 bool(raw)（非空字符串恒为 True）。
+                    "stream": _as_bool(item.get("stream", False), False)[0],
+                    "enable_proxy": _as_bool(item.get("enable_proxy", False), False)[0],
                     "fallback_order": _safe_int(item.get("fallback_order"), 0),
                     "complete": _provider_complete(item),
                     "primary": False,
@@ -632,32 +645,94 @@ class PageAPI:
         incoming = body.get("providers", _MISSING)
         if incoming is not _MISSING and not isinstance(incoming, list):
             return _err("节点配置格式无效")
+
+        deleted_raw = body.get("deleted_provider_ids", [])
+        if deleted_raw is None:
+            deleted_raw = []
+        if not isinstance(deleted_raw, list) or any(not isinstance(value, str) for value in deleted_raw):
+            return _err(
+                "deleted_provider_ids 必须是节点 ID 列表",
+                400,
+                code="invalid_request",
+                field="deleted_provider_ids",
+            )
+        declared_deleted = {value.strip() for value in deleted_raw if value.strip()}
+
         old_items = [item for item in (self.plugin.raw_config.get("providers", []) or []) if isinstance(item, Mapping)]
         old_by_id: dict[str, Mapping[str, Any]] = {}
+        old_order: list[str] = []
         for item in old_items:
             provider_id = str(item.get("id", "")).strip()
-            if provider_id:
+            if provider_id and provider_id not in old_by_id:
                 old_by_id[provider_id] = item
+                old_order.append(provider_id)
+        if declared_deleted - set(old_by_id):
+            return _err(
+                "要删除的节点不在当前配置里，无法确认身份",
+                400,
+                code="unknown_deleted_id",
+                field="deleted_provider_ids",
+            )
+
         warnings: list[dict[str, Any]] = []
         saved: list[dict[str, Any]] | None = None
+        known_types = _api_type_set()
+        thinking_values = (
+            {str(value) for value in getattr(core_params, "THINKING_VALUES", ())}
+            if core_params
+            else {"", "off", "low", "medium", "high", "max"}
+        )
 
-        if incoming is not _MISSING:
-            saved = []
+        if incoming is _MISSING and not declared_deleted:
+            saved = None
+        else:
+            updates: dict[str, dict[str, Any]] = {}
+            new_ids: list[str] = []
             seen: set[str] = set()
-            known_types = _api_type_set()
-            thinking_values = {str(value) for value in getattr(core_params, "THINKING_VALUES", ())} if core_params else {"", "off", "low", "medium", "high", "max"}
-            for index, item in enumerate(incoming):
+            for index, item in enumerate(incoming if incoming is not _MISSING else []):
                 if not isinstance(item, Mapping):
                     return _err("节点配置格式无效", 400, code="invalid_request", index=index)
-                provider_id = str(item.get("id", "")).strip()
+
+                # FF-03/FF-04：ID 与接口类型必须是严格文本；不在这里做任何 str() 温柔强转。
+                raw_id = item.get("id", _MISSING)
+                if not isinstance(raw_id, str):
+                    return _err("节点 ID 必须是文本", 400, code="invalid_id", field="id", index=index)
+                provider_id = raw_id.strip()
                 if not provider_id:
                     return _err("节点 ID 不能为空", 400, code="missing_field", field="id", index=index)
+                if len(provider_id) > 128 or any(ord(char) < 32 for char in provider_id):
+                    return _err(
+                        "节点 ID 形状无效（最长 128 字符，且不能包含控制字符）",
+                        400,
+                        code="invalid_id",
+                        field="id",
+                        index=index,
+                    )
                 if provider_id in seen:
                     return _err(f"节点 ID「{provider_id}」重复", 400, code="duplicate_id", field="id", index=index)
+                if provider_id in declared_deleted:
+                    return _err(
+                        f"节点「{provider_id}」同时出现在保存列表和删除列表里",
+                        400,
+                        code="conflicting_delete",
+                        field="id",
+                        index=index,
+                    )
+
                 old = old_by_id.get(provider_id, {})
+                is_new = provider_id not in old_by_id
                 old_api_type = str(old.get("api_type", "")).strip()
                 if "api_type" in item:
-                    api_type = str(item.get("api_type", "")).strip()
+                    raw_type = item.get("api_type")
+                    if not isinstance(raw_type, str):
+                        return _err(
+                            f"节点「{provider_id}」的接口类型必须是文本",
+                            400,
+                            code="invalid_api_type",
+                            field="api_type",
+                            index=index,
+                        )
+                    api_type = raw_type.strip()
                 else:
                     api_type = old_api_type
                 if api_type not in known_types:
@@ -670,88 +745,148 @@ class PageAPI:
                     )
                 native = api_type == "astrbot_native"
 
-                def take(key: str, fallback, *, as_text: bool = False):
-                    if key not in item:
-                        return fallback
-                    value = item.get(key)
-                    if as_text:
-                        return _text(value)
-                    return value
-
                 def warn(code: str, key: str, message: str):
                     warnings.append({"code": code, "key": key, "node": provider_id, "message": message})
 
+                def text_field(key: str, fallback: str, *, label: str, strip: bool = True) -> str:
+                    if key not in item:
+                        return fallback
+                    value = item.get(key)
+                    if not isinstance(value, str):
+                        warn("param_invalid_value", key, f"节点「{provider_id}」的{label}必须是文本，已保留原值。")
+                        return fallback
+                    return value.strip() if strip else value
+
                 # 布尔字段：出现即写入；非法值字段级拒绝（保留旧值）。
-                enabled, ok = _as_bool(take("enabled", _provider_enabled(old)), _provider_enabled(old))
+                stored_enabled = _provider_enabled(old)
+                enabled, ok = _as_bool(item.get("enabled", stored_enabled), stored_enabled)
                 if "enabled" in item and not ok:
                     warn("param_invalid_value", "enabled", f"节点「{provider_id}」的启用开关取值无效，已保留原值。")
-                    enabled = _provider_enabled(old)
-                enable_proxy, ok = _as_bool(take("enable_proxy", bool(old.get("enable_proxy", False))), bool(old.get("enable_proxy", False)))
+                    enabled = stored_enabled
+
+                stored_proxy = _as_bool(old.get("enable_proxy", False), False)[0]
+                enable_proxy, ok = _as_bool(item.get("enable_proxy", stored_proxy), stored_proxy)
                 if "enable_proxy" in item and not ok:
                     warn("param_invalid_value", "enable_proxy", f"节点「{provider_id}」的代理开关取值无效，已保留原值。")
-                    enable_proxy = bool(old.get("enable_proxy", False))
+                    enable_proxy = stored_proxy
+
                 if native:
-                    stream, ok = _as_bool(take("stream", bool(old.get("stream", False))), bool(old.get("stream", False)))
+                    stored_stream = _as_bool(old.get("stream", False), False)[0]
+                    stream, ok = _as_bool(item.get("stream", stored_stream), stored_stream)
                     if "stream" in item and not ok:
                         warn("param_invalid_value", "stream", f"节点「{provider_id}」的流式开关取值无效，已保留原值。")
-                        stream = bool(old.get("stream", False))
+                        stream = stored_stream
                 else:
                     # 切离原生：流式字段归零（不残留）。
                     stream = False
 
                 # 整数字段：坏值字段级拒绝；越界按钳制表夹紧。
-                ref_limit, ok = _int_checked(take("reference_image_limit", _safe_int(old.get("reference_image_limit"), 0, 0)), 0, None)
+                stored_ref = _safe_int(old.get("reference_image_limit"), 0, 0)
+                ref_limit, ok = _int_checked(item.get("reference_image_limit", stored_ref), 0, None)
                 if not ok:
                     if "reference_image_limit" in item:
                         warn("param_invalid_value", "reference_image_limit", f"节点「{provider_id}」的参考图上限不是有效整数，已保留原值。")
-                    ref_limit = _safe_int(old.get("reference_image_limit"), 0, 0)
-                timeout, ok = _int_checked(take("timeout", _safe_int(old.get("timeout"), 180, 10)), 10, None)
+                    ref_limit = stored_ref
+                stored_timeout = _safe_int(old.get("timeout"), 180, 10)
+                timeout, ok = _int_checked(item.get("timeout", stored_timeout), 10, None)
                 if not ok:
                     if "timeout" in item:
                         warn("param_invalid_value", "timeout", f"节点「{provider_id}」的超时不是有效整数，已保留原值。")
-                    timeout = _safe_int(old.get("timeout"), 180, 10)
+                    timeout = stored_timeout
                 if "fallback_order" in item:
                     order, ok = _int_checked(item.get("fallback_order"))
                     fallback_order = order if ok else 0
                 else:
                     fallback_order = _safe_int(old.get("fallback_order"), 0)
 
-                thinking = str(old.get("thinking", "") or "")
+                stored_thinking = str(old.get("thinking", "") or "")
+                thinking = stored_thinking
                 if "thinking" in item:
-                    candidate = _text(item.get("thinking")).strip()
-                    if candidate in thinking_values:
-                        thinking = candidate
+                    candidate = item.get("thinking")
+                    if not isinstance(candidate, str):
+                        warn("param_invalid_value", "thinking", f"节点「{provider_id}」的思考档位必须是文本，已保留原值。")
                     else:
-                        warn("param_invalid_value", "thinking", f"节点「{provider_id}」的思考档位无效，已保留原值。")
-                custom_params = _text(old.get("custom_params", ""))
-                if "custom_params" in item:
-                    candidate = item.get("custom_params")
-                    if isinstance(candidate, str):
-                        custom_params = candidate
+                        candidate = candidate.strip()
+                        if candidate in thinking_values:
+                            thinking = candidate
+                        else:
+                            warn("param_invalid_value", "thinking", f"节点「{provider_id}」的思考档位无效，已保留原值。")
+
+                custom_params = text_field(
+                    "custom_params",
+                    str(old.get("custom_params", "") or ""),
+                    label="高级参数",
+                    strip=False,
+                )
+
+                if "available_models" in item:
+                    raw_models = item.get("available_models")
+                    if isinstance(raw_models, list) and all(isinstance(value, str) for value in raw_models):
+                        available_models = [value.strip() for value in raw_models if value.strip()]
+                    elif isinstance(raw_models, str):
+                        available_models = _line_items(raw_models)
                     else:
-                        warn("param_invalid_value", "custom_params", f"节点「{provider_id}」的高级参数必须是文本，已保留原值。")
+                        warn("param_invalid_value", "available_models", f"节点「{provider_id}」的可用模型必须是文本列表，已保留原值。")
+                        available_models = _line_items(old.get("available_models", []))
+                else:
+                    available_models = _line_items(old.get("available_models", []))
 
-                astrbot_provider_id = str(item.get("astrbot_provider_id", old.get("astrbot_provider_id", ""))).strip() if native else ""
-                if native and not astrbot_provider_id:
-                    return _err(
-                        f"原生节点「{provider_id}」必须选择 AstrBot Provider",
-                        400,
-                        code="native_missing_provider",
-                        field="astrbot_provider_id",
-                        index=index,
-                    )
+                if native:
+                    raw_provider_id = item.get("astrbot_provider_id", old.get("astrbot_provider_id", ""))
+                    if not isinstance(raw_provider_id, str):
+                        return _err(
+                            f"原生节点「{provider_id}」的 Provider ID 形状无效",
+                            400,
+                            code="invalid_astrbot_provider_id",
+                            field="astrbot_provider_id",
+                            index=index,
+                        )
+                    astrbot_provider_id = raw_provider_id.strip()
+                    if not astrbot_provider_id:
+                        return _err(
+                            f"原生节点「{provider_id}」必须选择 AstrBot Provider",
+                            400,
+                            code="native_missing_provider",
+                            field="astrbot_provider_id",
+                            index=index,
+                        )
+                else:
+                    astrbot_provider_id = ""
 
-                submitted_keys = _line_items(item.get("api_keys", []))
+                # 密钥三态（FF-02）：缺席/空=保留；非空=整体替换；clear_api_keys=true=清空。
+                # 不再因为切到原生就丢弃休眠的 HTTP 密钥（切回来仍可用）。
                 stored_keys = _line_items(old.get("api_keys", []))
-                clear_keys, _clear_ok = _as_bool(item.get("clear_api_keys", False), False)
+                clear_keys, clear_ok = _as_bool(item.get("clear_api_keys", False), False)
+                if "clear_api_keys" in item and not clear_ok:
+                    warn("param_invalid_value", "clear_api_keys", f"节点「{provider_id}」的清空密钥标记取值无效，已忽略。")
+                    clear_keys = False
+                submitted_keys: list[str] = []
+                keys_shape_ok = True
+                if "api_keys" in item:
+                    raw_keys = item.get("api_keys")
+                    if isinstance(raw_keys, str):
+                        submitted_keys = _line_items(raw_keys)
+                    elif isinstance(raw_keys, list) and all(isinstance(value, str) for value in raw_keys):
+                        submitted_keys = [value.strip() for value in raw_keys if value.strip()]
+                    else:
+                        keys_shape_ok = False
+                        warn("param_invalid_value", "api_keys", f"节点「{provider_id}」的 API Key 必须是文本或文本列表，已保留原值。")
                 if clear_keys:
-                    api_keys: list[str] = []
-                elif native:
                     api_keys = []
+                elif not keys_shape_ok:
+                    api_keys = stored_keys
                 elif submitted_keys:
                     api_keys = submitted_keys
                 else:
                     api_keys = stored_keys
+
+                base_url = text_field("base_url", str(old.get("base_url", "")).strip(), label="接口地址")
+                model = text_field("model", str(old.get("model", "")).strip(), label="模型")
+                default_size = text_field(
+                    "default_size",
+                    str(old.get("default_size", "1024x1024")).strip(),
+                    label="默认尺寸",
+                )
 
                 extra = {key: value for key, value in old.items() if key not in PROVIDER_FIELDS and key != "__template_key"}
                 entry = {
@@ -759,12 +894,12 @@ class PageAPI:
                     "id": provider_id,
                     "api_type": api_type,
                     "enabled": enabled,
-                    "base_url": str(take("base_url", old.get("base_url", ""), as_text=True)).strip(),
+                    "base_url": base_url,
                     "api_keys": api_keys,
-                    "model": str(take("model", old.get("model", ""), as_text=True)).strip(),
-                    "available_models": _line_items(item["available_models"]) if "available_models" in item else _line_items(old.get("available_models", [])),
+                    "model": model,
+                    "available_models": available_models,
                     "reference_image_limit": ref_limit,
-                    "default_size": str(take("default_size", old.get("default_size", "1024x1024"), as_text=True)).strip(),
+                    "default_size": default_size,
                     "timeout": timeout,
                     "astrbot_provider_id": astrbot_provider_id,
                     "stream": stream,
@@ -774,35 +909,137 @@ class PageAPI:
                     "custom_params": custom_params,
                     "__template_key": "provider",
                 }
-                if not native and not entry["base_url"]:
-                    warn("node_incomplete", "base_url", f"节点「{provider_id}」未填写接口地址，保存后仍不参与调用。")
-                if not native and not entry["api_keys"]:
-                    warn("node_incomplete", "api_keys", f"节点「{provider_id}」没有可用的 API Key，保存后仍不参与调用。")
-                capability = str((_api_type_meta(api_type).get("capabilities") or {}).get("thinking", "none"))
-                if thinking and capability == "none":
-                    warn("thinking_ignored", "thinking", f"节点「{provider_id}」的思考档位会被保存，但 {api_type} 协议不会发送思考字段。")
+
+                # FF-04：HTTP 节点必须带地址与密钥才能落盘；显式清空必须同时停用，
+                # 普通新建 / 遗漏 key / 启用但不完整一律整单拒绝（原子，不写盘）。
+                if not native and not api_keys:
+                    already_keyless_disabled = (not is_new) and (not enabled) and bool(base_url)
+                    if (is_new or enabled) or not already_keyless_disabled:
+                        return _err(
+                            f"节点「{provider_id}」配置不完整：缺 API Key。"
+                            "如确实要清空密钥，请先勾选“清空 API Key”并确认，插件会自动停用该节点后再保存。",
+                            400,
+                            code="node_incomplete",
+                            field="api_keys",
+                            index=index,
+                        )
+                if not native and not base_url:
+                    return _err(
+                        f"节点「{provider_id}」配置不完整：缺接口地址。",
+                        400,
+                        code="node_incomplete",
+                        field="base_url",
+                        index=index,
+                    )
+
+                if is_new:
+                    warnings.append(
+                        {
+                            "code": "new_node_no_key_inheritance",
+                            "key": "id",
+                            "node": provider_id,
+                            "message": (
+                                f"「{provider_id}」按新增节点保存，不会继承任何旧节点的密钥或配置；"
+                                "如要替换旧节点，请显式删除旧节点。"
+                            ),
+                        }
+                    )
+
+                capabilities = dict(_api_type_meta(api_type).get("capabilities") or {})
+                param_mode = str(_api_type_meta(api_type).get("param_mode", "ignored"))
+                if thinking and str(capabilities.get("thinking", "none")) == "none":
+                    warn(
+                        "thinking_ignored",
+                        "thinking",
+                        f"节点「{provider_id}」的思考档位会保存但不会发送（{api_type} 没有思考字段）；切换接口后仍保留。",
+                    )
+
+                # FF-09：区分「未声明但会透传」与「原生节点根本不发」，不写空头承诺。
                 _params, param_errors = _parse_params(custom_params, api_type)
                 for error in param_errors:
-                    if str(error.get("reason", "")) == "unknown_for_type":
+                    if str(error.get("reason", "")) != "unknown_for_type":
+                        continue
+                    key = str(error.get("key", ""))
+                    if key == "quality" and api_type == "openai_image":
+                        continue
+                    if param_mode == "ignored":
+                        message = (
+                            f"节点「{provider_id}」的参数「{key}」不会被发送：原生节点由 AstrBot Provider 处理，"
+                            "插件不发送自定义参数；该键只保留在配置里。"
+                        )
+                    else:
+                        message = (
+                            f"节点「{provider_id}」的参数「{key}」未获 {api_type} 公开声明支持，会原样透传给服务端；"
+                            "服务端可能返回 400，插件不会自动重试，也不会因此触发参考图降级。"
+                        )
+                    warnings.append(
+                        {
+                            "code": "param_unsupported_for_type",
+                            "key": key,
+                            "api_type": api_type,
+                            "node": provider_id,
+                            "param_mode": param_mode,
+                            "passthrough": param_mode != "ignored",
+                            "message": message,
+                        }
+                    )
+                # 原生节点把鉴权交给 AstrBot Provider，本插件不发送任何自定义参数：
+                # 已解析出的键也要明确告知“只保存、不会发送”，不留空头承诺。
+                if param_mode == "ignored" and custom_params.strip():
+                    for key in _params:
                         warnings.append(
                             {
                                 "code": "param_unsupported_for_type",
-                                "key": str(error.get("key", "")),
+                                "key": key,
                                 "api_type": api_type,
                                 "node": provider_id,
-                                "message": f"节点「{provider_id}」的参数「{error.get('key', '')}」不属于 {api_type}，会保留但不会发送。",
+                                "param_mode": param_mode,
+                                "passthrough": False,
+                                "message": (
+                                    f"节点「{provider_id}」的参数「{key}」不会被发送：原生节点由 AstrBot Provider 处理，"
+                                    "插件不发送自定义参数；该键只保留在配置里。"
+                                ),
                             }
                         )
-                saved.append(entry)
+
+                updates[provider_id] = entry
                 seen.add(provider_id)
+                if is_new and provider_id not in new_ids:
+                    new_ids.append(provider_id)
+
+            # FF-03：以旧顺序合并——未提交的旧节点原样保留（局部保存不会“改名”或删除它），
+            # 新节点按提交顺序追加；删除只认显式 deleted_provider_ids，绝不按位置猜身份。
+            assembled: list[dict[str, Any]] = []
+            for old_id in old_order:
+                if old_id in declared_deleted:
+                    continue
+                replacement = updates.pop(old_id, None)
+                assembled.append(replacement if replacement is not None else copy.deepcopy(dict(old_by_id[old_id])))
+            for new_id in new_ids:
+                if new_id in declared_deleted:
+                    continue
+                replacement = updates.pop(new_id, None)
+                if replacement is not None:
+                    assembled.append(replacement)
+            assembled.extend(updates.values())
+            saved = assembled
 
         primary_present = "primary_provider_id" in body
         stored_primary = str(self.plugin.store.get_primary_provider_id() or "").strip()
-        primary = str(body.get("primary_provider_id", "")).strip() if primary_present else stored_primary
-        if saved is not None and primary:
-            saved_ids = {entry["id"] for entry in saved}
-            if primary not in saved_ids and primary.partition("/")[0] not in saved_ids:
-                return _err("主节点不在当前列表中", 400, code="missing_field", field="primary_provider_id")
+        if primary_present:
+            raw_primary = body.get("primary_provider_id")
+            if raw_primary is not None and not isinstance(raw_primary, str):
+                return _err("主节点 ID 形状无效", 400, code="invalid_primary", field="primary_provider_id")
+            primary = (raw_primary or "").strip()
+        else:
+            primary = stored_primary
+        # 仅当被删除的正是存储主节点、且本次没有明确指定新主节点时，才清空存储值。
+        clear_stored_primary = bool(stored_primary and stored_primary in declared_deleted and not primary_present)
+        if clear_stored_primary:
+            primary = ""
+        current_ids = {entry["id"] for entry in saved} if saved is not None else (set(old_by_id) - declared_deleted)
+        if saved is not None and primary and primary not in current_ids and primary.partition("/")[0] not in current_ids:
+            return _err("主节点不在当前列表中", 400, code="missing_field", field="primary_provider_id")
 
         # 组配置：缺席=保留；出现=按描述表逐键写入（非法键只告警）。
         # 遮挡节点必须是「本次保存后」已启用且配置完整的节点。
@@ -814,7 +1051,9 @@ class PageAPI:
             group_provider_ids = {
                 str(item.get("id", "")).strip()
                 for item in old_items
-                if _provider_enabled(item) and _provider_complete(item)
+                if str(item.get("id", "")).strip() not in declared_deleted
+                and _provider_enabled(item)
+                and _provider_complete(item)
             }
         merged_groups: dict[str, dict[str, Any]] = {}
         for name, definition in GROUP_DEFS.items():
@@ -869,11 +1108,25 @@ class PageAPI:
         if "vision_provider_id" in body:
             new_optimizer["vision_provider_id"] = str(body.get("vision_provider_id", "")).strip()
 
-        snapshot_before = {
-            "providers": self.plugin.raw_config.get("providers"),
-            "optimizer_config": self.plugin.raw_config.get("optimizer_config"),
-            **{name: self.plugin.raw_config.get(name) for name in GROUP_DEFS},
+        # FF-06：配置与主节点存储是两份持久化；任一步失败都要恢复“内存 + 磁盘 + 存储”，
+        # 并在响应里如实说明回滚是否成功（不再出现 500 但磁盘已更新的假象）。
+        state_before: dict[str, Any] = {
+            "providers": copy.deepcopy(self.plugin.raw_config.get("providers")),
+            "optimizer_config": copy.deepcopy(self.plugin.raw_config.get("optimizer_config")),
+            **{name: copy.deepcopy(self.plugin.raw_config.get(name)) for name in GROUP_DEFS},
         }
+        stored_before = str(self.plugin.store.get_primary_provider_id() or "").strip()
+        save_fn = getattr(self.plugin.raw_config, "save_config", None)
+        if not callable(save_fn):
+            return _err("当前 AstrBot 配置对象不支持持久化", 500, code="config_unsupported")
+
+        def restore_memory() -> None:
+            for key, value in state_before.items():
+                if value is None:
+                    self.plugin.raw_config.pop(key, None)
+                else:
+                    self.plugin.raw_config[key] = value
+
         try:
             if saved is not None:
                 self.plugin.raw_config["providers"] = saved
@@ -881,20 +1134,56 @@ class PageAPI:
                 self.plugin.raw_config["optimizer_config"] = new_optimizer
             for name, group in merged_groups.items():
                 self.plugin.raw_config[name] = group
-            save_fn = getattr(self.plugin.raw_config, "save_config", None)
-            if not callable(save_fn):
-                raise RuntimeError("当前 AstrBot 配置对象不支持持久化")
             save_fn()
-            if primary_present:
+        except Exception as exc:
+            restore_memory()
+            rollback_ok = True
+            rollback_error = ""
+            try:
+                save_fn()
+            except Exception as rollback_exc:
+                rollback_ok = False
+                rollback_error = str(rollback_exc) or rollback_exc.__class__.__name__
+            return _err(
+                "无法保存节点配置" + ("；已恢复保存前状态" if rollback_ok else "；恢复保存前状态失败，请人工核对配置"),
+                500,
+                code="config_write_failed",
+                rollback="ok" if rollback_ok else "failed",
+                detail=str(exc) or exc.__class__.__name__,
+                rollback_error=rollback_error or None,
+            )
+
+        store_changed = (primary_present or clear_stored_primary) and primary != stored_before
+        if store_changed:
+            try:
                 self.plugin.store.set_primary_provider_id(primary)
-        except Exception:
-            # 原子性：写盘失败时恢复内存里的旧值，避免“页面显示已保存、盘上没写”。
-            for key, value in snapshot_before.items():
-                if value is None:
-                    self.plugin.raw_config.pop(key, None)
-                else:
-                    self.plugin.raw_config[key] = value
-            return _err("无法保存节点配置", 500)
+            except Exception as exc:
+                restore_memory()
+                config_restored = True
+                config_error = ""
+                try:
+                    save_fn()
+                except Exception as rollback_exc:
+                    config_restored = False
+                    config_error = str(rollback_exc) or rollback_exc.__class__.__name__
+                store_restored = True
+                store_error = ""
+                try:
+                    self.plugin.store.set_primary_provider_id(stored_before)
+                except Exception as rollback_exc:
+                    store_restored = False
+                    store_error = str(rollback_exc) or rollback_exc.__class__.__name__
+                fully_rolled_back = config_restored and store_restored
+                return _err(
+                    "主节点保存失败" + ("；已回滚到保存前状态" if fully_rolled_back else "；回滚未完全成功，请人工核对"),
+                    500,
+                    code="primary_store_failed",
+                    rollback="ok" if fully_rolled_back else "failed",
+                    config_restored=config_restored,
+                    store_restored=store_restored,
+                    detail=str(exc) or exc.__class__.__name__,
+                    rollback_error=(config_error or store_error) or None,
+                )
 
         snapshot = self._snapshot()
         return _ok("节点配置已保存", data=snapshot, warnings=warnings, **snapshot)

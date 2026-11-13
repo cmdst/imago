@@ -7,6 +7,7 @@ const $=s=>document.querySelector(s);
 
 const state={
   personas:[],current:'',providers:[],primary:'',storedPrimary:'',
+  primaryChosen:false,originalIds:new Set(),originalPrimary:'',
   catalog:{version:1,api_types:[],groups:[],thinking_values:[],thinking_labels:{}},
   referenceFallback:{},experimental:{},chatProviders:[],
   optimizerProviderId:'',visionProviderId:'',
@@ -93,7 +94,8 @@ function normalizeProvider(item){
     capabilities:item.capabilities||{},
     available_models:lineList(item.available_models),
     api_keys:[],
-    clear_api_keys:false
+    clear_api_keys:false,
+    isNew:item.isNew===true
   };
 }
 function providerBadges(item,index){
@@ -155,7 +157,10 @@ function renderProvider(item,index){
   const primaryTouch=item.primary?'':'title="设置为主节点"';
   const toggleClass=item.primary?'active':item.complete?'complete':'incomplete';
   const keyHint=item.api_keys_configured?' · 已配置（留空 = 保留）':' · 未配置';
-  const clearKeys=item.api_keys_configured?`<label class="check-line"><input type="checkbox" data-field="clear_api_keys" ${item.clear_api_keys?'checked':''}> 清空已保存的 API Key（保存后生效）</label>`:'';
+  const clearKeys=item.api_keys_configured?`<label class="check-line warn-line"><input type="checkbox" data-field="clear_api_keys" ${item.clear_api_keys?'checked':''}> 清空已保存的 API Key（勾选后保存会先二次确认；确认清空时该节点会被自动停用）</label>`:'';
+  const idField=item.isNew
+    ? `<label>节点 ID<input data-field="id" value="${attr(item.id||'')}"><span class="hint">新增节点可连续键入；ID 需唯一。</span></label>`
+    : `<label>节点 ID<input data-field="id" value="${attr(item.id||'')}" readonly aria-readonly="true"><span class="hint">已有节点的 ID 只读：要换名请新增节点并显式删除旧节点，避免密钥与历史配置错位。</span></label>`;
   const apiOptions=(state.catalog.api_types||[]).map(entry=>`<option value="${attr(entry.value)}" ${entry.value===item.api_type?'selected':''}>${escapeHtml(entry.label||entry.value)}</option>`).join('');
   const advancedFields=paramFields(item.api_type).map(field=>renderParamControl(field,item)).join('');
   const modeHint=item.param_mode==='typed'
@@ -179,7 +184,7 @@ function renderProvider(item,index){
       <section class="node-section">
         <h4>基础</h4>
         <div class="field-grid">
-          <label>节点 ID<input data-field="id" value="${attr(item.id||'')}"></label>
+          ${idField}
           <label>接口类型<select data-field="api_type">${apiOptions}</select></label>
           <label>接口地址（Base URL）<input data-field="base_url" value="${attr(item.base_url||'')}" placeholder="https://…"></label>
           <label>API Key（每行一个，节点内轮换）${escapeHtml(keyHint)}<textarea rows="3" data-field="api_keys" placeholder="留空 = 保留已保存的 Key" spellcheck="false"></textarea></label>
@@ -329,26 +334,17 @@ function syncProviderField(target){
   else if(field==='clear_api_keys')value=Boolean(target.checked);
   else if(field==='id')value=String(target.value).trim();
   else if(['reference_image_limit','timeout','fallback_order'].includes(field))value=target.value===''?0:Number(target.value);
+  if(field==='id'&&!item.isNew){notify('已有节点的 ID 只读：如需换名，请新增节点并显式删除旧节点',true);return}
   item[field]=value;
-  if(field==='id'&&state.primary===oldId)state.primary=item.id;
-  if(field==='api_type'){
-    const entry=catalogEntry(item.api_type);
-    item.param_mode=entry?entry.param_mode:item.param_mode;
-    item.capabilities=entry?entry.capabilities:item.capabilities;
-    if(item.api_type!=='astrbot_native'){item.stream=false;item.astrbot_provider_id=''}
-    item.complete=Boolean(item.id&&(item.api_type==='astrbot_native'?item.astrbot_provider_id:(item.base_url&&hasApiKeys(item))));
-    setDirty(true);
-    renderProviders();
-    return;
-  }
-  if(field==='enabled'){
-    setDirty(true);
-    renderProviders();
-    return;
+  if(field==='id'){
+    if(state.primary===oldId)state.primary=item.id;
+    // FF-07：只改标题，不替换正在输入的 input（否则连续键入会丢字符与光标）。
+    const title=node.querySelector('.provider-title-line strong');
+    if(title)title.textContent=item.id||'（未命名）';
   }
   item.complete=Boolean(item.id&&(item.api_type==='astrbot_native'?item.astrbot_provider_id:(item.base_url&&hasApiKeys(item))));
   setDirty(true);
-  if(field==='id'||field==='thinking')renderProviders();
+  if(field==='api_type'||field==='enabled')renderProviders();
 }
 function setParamValue(item,key,value,control){
   const lines=String(item.custom_params||'').split(/\r?\n/).filter(line=>{
@@ -402,7 +398,6 @@ function syncGroupField(target){
 }
 function buildProviderPayload(){
   const payload={
-    primary_provider_id:state.primary,
     optimizer_provider_id:state.optimizerProviderId,
     vision_provider_id:state.visionProviderId,
     providers:state.providers.map(item=>{
@@ -428,6 +423,14 @@ function buildProviderPayload(){
       return entry;
     })
   };
+  // FF-01：只有用户明确点选主节点时才提交 primary_provider_id；
+  // 启停、改参数等普通保存省略该项，后端保留存储主节点，避免把“当前生效”误存为“已选”。
+  if(state.primaryChosen)payload.primary_provider_id=state.primary;
+  // FF-03：删除必须是显式名单；只提交旧快照中存在、当前列表已不存在的 ID。
+  const originalIds=state.originalIds instanceof Set?state.originalIds:new Set();
+  const currentIds=state.providers.map(item=>String(item.id||'').trim()).filter(Boolean);
+  const deletedIds=[...originalIds].filter(id=>!currentIds.includes(id));
+  if(deletedIds.length)payload.deleted_provider_ids=deletedIds;
   for(const group of (state.catalog.groups||[])){
     const groupKey=group.key;
     if(groupKey==='reference_fallback_config'||groupKey==='experimental_reference_config'){
@@ -441,7 +444,32 @@ function buildProviderPayload(){
   }
   return payload;
 }
+function pendingClearNodes(){return state.providers.filter(item=>item.clear_api_keys&&item.api_keys_configured)}
+function cancelClearFlags(){
+  for(const item of state.providers)item.clear_api_keys=false;
+  renderProviders();
+}
+function confirmClearAndDisable(ids){
+  const confirmFn=typeof window.confirm==='function'?window.confirm:null;
+  if(!confirmFn)return false;
+  return Boolean(confirmFn(`将清空以下节点的已保存 API Key，并自动停用该节点：\n${ids.join('、')}\n\n清空后该节点无法发起调用；确认继续？`));
+}
 async function saveProviderConfig(){
+  // FF-08：破坏性的“清空密钥”必须先单独确认；确认后自动停用，避免“启用但缺 key”的不完整节点。
+  const clearing=pendingClearNodes();
+  if(clearing.length){
+    if(!confirmClearAndDisable(clearing.map(item=>item.id))){
+      cancelClearFlags();
+      notify('已取消清空密钥；未发送任何清空请求',false);
+      return;
+    }
+    for(const item of state.providers){
+      if(!item.clear_api_keys)continue;
+      item.clear_api_keys=false;
+      item.enabled=false;
+    }
+    renderProviders();
+  }
   const result=await apiPost('providers/save',buildProviderPayload());
   if(!result.success){notify(result.message||'保存失败',true);return}
   state.warnings=Array.isArray(result.warnings)?result.warnings:[];
@@ -465,6 +493,9 @@ function applySnapshot(result){
   state.providers=Array.isArray(result.providers)?result.providers.map(normalizeProvider):[];
   state.primary=result.primary_provider_id||'';
   state.storedPrimary=result.stored_primary_provider_id||'';
+  state.originalPrimary=state.storedPrimary;
+  state.originalIds=new Set(state.providers.map(item=>item.id));
+  state.primaryChosen=false;
   state.catalog=result.catalog||{version:1,api_types:[],groups:[],thinking_values:[],thinking_labels:{}};
   state.referenceFallback=result.reference_fallback||{};
   state.experimental=result.experimental_reference||{};
@@ -512,7 +543,7 @@ document.addEventListener('click',async event=>{
   const step=event.target.closest('[data-quota-step]');
   if(step){const row=step.closest('[data-quota-index]');const item=state.quotas[Number(row.dataset.quotaIndex)];item.quota=Math.max(0,(Number(item.quota)||0)+Number(step.dataset.quotaStep));row.querySelector('[data-quota-field="quota"]').value=item.quota;setQuotaDirty(true);return}
   const primary=event.target.closest('[data-primary]');
-  if(primary){const index=Number(primary.dataset.primary);state.primary=state.providers[index].id;setDirty(true);if(state.providers[index].enabled===false)notify('该节点已停用：保存后不会参与调用，启用后才会生效',false);renderProviders();return}
+  if(primary){const index=Number(primary.dataset.primary);state.primary=state.providers[index].id;state.primaryChosen=true;setDirty(true);if(state.providers[index].enabled===false)notify('该节点已停用：保存后不会参与调用，启用后才会生效',false);renderProviders();return}
   const expand=event.target.closest('[data-expand]');
   if(expand){const index=Number(expand.dataset.expand);if(state.expanded.has(index))state.expanded.delete(index);else state.expanded.add(index);expand.closest('.provider-node').classList.toggle('expanded');return}
   const deleteButton=event.target.closest('[data-delete]');
@@ -543,8 +574,8 @@ $('#add-provider').addEventListener('click',()=>{
   const ids=new Set(state.providers.map(item=>item.id));
   while(ids.has(id)){number+=1;id=`provider_${number}`}
   const entry=catalogEntry('openai_image');
-  state.providers.push(normalizeProvider({id,api_type:'openai_image',enabled:true,model:'',reference_image_limit:0,available_models:[],base_url:'',api_keys:[],api_keys_configured:false,default_size:'1024x1024',timeout:180,astrbot_provider_id:'',stream:false,enable_proxy:false,fallback_order:0,complete:false,thinking:'',custom_params:'',params:{},param_errors:[],param_mode:entry?entry.param_mode:'typed',capabilities:entry?entry.capabilities:{}}));
-  if(!state.primary)state.primary=id;
+  state.providers.push(normalizeProvider({isNew:true,id,api_type:'openai_image',enabled:true,model:'',reference_image_limit:0,available_models:[],base_url:'',api_keys:[],api_keys_configured:false,default_size:'1024x1024',timeout:180,astrbot_provider_id:'',stream:false,enable_proxy:false,fallback_order:0,complete:false,thinking:'',custom_params:'',params:{},param_errors:[],param_mode:entry?entry.param_mode:'typed',capabilities:entry?entry.capabilities:{}}));
+  if(!state.primary){state.primary=id;state.primaryChosen=true}
   state.expanded.add(state.providers.length-1);
   setDirty(true);
   renderProviders();
