@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import json
+import os
 import subprocess
 from pathlib import Path
 
@@ -202,9 +203,18 @@ class TestProvidersRead:
         assert by_value["gemini_official"]["capabilities"]["thinking"] == "thinking_level"
         for value in ("dashscope_multimodal", "custom_endpoint", "astrbot_native", "xai_image"):
             assert by_value[value]["capabilities"]["thinking"] == "none"
-        quality_values = {"native", "none", "undocumented"}
-        for entry in catalog["api_types"]:
-            assert entry["capabilities"]["quality"] in quality_values
+        expected = {
+            "openai_image": ("native", "complexity", "edits"),
+            "openai_chat": ("none", "reasoning_effort", "inline"),
+            "gemini_official": ("undocumented", "thinking_level", "inline"),
+            "dashscope_multimodal": ("none", "none", "array"),
+            "custom_endpoint": ("none", "none", "array"),
+            "astrbot_native": ("none", "none", "inline"),
+            "xai_image": ("undocumented", "none", "edits"),
+        }
+        for value, (quality, thinking, references) in expected.items():
+            caps = by_value[value]["capabilities"]
+            assert (caps["quality"], caps["thinking"], caps["references"]) == (quality, thinking, references), value
 
     def test_catalog_quality_allows_unknown_for_type_passthrough(self, env):
         catalog = get_state(env)["catalog"]
@@ -226,6 +236,13 @@ class TestProvidersRead:
             assert obsolete not in serialized
         assert experimental["depends_on"]["payload"] == "reference_fallback"
         assert experimental["depends_on"]["field"] == "enable"
+
+    def test_occluder_description_says_original_image_is_sent(self, env):
+        groups = {group["key"]: group for group in get_state(env)["catalog"]["groups"]}
+        description = groups["experimental_reference_config"]["description"]
+        assert "会把参考原图发给" in description
+        assert "费用另计" in description
+        assert "不外传原图" not in description
 
     def test_get_never_echoes_api_keys(self, env):
         _status, text = request(env[0])
@@ -627,11 +644,19 @@ class TestWebuiAssets:
         assert ".node-fields,.brain-selectors" in block.replace(" ", "") or ".node-fields" in block
         assert "overflow-x:auto" in css  # 宽表自身横滚，不撑破页面
 
-    def test_node_regression_suite(self):
+    def test_node_regression_suite(self, tmp_path):
         if not JS_TEST.exists():
             pytest.fail("缺少 test/test_webui_v130.js")
+        # 把真实 core/params.py 的 catalog 桥接给 Node，夹具偏差会直接红。
+        from imago_fusion.core.params import build_catalog
+
+        catalog_file = tmp_path / "catalog.json"
+        catalog_file.write_text(json.dumps(build_catalog(), ensure_ascii=False), encoding="utf-8")
+        env = dict(os.environ, IMAGO_WEBUI_CATALOG=str(catalog_file))
         result = subprocess.run(
-            ["node", str(JS_TEST)], capture_output=True, text=True, cwd=str(REPO_ROOT), check=False,
+            ["node", str(JS_TEST)], capture_output=True, text=True,
+            cwd=str(REPO_ROOT), check=False, env=env,
         )
         assert result.returncode == 0, result.stdout + result.stderr
+        assert "桥接" in result.stdout
         assert "全部" in result.stdout

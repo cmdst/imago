@@ -565,7 +565,7 @@ $('#upload').addEventListener('click',async()=>{const files=[...$('#reference-fi
 window.addEventListener('beforeunload',event=>{if(!state.dirty&&!state.quotaDirty)return;event.preventDefault();event.returnValue=''});
 
 /* 测试钩子：Node vm 回归直接调用真实渲染/装配逻辑（对线上无副作用）。 */
-window.__imagoWebui={state,catalogEntry,catalogLabel,paramFields,capabilitiesOf,thinkingValues,thinkingLabel,normalizeProvider,renderProviders,renderGroups,buildProviderPayload,applySnapshot,syncProviderField,syncGroupField,setParamValue};
+window.__imagoWebui={state,catalogEntry,catalogLabel,paramFields,capabilitiesOf,qualityText,thinkingCapText,referencesText,thinkingValues,thinkingLabel,normalizeProvider,renderProviders,renderGroups,buildProviderPayload,applySnapshot,syncProviderField,syncGroupField,setParamValue};
 
 (async()=>{
   try{

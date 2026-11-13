@@ -119,13 +119,22 @@ const CATALOG = {
     { value: 'openai_image', label: 'OpenAI 图像接口', param_mode: 'typed',
       fields: [field('size', '尺寸 / 比例', 'text', 'str', { placeholder: '1024x1024' }),
                field('quality', '生成质量', 'select', 'str', { options: ['', 'auto', 'low', 'medium', 'high', 'xhigh', 'max'] })],
-      capabilities: { quality: 'quality', thinking: 'complexity', references: true } },
-    { value: 'openai_chat', label: 'OpenAI Chat 接口', param_mode: 'typed', fields: [], capabilities: { quality: 'none', thinking: 'reasoning_effort', references: true } },
-    { value: 'gemini_official', label: 'Gemini 官方接口', param_mode: 'typed', fields: [field('image_size', '输出分辨率', 'select', 'str', { options: ['', '512', '1K', '2K', '4K'] })], capabilities: { quality: 'none', thinking: 'thinking_level', references: true } },
-    { value: 'dashscope_multimodal', label: '百炼多模态', param_mode: 'typed', fields: [], capabilities: { quality: 'none', thinking: 'none', references: true } },
-    { value: 'custom_endpoint', label: '自定义 JSON 接口', param_mode: 'free', fields: [], capabilities: { quality: 'none', thinking: 'none', references: true } },
-    { value: 'astrbot_native', label: 'AstrBot 原生 Provider', param_mode: 'ignored', fields: [], capabilities: { quality: 'none', thinking: 'none', references: true } },
-    { value: 'xai_image', label: 'xAI 图像接口', param_mode: 'typed', fields: [field('resolution', '分辨率档', 'select', 'str', { options: ['', '1k', '1.5k', '2k'] })], capabilities: { quality: 'none', thinking: 'none', references: true } }
+      capabilities: { quality: 'native', thinking: 'complexity', references: 'edits' } },
+    { value: 'openai_chat', label: 'OpenAI Chat 接口', param_mode: 'typed', fields: [], capabilities: { quality: 'none', thinking: 'reasoning_effort', references: 'inline' } },
+    { value: 'gemini_official', label: 'Gemini 官方接口', param_mode: 'typed',
+      fields: [field('size', '尺寸 / 比例', 'text', 'str'), field('image_size', '输出分辨率', 'select', 'str', { options: ['', '512', '1K', '2K', '4K'] })],
+      capabilities: { quality: 'undocumented', thinking: 'thinking_level', references: 'inline' } },
+    { value: 'dashscope_multimodal', label: '百炼多模态', param_mode: 'typed',
+      fields: [field('size', '尺寸', 'text', 'str'), field('prompt_extend', '提示词扩写', 'bool3', 'bool'),
+               field('watermark', '水印', 'bool3', 'bool'), field('seed', '随机种子', 'int', 'int'),
+               field('negative_prompt', '反向提示词', 'text', 'str')],
+      capabilities: { quality: 'none', thinking: 'none', references: 'array' } },
+    { value: 'custom_endpoint', label: '自定义 JSON 接口', param_mode: 'free', fields: [], capabilities: { quality: 'none', thinking: 'none', references: 'array' } },
+    { value: 'astrbot_native', label: 'AstrBot 原生 Provider', param_mode: 'ignored', fields: [], capabilities: { quality: 'none', thinking: 'none', references: 'inline' } },
+    { value: 'xai_image', label: 'xAI 图像接口', param_mode: 'typed',
+      fields: [field('size', '尺寸', 'text', 'str'), field('resolution', '分辨率档', 'select', 'str', { options: ['', '1k', '1.5k', '2k'] }),
+               field('edit_mode', '编辑模式', 'text', 'str')],
+      capabilities: { quality: 'undocumented', thinking: 'none', references: 'edits' } }
   ],
   thinking_values: ['', 'off', 'low', 'medium', 'high', 'max'],
   thinking_labels: { '': '跟随默认（不发送）', off: '关闭', low: '低', medium: '中', high: '高', max: '最高（协议支持时映射到 xhigh）' },
@@ -136,7 +145,7 @@ const CATALOG = {
       { key: 'caption_max_chars', label: '描述长度', control: 'number', type: 'int', default: 200, min: 80, max: 400, help: '80..400' }
     ] },
     { key: 'experimental_reference_config', payload: 'experimental_reference', label: '实验：参考图被拒后先遮挡再重绘',
-      description: '拒绝后的降级阶段用另配节点做遮挡编辑；不外传原图，只外传遮挡后的处理图。', depends_on: { payload: 'reference_fallback', field: 'enable', message: '实验遮挡依赖「参考图文字降级」：请先开启该组，实验功能才会生效。' },
+      description: '拒绝后的降级阶段会把参考原图发给遮挡节点；向原目标只提交遮挡产物和对应描述。', depends_on: { payload: 'reference_fallback', field: 'enable', message: '实验遮挡依赖「参考图文字降级」：请先开启该组，实验功能才会生效。' },
       fields: [
         { key: 'enable', label: '实验：参考图被拒后先遮挡再重绘', control: 'switch', type: 'bool', default: false, help: '关闭时代码路径不可达' },
         { key: 'occluder_provider_id', label: '遮挡编辑节点', control: 'provider_select', type: 'str', default: '', help: '只列已启用且配置完整的节点' },
@@ -153,7 +162,7 @@ const SNAPSHOT = {
     { id: 'main', api_type: 'openai_image', enabled: true, thinking: 'high',
       custom_params: 'size=1536x1024\nfoo=bar', params: { size: '1536x1024', foo: 'bar' },
       param_errors: [{ line: 2, key: 'foo', reason: 'unknown_for_type', message: '未知键透传' }],
-      param_mode: 'typed', capabilities: { quality: 'quality', thinking: 'complexity', references: true },
+      param_mode: 'typed', capabilities: { quality: 'native', thinking: 'complexity', references: 'edits' },
       model: 'gpt-image', reference_image_limit: 0, available_models: [], base_url: 'https://a.invalid',
       api_keys_configured: true, default_size: '1024x1024', timeout: 180, astrbot_provider_id: '',
       stream: false, enable_proxy: false, fallback_order: 0, complete: true, primary: true, primary_disabled: false },
@@ -235,6 +244,35 @@ async function waitReady() {
     assert.ok(html.includes('badge-off'));
   });
 
+  check('七型能力逐值映射与契约一致（quality/thinking/references）', () => {
+    const expected = {
+      openai_image: ['原生支持（quality 参数）', '映射为 complexity', 'images/edits 或 JSON 图像字段'],
+      openai_chat: ['不适用', '映射为 reasoning_effort', '内联图像（inlineData/contents）'],
+      gemini_official: ['未文档化（写了会透传）', '映射为 thinkingLevel（仅能力声明模型）', '内联图像（inlineData/contents）'],
+      dashscope_multimodal: ['不适用', '不发送思考字段', 'references[]'],
+      custom_endpoint: ['不适用', '不发送思考字段', 'references[]'],
+      astrbot_native: ['不适用', '不发送思考字段', '内联图像（inlineData/contents）'],
+      xai_image: ['未文档化（写了会透传）', '不发送思考字段', 'images/edits 或 JSON 图像字段']
+    };
+    for (const entry of CATALOG.api_types) {
+      const want = expected[entry.value];
+      assert.ok(want, `夹具缺少 ${entry.value}`);
+      const caps = ui.capabilitiesOf(entry.value);
+      assert.strictEqual(ui.qualityText(caps.quality), want[0], `${entry.value} quality`);
+      assert.strictEqual(ui.thinkingCapText(caps.thinking), want[1], `${entry.value} thinking`);
+      assert.strictEqual(ui.referencesText(caps.references), want[2], `${entry.value} references`);
+    }
+    // 旧形状（bool）只做单例兼容，不再是主路径
+    assert.strictEqual(ui.referencesText(true), '支持（旧形状）');
+    assert.strictEqual(ui.referencesText(false), '不发送');
+  });
+
+  check('节点能力行渲染真实 catalog 文案（quality/references）', () => {
+    assert.ok(html.includes('原生支持（quality 参数）'));
+    assert.ok(html.includes('images/edits 或 JSON 图像字段'));
+    assert.ok(html.includes('内联图像（inlineData/contents）'));
+  });
+
   check('接口类型下拉来自 catalog（7 项，含 xai_image，不硬编码）', () => {
     const select = html.match(/<select data-field="api_type">([\s\S]*?)<\/select>/)[1];
     const values = [...select.matchAll(/<option value="([^"]*)"/g)].map(match => match[1]);
@@ -295,6 +333,8 @@ async function waitReady() {
     assert.ok(groupsHtml.includes('class="card config-card is-blocked"'));
     assert.ok(groupsHtml.includes('data-group-field="enable" type="checkbox"  disabled'.replace('  ', ' ')) || groupsHtml.includes('disabled'));
     assert.ok(!groupsHtml.includes('只取失败尝试'));
+    assert.ok(!groupsHtml.includes('不外传原图'));
+    assert.ok(groupsHtml.includes('会把参考原图发给'));
     assert.ok(groupsHtml.includes('实验成本上限'));
     assert.ok(!groupsHtml.includes('丢弃'));
     assert.ok(!/只处理前|只取前/.test(groupsHtml));
@@ -447,6 +487,23 @@ async function waitReady() {
     assert.ok(!source.includes('"openai_image","openai_chat"'));
     assert.ok(!source.includes("quality:'high'"));
   });
+
+  if (process.env.IMAGO_WEBUI_CATALOG) {
+    check('夹具 catalog 与真实 API 输出一致（桥接）', () => {
+      const live = JSON.parse(fs.readFileSync(process.env.IMAGO_WEBUI_CATALOG, 'utf8'));
+      assert.strictEqual(CATALOG.version, live.version);
+      const liveByValue = {};
+      for (const entry of live.api_types) liveByValue[entry.value] = entry;
+      assert.strictEqual(CATALOG.api_types.length, live.api_types.length);
+      for (const entry of CATALOG.api_types) {
+        const real = liveByValue[entry.value];
+        assert.ok(real, '真实 catalog 缺少 ' + entry.value);
+        assert.deepStrictEqual(entry.capabilities, real.capabilities, entry.value + ' capabilities');
+        assert.strictEqual(entry.param_mode, real.param_mode, entry.value + ' param_mode');
+        assert.deepStrictEqual(entry.fields.map(f => f.key), real.fields.map(f => f.key), entry.value + ' fields');
+      }
+    });
+  }
 
   if (process.exitCode) {
     console.error('前端回归失败：' + passed + ' 项通过，存在失败项');
