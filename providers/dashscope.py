@@ -112,7 +112,12 @@ class DashScopeMultimodalAdapter(ProviderAdapter):
                 if message:
                     detail += f" message={message}"
                 # ``code`` 同时作为结构化字段交给拒绝分类器（如 DataInspectionFailed=安全）。
-                raise ProviderError(f"DashScope{detail}", code=str(payload.get("code", "")))
+                raise ProviderError(
+                    f"DashScope{detail}",
+                    status=200,
+                    code=str(payload.get("code", "")),
+                    source="body",
+                )
         if not results:
             raise NoOutputError("DashScope 响应中没有可识别的图片")
         return results

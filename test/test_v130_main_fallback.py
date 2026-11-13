@@ -150,7 +150,9 @@ class FallbackOutboundTests(unittest.IsolatedAsyncioTestCase):
         first, first_request, _ = self.plugin.scheduler.invocations[0]
         self.assertEqual(first.id, "occ")
         self.assertEqual(len(first_request.references), 1)
-        self.assertEqual(first_request.prompt, "挡住敏感处")
+        # BF-06：遮挡编辑请求必须带冻结的输出约束后缀（只出图、不要文字）。
+        self.assertTrue(first_request.prompt.startswith("挡住敏感处"))
+        self.assertTrue(first_request.prompt.endswith("只输出图片，不要文字说明。"))
         provider, request, _ = self.plugin.scheduler.invocations[-1]
         # 原目标节点只收到 1 张遮挡产物，绝不出现原始两张参考图。
         self.assertEqual(provider.id, "node_a")
@@ -171,14 +173,19 @@ class FallbackOutboundTests(unittest.IsolatedAsyncioTestCase):
         exp = ExperimentalReferenceConfig(
             enable=True, occluder_provider_id="occ", occlusion_prompt="挡住", max_images=1,
         )
-        results = await self.plugin._reference_fallback(
-            task, self._config(exp=exp), 90.0, {"kind": "safety", "status": 200}, locked,
-        )
-        self.assertIsNone(results)
+        # BF-03：最终降级生成失败必须原样上抛（由调度器判终态），不得吞成 None
+        # 再回落文字；这里断言"只有遮挡调用 + 一次原目标调用（失败）"。
+        from imago_fusion.core.errors import ProviderError
+
+        with self.assertRaises(ProviderError):
+            await self.plugin._reference_fallback(
+                task, self._config(exp=exp), 90.0, {"kind": "safety", "status": 200}, locked,
+            )
         # 只有遮挡调用 + 一次原目标调用（失败），没有第二次文字重绘。
         self.assertEqual([call[0].id for call in self.plugin.scheduler.invocations], ["occ", "node_a"])
         info = task.runtime["reference_fallback"]
-        self.assertEqual(info["reason"], "occlusion_failed")
+        self.assertEqual(info["mode"], "occlusion")
+        self.assertEqual(info["extra_attempts"], 1)
         self.assertTrue(info["notice"])
 
 

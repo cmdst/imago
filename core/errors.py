@@ -29,6 +29,7 @@ class ProviderError(ImagoFusionFusionError):
         code: str = "",
         finish_reason: str = "",
         block_reason: str = "",
+        source: str = "",
     ):
         super().__init__(message)
         self.status = status
@@ -39,6 +40,9 @@ class ProviderError(ImagoFusionFusionError):
             self.code = code
         self.finish_reason = finish_reason
         self.block_reason = block_reason
+        # rev3.1：HTTP 200 的拒绝没有状态码，用 ``source`` 说明结构化证据来自响应体
+        # 还是 AstrBot 运行态（native），分类器据此区分「无证据的 None」。
+        self.source = source
 
 
 class ProviderTimeout(ProviderError):
@@ -66,8 +70,17 @@ class NoOutputError(UnsupportedResponse):
         finish_reason: str = "",
         block_reason: str = "",
         code: str = "",
+        status: int | None = None,
+        source: str = "",
     ):
-        super().__init__(message, code=code, finish_reason=finish_reason, block_reason=block_reason)
+        super().__init__(
+            message,
+            code=code,
+            finish_reason=finish_reason,
+            block_reason=block_reason,
+            status=status,
+            source=source,
+        )
 
 
 class SendError(ImagoFusionFusionError):
@@ -147,6 +160,7 @@ class UpscaleSkipped(Exception):
 _ALLOWED_ERROR_MESSAGES = (
     "提示词不能为空",
     "未配置有效图片节点",
+    "没有可用的绘图节点（全部停用或配置不完整）",
     "附加参数必须使用 --key value",
     "不允许的附加参数:",
     "当前 AstrBot 不支持 Persona 正式解析",

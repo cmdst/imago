@@ -56,7 +56,7 @@ class OpenAIImageAdapter(ProviderAdapter):
                 headers={**headers, "Content-Type": "application/json"},
                 json=payload,
             ) as response:
-                return self.parse_common(await self.response_json(response))
+                return self.parse_common(await self.response_json(response), status=200)
         return await self._edit_multipart(
             session, request, api_key, urljoin(self.config.base_url.rstrip("/") + "/", "images/edits"),
             extra_fields=params, size=size,
@@ -91,7 +91,7 @@ class OpenAIImageAdapter(ProviderAdapter):
             )
         headers = {"Authorization": f"Bearer {api_key}"}
         async with session.post(url, headers=headers, data=form) as response:
-            return self.parse_common(await self.response_json(response))
+            return self.parse_common(await self.response_json(response), status=200)
 
     def reference_url(self, image: ImageInput) -> str:
         """参考图的 JSON 形态：base64 data URL（OpenAI 与 xAI 都接受）。"""

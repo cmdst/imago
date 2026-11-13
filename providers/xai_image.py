@@ -26,15 +26,20 @@ class XaiImageAdapter(OpenAIImageAdapter):
 
     # 单图 JSON 字段名；multipart 回退也用它（父类默认是 ``image[]``）。
     image_field = "image"
-    _dedicated = frozenset({"size", "resolution", "edit_mode"})
+    # resolution 不放进 dedicated：它必须走合并链（调用级 > 节点级），否则调用级
+    # 2k 会被节点 1k 覆盖（BF-09）。size/edit_mode 有独立槽位。
+    _dedicated = frozenset({"size", "edit_mode"})
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._quality_warned = False
 
     def _node_options(self, request: GenerationRequest) -> dict[str, object]:
         """取节点参数里的 ``resolution``/``edit_mode`` 等专用项，并返回剩余通用参数。"""
         params = self.merged_params(request, reserved=self._dedicated)
         self.log_param_errors()
         self.thinking_decision()
-        node_params, _errors = self.node_params()
-        resolution = str(params.pop("resolution", node_params.get("resolution", "")) or "").strip()
+        resolution = str(params.pop("resolution", "") or "").strip().lower()
         if resolution and resolution not in {"1k", "1.5k", "2k"}:
             self._debug(
                 "参数 忽略 api_type=xai_image key=resolution reason=invalid_value",
@@ -42,6 +47,14 @@ class XaiImageAdapter(OpenAIImageAdapter):
             resolution = ""
         if resolution:
             params["resolution"] = resolution
+        if "quality" in params and not self._quality_warned:
+            # xAI 只在定价档出现 quality，请求 schema 没有该字段；用户显式写时
+            # 仍按"未文档化透传"发送，但必须提示供应商可能拒绝（BF-09）。
+            self._quality_warned = True
+            self._warn(
+                "参数 透传 api_type=xai_image key=quality reason=undocumented"
+                "（xAI 无质量请求字段，供应商可能拒绝）",
+            )
         return params
 
     def edit_mode(self) -> str:
@@ -55,7 +68,11 @@ class XaiImageAdapter(OpenAIImageAdapter):
         explicit = xai_aspect_ratio(request.aspect_ratio)
         if explicit:
             return explicit
-        return xai_aspect_ratio(request.size) or xai_aspect_ratio(self.node_size())
+        return (
+            xai_aspect_ratio(request.size)
+            or xai_aspect_ratio(self.node_size())
+            or xai_aspect_ratio(self.config.default_size)
+        )
 
     async def generate(self, session, request: GenerationRequest, api_key: str) -> list:
         headers = {"Authorization": f"Bearer {api_key}"}
@@ -76,7 +93,7 @@ class XaiImageAdapter(OpenAIImageAdapter):
                 headers={**headers, "Content-Type": "application/json"},
                 json=payload,
             ) as response:
-                return self.parse_common(await self.response_json(response))
+                return self.parse_common(await self.response_json(response), status=200)
         if self.edit_mode() == "multipart":
             return await self._edit_multipart(
                 session, request, api_key, urljoin(base, "images/edits"),
@@ -100,7 +117,7 @@ class XaiImageAdapter(OpenAIImageAdapter):
             headers={**headers, "Content-Type": "application/json"},
             json=body,
         ) as response:
-            return self.parse_common(await self.response_json(response))
+            return self.parse_common(await self.response_json(response), status=200)
 
     @staticmethod
     def encode_reference(image) -> str:  # pragma: no cover - 兼容旧调用形态

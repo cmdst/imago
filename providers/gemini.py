@@ -116,10 +116,15 @@ class GeminiAdapter(ProviderAdapter):
         # image_size 有专属容器（imageConfig.imageSize），先取出再记其余无容器键。
         image_size = str(params.pop("image_size", "") or "").strip().upper()
         self.log_param_errors()
+        # BF-08：Gemini 没有 quality 容器，但冻结契约要求"显式质量例外传递"——
+        # 不映射成 image_size/thinking，原样放进 generationConfig（厂商可拒绝），
+        # 并提示该模型未声明支持，绝不宣称已支持。
         for key in params:
-            self._debug(
-                "参数 忽略 api_type=gemini_official key=%s reason=no_container", key,
-            )
+            if key == "quality":
+                self._warn(
+                    "参数 透传 api_type=gemini_official key=quality reason=unknown_for_type"
+                    "（该模型未声明支持 quality，供应商可能拒绝）",
+                )
         generation_config: dict = {"responseModalities": ["TEXT", "IMAGE"]}
         # 尺寸真正生效（F2）：取值口径 = 调用级 → 节点参数 → 节点默认；识别不出比例
         # 时不写 imageConfig，保持 v1.2.2 的请求体不变。
@@ -129,6 +134,8 @@ class GeminiAdapter(ProviderAdapter):
             image_config["aspectRatio"] = ratio
         if image_size and image_size in {"512", "1K", "2K", "4K"}:
             image_config["imageSize"] = image_size
+        for key, value in params.items():
+            generation_config.setdefault(key, value)
         if image_config:
             generation_config["imageConfig"] = image_config
         decision = self.thinking_decision()
@@ -186,6 +193,8 @@ class GeminiAdapter(ProviderAdapter):
                     code=block_reason.lower(),
                     block_reason=block_reason,
                     finish_reason=finish_reason,
+                    status=200,
+                    source="body",
                 )
             raise NoOutputError("Gemini 响应中没有图片", finish_reason=finish_reason)
         return results

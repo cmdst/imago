@@ -43,7 +43,7 @@ class CustomEndpointAdapter(ProviderAdapter):
             headers={"Authorization": f"Bearer {api_key}"},
             json=body,
         ) as response:
-            return self.parse_common(await self.response_json(response))
+            return self.parse_common(await self.response_json(response), status=200)
 
     @staticmethod
     def _scalar(value: object) -> object:

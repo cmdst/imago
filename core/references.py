@@ -288,12 +288,29 @@ class ReferencePlanner:
 #   同理不降级；只有 ``image_unsupported`` / ``image_invalid`` 可直接改文字重绘。
 CAPTION_MAX_IMAGES = 4
 REJECTION_STATUSES = frozenset({400, 413, 415, 422})
+# rev3.1：这些状态永远不触发图片降级（鉴权/限流/不存在/服务端故障）。
+EXCLUDED_STATUSES = frozenset({401, 403, 404, 429})
+# 内部泛型 code 只表示"插件内部错误类型"，不构成上游业务证据（BF-04）。
+_GENERIC_CODES = frozenset({
+    "provider_error",
+    "unsupported_response",
+    "no_output",
+    "provider_timeout",
+    "internal_error",
+    "configuration_missing",
+    "reference_invalid",
+    "quota_denied",
+    "send_failed",
+    "duplicate_request",
+    "duplicate_image",
+    "persona_invalid",
+})
 
 _STRUCTURED_SAFETY = frozenset({
     "content_policy", "contentpolicy", "content_policy_violation", "safety",
-    "moderation", "nsfw", "sensitive", "prohibited", "blocked", "blocklist",
-    "content_filter", "data_inspection_failed", "datainspectionfailed",
-    "image_safety", "spii", "recitation", "unsafe",
+    "safety_violation", "moderation", "nsfw", "sensitive", "prohibited",
+    "blocked", "blocklist", "content_filter", "data_inspection_failed",
+    "datainspectionfailed", "image_safety", "spii", "recitation", "unsafe",
 })
 _STRUCTURED_UNSUPPORTED = frozenset({
     "unsupported_image", "image_not_supported", "images_not_supported",
@@ -301,14 +318,17 @@ _STRUCTURED_UNSUPPORTED = frozenset({
     "image_unsupported", "image_input_unsupported", "vision_not_supported",
 })
 _STRUCTURED_TEXT_REJECTED = frozenset({
-    "text_rejected", "prompt_rejected", "prompt_too_long", "input_too_long",
-    "invalid_prompt",
+    "text_rejected", "prompt_rejected", "prompt_blocked", "prompt_too_long",
+    "input_too_long", "invalid_prompt",
 })
 _STRUCTURED_INVALID = frozenset({
     "invalid_image", "image_invalid", "image_too_large", "image_size_invalid",
     "invalid_image_size", "bad_image", "image_decode_failed",
+    "image_format_unsupported",
 })
-
+# finish_reason / block_reason 的字段语义：只有这些取值才是有意义的业务证据。
+_SAFETY_REASONS = frozenset({"safety", "prohibited_content", "blocklist", "spii"})
+_TEXT_REASON_VALUES = frozenset({"blocklist", "prompt_blocked", "text_rejected"})
 _TEXT_ONLY = re.compile(
     r"(does\s+not|doesn't|not)\s+support\s+(?:image|vision)|text[- ]only|"
     r"not\s+a\s+vision|images?\s+(?:are|is)\s+not\s+supported",
@@ -318,7 +338,22 @@ _UNSUPPORTED = re.compile(
     r"(?:invalid|unsupported|not\s+supported|not\s+allowed|cannot|can't|"
     r"unable\s+to\s+process|rejected)[^\n]{0,40}images?|"
     r"images?[^\n]{0,40}(?:invalid|unsupported|not\s+supported|not\s+allowed|"
-    r"too\s+large|exceed)|(?:input|reference)\s+image",
+    r"too\s+large|exceed)",
+    re.I,
+)
+# 参数级 400（quality/思考/分辨率/尺寸）不是图片被拒，必须排除（BF-04）。
+_PARAM_REJECTION = re.compile(
+    r"(?:quality|image[_-]?size|resolution|aspect[_-]?ratio|thinking|"
+    r"thinking[_-]?level|complexity|reasoning[_-]?effort|prompt[_-]?extend|"
+    r"watermark)[^\n]{0,40}"
+    r"(?:not\s+supported|unsupported|invalid|not\s+allowed|unknown|"
+    r"unrecognized|unexpected|must\s+be)",
+    re.I,
+)
+_PARAM_REJECTION_REVERSED = re.compile(
+    r"(?:not\s+supported|unsupported|invalid|unknown|unrecognized|unexpected)"
+    r"[^\n]{0,40}(?:quality|image[_-]?size|resolution|aspect[_-]?ratio|"
+    r"thinking|complexity|reasoning[_-]?effort)",
     re.I,
 )
 _IMAGE_SIZE = re.compile(
@@ -360,17 +395,35 @@ class RejectionVerdict:
     detail: str = ""
 
 
-def _structured_tokens(exc: Any) -> list[tuple[str, str]]:
-    """取出异常上的结构化字段（code / finish_reason / block_reason）。"""
-    found: list[tuple[str, str]] = []
-    for name in ("code", "finish_reason", "block_reason"):
-        value = getattr(exc, name, None)
-        if value is None:
-            continue
-        text = str(value).strip()
-        if text:
-            found.append((name, text))
-    return found
+def _business_fields(exc: BaseException) -> tuple[str, str, str, str]:
+    """取出**上游业务**字段：code / finish_reason / block_reason / source。
+
+    内部泛型 ``code``（``provider_error``/``no_output`` 等类属性）不算证据；
+    只有适配器显式写入实例的 code 才视为上游给出的业务码（BF-04）。
+    """
+    code = str(exc.__dict__.get("code", "") or "").strip()
+    if code.lower() in _GENERIC_CODES:
+        code = ""
+    finish = str(getattr(exc, "finish_reason", "") or "").strip()
+    block = str(getattr(exc, "block_reason", "") or "").strip()
+    source = str(getattr(exc, "source", "") or "").strip()
+    return code, finish, block, source
+
+
+def _field_kind(code: str, finish: str, block: str) -> str:
+    """按字段语义给出判定；返回空串表示"有证据但无法归类"。"""
+    code_l = code.lower()
+    finish_l = finish.lower().replace("-", "_")
+    block_l = block.lower().replace("-", "_")
+    if code_l in _STRUCTURED_TEXT_REJECTED or block_l in _TEXT_REASON_VALUES:
+        return "text_rejected"
+    if code_l in _STRUCTURED_SAFETY or finish_l in _SAFETY_REASONS or block_l in _SAFETY_REASONS:
+        return "safety"
+    if code_l in _STRUCTURED_UNSUPPORTED:
+        return "image_unsupported"
+    if code_l in _STRUCTURED_INVALID:
+        return "image_invalid"
+    return ""
 
 
 def classify_rejection(
@@ -381,59 +434,60 @@ def classify_rejection(
 ) -> RejectionVerdict:
     """把一次失败尝试判定为可降级 / 安全 / 文本 / 未知。
 
-    Args:
-        exc: 适配器/调度器捕获到的异常（``ProviderError``/``NoOutputError`` 等）。
-        api_type: 节点协议，仅用于日志与排障，不改变判定。
-        model: 模型名，同上。
-
-    Returns:
-        ``RejectionVerdict``；``detail`` 已脱敏并截断到 200 字符。
+    判定顺序（rev3.1 §6.3）：先排除传输/鉴权/限流/404/5xx 与无证据的 None，
+    再读结构化字段（按字段语义），最后才在状态码白名单内走窄文本正则。
     """
     raw = redact(str(exc) or "")
     detail = raw[:200]
-    tokens = _structured_tokens(exc)
-    normalized = {value.strip().lower() for _name, value in tokens}
-    evidence = ",".join(f"{name}:{redact(value)[:60]}" for name, value in tokens)
-
-    # 1) 排除层（rev3.1 §6.3）：传输/鉴权/限流/服务端故障与"无任何证据的 None"
-    #    永远不参与判定；有结构化业务证据的 None（HTTP 200 拒绝）仍可分类。
     status = getattr(exc, "status", None)
+    code, finish, block, source = _business_fields(exc)
+    evidence_parts = []
+    if code:
+        evidence_parts.append(f"code:{redact(code)[:60]}")
+    if finish:
+        evidence_parts.append(f"finish:{redact(finish)[:60]}")
+    if block:
+        evidence_parts.append(f"block:{redact(block)[:60]}")
+    if source:
+        evidence_parts.append(f"source:{redact(source)[:20]}")
+    evidence = ",".join(evidence_parts)
+
+    # 1) 排除层：传输/鉴权/限流/不存在/服务端故障永不算图片拒绝。
     if isinstance(exc, (asyncio.TimeoutError, ProviderTimeout)):
         return RejectionVerdict("unknown", False, evidence or "transport", detail)
     if isinstance(exc, _AiohttpClientError):
         return RejectionVerdict("unknown", False, evidence or "transport", detail)
-    if status in {401, 403, 429} or (isinstance(status, int) and status >= 500):
-        return RejectionVerdict("unknown", False, evidence or f"status:{status}", detail)
-    if not tokens and status not in REJECTION_STATUSES:
+    if status in EXCLUDED_STATUSES or (isinstance(status, int) and status >= 500):
         return RejectionVerdict("unknown", False, evidence or f"status:{status}", detail)
 
-    # 2) 判定层：结构化证据优先；``block_reason=OTHER`` 单独 = unknown。
-    if normalized == {"other"}:
+    # 2) 结构化判定：每个字段是否构成有效证据（OTHER 单独无效）。
+    reliable = bool(
+        code
+        or (finish and finish.lower() not in {"other", "stop", "length"})
+        or (block and block.lower() not in {"other"})
+    )
+    if reliable:
+        kind = _field_kind(code, finish, block)
+        if kind:
+            return RejectionVerdict(kind, kind in {"image_unsupported", "image_invalid"}, evidence or "structured", detail)
+        # 结构化证据可靠但无法归类：不猜、也不回落到文本正则。
         return RejectionVerdict("unknown", False, evidence or "structured", detail)
-    # 结构化 text_rejected（prompt 被拒）：恒不可降级，且与 safety 互斥时优先
-    # （rev3.1 §6.3 第 3 条：证据同现时 text_rejected 优先）。
-    if normalized & _STRUCTURED_TEXT_REJECTED:
-        return RejectionVerdict("text_rejected", False, evidence or "structured", detail)
-    if normalized & _STRUCTURED_SAFETY:
-        return RejectionVerdict("safety", False, evidence or "structured", detail)
-    if normalized & _STRUCTURED_UNSUPPORTED:
-        return RejectionVerdict("image_unsupported", True, evidence or "structured", detail)
-    if normalized & _STRUCTURED_INVALID:
-        return RejectionVerdict("image_invalid", True, evidence or "structured", detail)
 
-    lowered = raw
-    # 3) 文本层：text_rejected 与 safety 互斥，证据同现时 text_rejected 优先。
-    # 鉴权/额度/模型不存在等否定词优先排除：即使 HTTP 400 也不能当成图片拒绝。
-    if _NON_IMAGE_EXCLUSIONS.search(lowered):
+    # 3) 文本层：仅在状态码白名单内、且无任何结构化证据时启用（窄路径）。
+    if status not in REJECTION_STATUSES:
+        return RejectionVerdict("unknown", False, evidence or f"status:{status}", detail)
+    if _PARAM_REJECTION.search(raw) or _PARAM_REJECTION_REVERSED.search(raw):
+        return RejectionVerdict("unknown", False, evidence or "param", detail)
+    if _NON_IMAGE_EXCLUSIONS.search(raw):
         return RejectionVerdict("unknown", False, evidence or "text", detail)
-    if _TEXT_REJECTED.search(lowered):
+    if _TEXT_REJECTED.search(raw):
         return RejectionVerdict("text_rejected", False, evidence or "text", detail)
-    if _SAFETY_TEXT.search(lowered):
+    if _SAFETY_TEXT.search(raw):
         return RejectionVerdict("safety", False, evidence or "text", detail)
-    if _TEXT_ONLY.search(lowered) or _ZH_IMAGE.search(lowered):
+    if _TEXT_ONLY.search(raw) or _ZH_IMAGE.search(raw):
         return RejectionVerdict("image_unsupported", True, evidence or "text", detail)
-    if _IMAGE_SIZE.search(lowered):
+    if _IMAGE_SIZE.search(raw):
         return RejectionVerdict("image_invalid", True, evidence or "text", detail)
-    if _UNSUPPORTED.search(lowered):
+    if _UNSUPPORTED.search(raw):
         return RejectionVerdict("image_invalid", True, evidence or "text", detail)
     return RejectionVerdict("unknown", False, evidence or "text", detail)

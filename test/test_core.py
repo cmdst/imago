@@ -240,10 +240,17 @@ class ConfigTests(unittest.TestCase):
         self.assertIn("dashscope_multimodal", API_TYPES)
         # ADAPTERS 必须覆盖 API_TYPES（providers/__init__.py 的既有约定）
         self.assertEqual(set(ADAPTERS), set(API_TYPES))
-        # schema 的 api_type.options 恰 6 项且含这两个类型
+        # schema 的 api_type.options 在 v1.3.0 恰 7 项：旧六型原顺序 + xai_image 末尾
+        # （契约 C1；旧六型一个都不能少）；含 chat/dashscope 这两个上游删掉的类型。
         schema = json.loads((ROOT / "_conf_schema.json").read_text("utf-8"))
         options = schema["providers"]["templates"]["provider"]["items"]["api_type"]["options"]
-        self.assertEqual(len(options), 6)
+        self.assertEqual(
+            options,
+            [
+                "openai_image", "openai_chat", "gemini_official",
+                "dashscope_multimodal", "custom_endpoint", "astrbot_native", "xai_image",
+            ],
+        )
         self.assertLessEqual({"openai_chat", "dashscope_multimodal"}, set(options))
 
     def test_enhance_schema_group_matches_the_parser(self):

@@ -132,8 +132,38 @@ class ProviderAdapter(ABC):
 
         runtime.debug_log(message, *args)
 
+    # 上游常见"泛型"错误类别：它们只说明错误分层，不构成图片被拒的业务证据。
+    _GENERIC_BODY_CODES = frozenset({
+        "invalid_request_error", "api_error", "error", "internal_error",
+        "rate_limit_error", "authentication_error", "permission_error",
+    })
+
     @staticmethod
-    def parse_common(payload: Any) -> list[ImageResult]:
+    def _body_fields(payload: Any) -> dict[str, str]:
+        """从响应体提取上游业务字段（code / finish_reason / block_reason）。
+
+        兼容 ``{"error": {...}}`` 与顶层字段两种形态；``type`` 只在没有 ``code``
+        且不是泛型类别时才当作 code（BF-05：保留真实业务码，不吞成 provider_error）。
+        """
+        if not isinstance(payload, dict):
+            return {}
+        merged = dict(payload)
+        error = payload.get("error")
+        if isinstance(error, dict):
+            merged.update(error)
+        code = str(merged.get("code", "") or "").strip()
+        if not code:
+            candidate = str(merged.get("type", "") or "").strip()
+            if candidate and candidate.lower() not in ProviderAdapter._GENERIC_BODY_CODES:
+                code = candidate
+        return {
+            "code": code,
+            "finish_reason": str(merged.get("finish_reason", "") or "").strip(),
+            "block_reason": str(merged.get("block_reason", "") or "").strip(),
+        }
+
+    @staticmethod
+    def parse_common(payload: Any, *, status: int | None = None) -> list[ImageResult]:
         results: list[ImageResult] = []
         candidates = payload.get("data", []) if isinstance(payload, dict) else []
         if isinstance(candidates, dict):
@@ -160,6 +190,18 @@ class ProviderAdapter(ABC):
                     )
                 )
         if not results:
+            fields = ProviderAdapter._body_fields(payload)
+            if fields.get("code") or fields.get("finish_reason") or fields.get("block_reason"):
+                # HTTP 200 但响应体带业务拒绝字段：抛结构化 NoOutputError，
+                # 让分类器按字段语义判 safety/text_rejected/unknown（BF-05）。
+                raise NoOutputError(
+                    "响应中没有可识别的图片",
+                    code=fields.get("code", ""),
+                    finish_reason=fields.get("finish_reason", ""),
+                    block_reason=fields.get("block_reason", ""),
+                    status=status,
+                    source="body",
+                )
             raise NoOutputError("响应中没有可识别的图片")
         return results
 
@@ -214,7 +256,15 @@ class ProviderAdapter(ABC):
                     raw = ""
                 if raw and str(raw).strip():
                     detail = "body=" + redact_debug(str(raw).strip())[:160]
-            raise ProviderError(f"HTTP {response.status}{' ' + detail if detail else ''}", status=response.status)
+            fields = ProviderAdapter._body_fields(payload)
+            raise ProviderError(
+                f"HTTP {response.status}{' ' + detail if detail else ''}",
+                status=response.status,
+                code=fields.get("code", ""),
+                finish_reason=fields.get("finish_reason", ""),
+                block_reason=fields.get("block_reason", ""),
+                source="body" if any(fields.values()) else "",
+            )
         try:
             return await response.json(content_type=None)
         except Exception as exc:

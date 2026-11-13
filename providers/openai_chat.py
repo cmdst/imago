@@ -102,12 +102,16 @@ class OpenAIChatAdapter(ProviderAdapter):
                     code="refusal",
                     finish_reason=finish_reason,
                     block_reason=refusal[:200],
+                    status=200,
+                    source="body",
                 )
             if finish_reason.lower() in {"content_filter", "safety", "blocked", "refusal"}:
                 raise NoOutputError(
                     "Chat 上游因内容安全策略未返回图片",
                     code=finish_reason.lower(),
                     finish_reason=finish_reason,
+                    status=200,
+                    source="body",
                 )
             raise NoOutputError("Chat 响应中没有图片", finish_reason=finish_reason)
         return results

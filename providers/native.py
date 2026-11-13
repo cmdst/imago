@@ -81,6 +81,9 @@ class NativeAdapter(ProviderAdapter):
         # can return the same picture again.
         self._referenced: set[str] = set()
         self._last_reason: dict[str, str] = {}
+        # BF-01：原生节点单次 generate 内部的子请求计数（≤4），与调度器的
+        # adapter 调用计数分开统计；成功与失败都计数，供降级链路写入 runtime。
+        self.subcalls = 0
 
     async def generate(
         self, session: Any, request: GenerationRequest, api_key: str
@@ -142,6 +145,7 @@ class NativeAdapter(ProviderAdapter):
         last_error: Exception | None = None
         results: list[ImageResult] = []
         for index in range(attempts):
+            self.subcalls += 1
             try:
                 if self.config.stream:
                     found, text = await self._call_stream(
@@ -171,9 +175,12 @@ class NativeAdapter(ProviderAdapter):
             return results
         if last_error is not None:
             raise last_error
+        reason = {key: value for key, value in self._last_reason.items() if value}
+        if reason:
+            reason["source"] = "native"
         raise NoOutputError(
             f"原生 Provider {provider_id} 未返回图片数据{self._text_detail(texts)}",
-            **self._last_reason,
+            **reason,
         )
 
     async def _call_once(
@@ -299,10 +306,12 @@ class NativeAdapter(ProviderAdapter):
                 if value not in (None, ""):
                     fields[key] = str(value)
             if not fields["code"]:
+                # AstrBot 各版本把业务码放在 error_code / reason / status 之一；
+                # 只取第一个非空值作为 code，不把整段文本当证据（BF-05）。
                 for key in ("error_code", "reason", "status"):
                     value = getter(key)
                     if value not in (None, ""):
-                        fields[key if key == "code" else "code"] = str(value)
+                        fields["code"] = str(value)
                         break
         return fields
 
@@ -310,7 +319,10 @@ class NativeAdapter(ProviderAdapter):
     def _exception_kwargs(cls, exc: BaseException) -> dict[str, str]:
         """从上游异常上提取结构化拒绝字段（无则全空，由分类器判 unknown）。"""
         fields = cls._reason_fields(exc)
-        return {key: value for key, value in fields.items() if value}
+        payload = {key: value for key, value in fields.items() if value}
+        if payload:
+            payload["source"] = "native"
+        return payload
 
     def _extract(self, response: Any) -> tuple[list[ImageResult], str]:
         """Extract image references from one ``LLMResponse``.

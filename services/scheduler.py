@@ -15,7 +15,7 @@ except ImportError:  # 允许在不含 AstrBot 运行依赖的源码环境运行
     class _AiohttpClientError(Exception):
         pass
 
-from ..core.config import matches_template
+from ..core.config import available_providers, matches_template, provider_complete
 from ..core.errors import ConfigurationError, NoOutputError, ProviderError
 from ..core.models import DrawTask, ImageResult, TaskStage, TaskState
 from ..core.prompting import REFERENCE_RELATION_SUFFIX, reference_relation_suffix
@@ -337,11 +337,16 @@ class TaskScheduler:
             task.errors.append(f"terminal_notice:{type(exc).__name__}")
 
     @staticmethod
+    def _record_adapter_subcalls(task: DrawTask, adapter) -> None:
+        """把适配器内部子请求数累加进 runtime（仅原生节点会 >0）。"""
+        subcalls = int(getattr(adapter, "subcalls", 0) or 0)
+        if subcalls:
+            task.runtime["native_subcalls"] = int(task.runtime.get("native_subcalls", 0) or 0) + subcalls
+
+    @staticmethod
     def _provider_complete(provider) -> bool:
-        """节点是否完整（与 ``core.config.load_config`` 的丢弃口径一致）。"""
-        if provider.api_type == "astrbot_native":
-            return bool(str(provider.astrbot_provider_id or "").strip())
-        return bool(str(provider.base_url or "").strip()) and bool(provider.api_keys)
+        """节点是否完整（统一委托 ``core.config.provider_complete``，BF-12）。"""
+        return provider_complete(provider)
 
     def _record_rejection(self, task: DrawTask, verdict, attempt, request, status=None) -> None:
         """记录首个拒绝事件；首个可降级（或 safety）事件锁定内存请求副本。"""
@@ -376,7 +381,11 @@ class TaskScheduler:
             "model": attempt.model,
             "api_type": attempt.api_type,
             "thinking": str(attempt.thinking or ""),
-            "user_prompt": str(task.runtime.get("original_user_prompt") or task.request.prompt),
+            # BF-11：只接受 prepare 入口保存的**用户原文**，绝不回退到已被
+            # caption/副脑/人格改写过的 ``task.request.prompt``；来源不可证明时
+            # 留空，由降级执行体判 prompt_unrebuildable。
+            "user_prompt": str(runtime.get("original_user_prompt") or ""),
+            "user_prompt_source": "prepare" if runtime.get("original_user_prompt") else "",
             "prompt_has_auto_caption": bool(runtime.get("auto_caption_injected", False)),
         }
         runtime["fallback_locked"] = True
@@ -391,6 +400,9 @@ class TaskScheduler:
         if task.state == TaskState.CANCELLED:
             reason = "cancelled"
         elif not fb or not fb.enable:
+            reason = "disabled"
+        elif int(getattr(fb, "max_extra_attempts", 0) or 0) < 1:
+            # BF-01：配置为 0 时不得发起任何降级调用（含编辑/识图/最终）。
             reason = "disabled"
         elif not rejection:
             reason = "no_rejection"
@@ -449,6 +461,7 @@ class TaskScheduler:
                     "notice": (
                         "（参考图数量超出降级上限，本次未改按文字重绘。）"
                         if reason in {"capacity_over_caption", "capacity_safety"}
+                        and bool(getattr(fb, "notify_user", True))
                         else ""
                     ),
                 },
@@ -472,10 +485,7 @@ class TaskScheduler:
             remaining = deadline - time.monotonic()
         proxy_url = config.proxy_url
         # v1.3.0 F1：停用节点完全不参与路由；"完整"口径与 load_config 一致。
-        providers = [
-            item for item in config.providers
-            if item.enabled and self._provider_complete(item)
-        ]
+        providers = available_providers(config)
         if not providers:
             raise ConfigurationError("没有可用的绘图节点（全部停用或配置不完整）")
         primary_id = str(task.runtime.get("primary_provider_id", ""))
@@ -548,13 +558,18 @@ class TaskScheduler:
                         attempt_request.count, len(attempt_request.references),
                         task.runtime.get("current_persona_reference_count", 0),
                     )
-                    async with asyncio.timeout(attempt.timeout):
-                        results = await adapter.generate(
-                            _ProxySession(self.session, proxy_url)
-                            if attempt.enable_proxy and proxy_url else self.session,
-                            attempt_request,
-                            key,
-                        )
+                    try:
+                        async with asyncio.timeout(attempt.timeout):
+                            results = await adapter.generate(
+                                _ProxySession(self.session, proxy_url)
+                                if attempt.enable_proxy and proxy_url else self.session,
+                                attempt_request,
+                                key,
+                            )
+                    finally:
+                        # BF-01：原生节点单次调用内部的子请求（≤4）单独累计，
+                        # 成功/失败/超时都要计数，不能只按 adapter 调用次数。
+                        self._record_adapter_subcalls(task, adapter)
                     self.debug(
                         task,
                         "task=%s 绘图模型成功 node=%s model=%s results=%d references=%d persona_refs=%d forms=%s bytes=%d",

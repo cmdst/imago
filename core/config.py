@@ -316,6 +316,23 @@ def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
     )
 
 
+def provider_complete(provider: ProviderConfig) -> bool:
+    """节点是否"配置完整"（与 ``load_config`` 丢弃伪节点的口径一致）。
+
+    native 只要求 ``astrbot_provider_id``；其余协议要求 ``base_url`` 且至少一把
+    钥匙（钥匙随配置加载后仍非空）。停用（``enabled=False``）不在此函数判断：
+    调用方用 :func:`available_providers` 或自行判断。
+    """
+    if provider.api_type == "astrbot_native":
+        return bool(str(provider.astrbot_provider_id or "").strip())
+    return bool(str(provider.base_url or "").strip()) and bool(provider.api_keys)
+
+
+def available_providers(cfg: RuntimeConfig) -> list[ProviderConfig]:
+    """可参与路由的节点：已启用且完整（顺序保持 fallback_order 排序）。"""
+    return [item for item in cfg.providers if item.enabled and provider_complete(item)]
+
+
 def optimizer_in_use(cfg: RuntimeConfig, *, persona: bool, plain_draw_tool: bool) -> bool:
     """本轮任务是否调用副脑（纯逻辑，与风格联动完全独立）。
 

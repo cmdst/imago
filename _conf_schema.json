@@ -30,10 +30,11 @@
               "gemini_official",
               "dashscope_multimodal",
               "custom_endpoint",
-              "astrbot_native"
+              "astrbot_native",
+              "xai_image"
             ],
             "default": "openai_image",
-            "hint": "openai_image=OpenAI images；openai_chat=chat/completions；gemini_official=Gemini（反代填 `http://host:端口/v1beta`）；dashscope_multimodal=百炼；custom_endpoint=IMAGO·FUSION JSON；astrbot_native=走 AstrBot 已配置的原生 Provider（反代网页端出图，节点无需 base_url/api_keys）。"
+            "hint": "openai_image=OpenAI images；openai_chat=chat/completions；gemini_official=Gemini（反代填 `http://host:端口/v1beta`）；dashscope_multimodal=百炼；custom_endpoint=IMAGO·FUSION JSON；astrbot_native=走 AstrBot 已配置的原生 Provider（反代网页端出图，节点无需 base_url/api_keys）；xai_image=xAI images（改图走 JSON，`resolution` 支持 1k/1.5k/2k）。"
           },
           "base_url": {
             "description": "接口地址",
