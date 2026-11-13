@@ -212,6 +212,18 @@ class FrozenClassifierTests(unittest.TestCase):
         exc = NoOutputError("no image", status=200, source="body", block_reason="BLOCKLIST")
         self.assertEqual(self._kind(exc), "text_rejected")
 
+    def test_structured_image_invalid_aliases(self) -> None:
+        for code in ("invalid_image_format", "image_format_unsupported", "image_decode_failed"):
+            with self.subTest(code=code):
+                exc = ProviderError("bad image", status=400, code=code)
+                verdict = classify_rejection(exc, api_type="openai_image", model="m")
+                self.assertEqual(verdict.kind, "image_invalid")
+                self.assertTrue(verdict.convertible)
+        exc = ProviderError("no vision", status=400, code="image_not_supported")
+        verdict = classify_rejection(exc, api_type="openai_image", model="m")
+        self.assertEqual(verdict.kind, "image_unsupported")
+        self.assertTrue(verdict.convertible)
+
     def test_prompt_blocked_text_is_text_rejected(self) -> None:
         for text in (
             "prompt was blocked by safety filter",
