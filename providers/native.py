@@ -80,6 +80,7 @@ class NativeAdapter(ProviderAdapter):
         # the complete result in its final frame, and a retried non-stream call
         # can return the same picture again.
         self._referenced: set[str] = set()
+        self._last_reason: dict[str, str] = {}
 
     async def generate(
         self, session: Any, request: GenerationRequest, api_key: str
@@ -171,7 +172,8 @@ class NativeAdapter(ProviderAdapter):
         if last_error is not None:
             raise last_error
         raise NoOutputError(
-            f"原生 Provider {provider_id} 未返回图片数据{self._text_detail(texts)}"
+            f"原生 Provider {provider_id} 未返回图片数据{self._text_detail(texts)}",
+            **self._last_reason,
         )
 
     async def _call_once(
@@ -214,7 +216,8 @@ class NativeAdapter(ProviderAdapter):
             if _is_provider_missing(exc):
                 raise ProviderError(f"原生 Provider {provider_id} 不存在") from exc
             raise ProviderError(
-                f"原生 Provider 请求失败 ({type(exc).__name__})"
+                f"原生 Provider 请求失败 ({type(exc).__name__})",
+                **self._exception_kwargs(exc),
             ) from exc
         return self._extract(resp)
 
@@ -262,9 +265,52 @@ class NativeAdapter(ProviderAdapter):
                     texts.append(text)
         except Exception as exc:
             raise ProviderError(
-                f"原生 Provider 流式请求失败 ({type(exc).__name__})"
+                f"原生 Provider 流式请求失败 ({type(exc).__name__})",
+                **self._exception_kwargs(exc),
             ) from exc
         return images, "".join(texts)
+
+    @staticmethod
+    def _reason_fields(source: Any) -> dict[str, str]:
+        """v1.3.0 rev3.1：把 AstrBot 返回的拒绝原因收集成结构化字段。
+
+        ``LLMResponse`` 各版本字段不同，这里同时读取对象属性与 ``raw_completion``
+        字典；调用方只在拿到非空值时挂到异常上，绝不凭文本猜。
+        """
+        fields = {"code": "", "finish_reason": "", "block_reason": ""}
+        if source is None:
+            return fields
+        raw = getattr(source, "raw_completion", None)
+        candidates: list[Any] = [source]
+        if isinstance(raw, dict):
+            candidates.append(raw)
+            error = raw.get("error")
+            if isinstance(error, dict):
+                candidates.append(error)
+        for item in candidates:
+            if isinstance(item, dict):
+                getter = item.get
+            else:
+                getter = lambda key, _item=item: getattr(_item, key, None)
+            for key in fields:
+                if fields[key]:
+                    continue
+                value = getter(key)
+                if value not in (None, ""):
+                    fields[key] = str(value)
+            if not fields["code"]:
+                for key in ("error_code", "reason", "status"):
+                    value = getter(key)
+                    if value not in (None, ""):
+                        fields[key if key == "code" else "code"] = str(value)
+                        break
+        return fields
+
+    @classmethod
+    def _exception_kwargs(cls, exc: BaseException) -> dict[str, str]:
+        """从上游异常上提取结构化拒绝字段（无则全空，由分类器判 unknown）。"""
+        fields = cls._reason_fields(exc)
+        return {key: value for key, value in fields.items() if value}
 
     def _extract(self, response: Any) -> tuple[list[ImageResult], str]:
         """Extract image references from one ``LLMResponse``.
@@ -286,6 +332,7 @@ class NativeAdapter(ProviderAdapter):
             returned when the response carried no image reference at all, so a
             fully failed node can show the model's own reason.
         """
+        self._last_reason = self._reason_fields(response)
         images: list[ImageResult] = []
         chain = getattr(response, "result_chain", None)
         components = getattr(chain, "chain", None) if chain is not None else None

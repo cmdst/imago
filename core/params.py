@@ -174,37 +174,37 @@ API_TYPE_META: dict[str, dict[str, Any]] = {
     "openai_image": {
         "label": "OpenAI 图像接口",
         "param_mode": "typed",
-        "capabilities": {"quality": "native", "thinking": "complexity", "references": True},
+        "capabilities": {"quality": "native", "thinking": "complexity", "references": "edits"},
     },
     "openai_chat": {
         "label": "OpenAI Chat 接口",
         "param_mode": "typed",
-        "capabilities": {"quality": "none", "thinking": "reasoning_effort", "references": True},
+        "capabilities": {"quality": "none", "thinking": "reasoning_effort", "references": "inline"},
     },
     "gemini_official": {
         "label": "Gemini 官方接口",
         "param_mode": "typed",
-        "capabilities": {"quality": "undocumented", "thinking": "thinking_level", "references": True},
+        "capabilities": {"quality": "undocumented", "thinking": "thinking_level", "references": "inline"},
     },
     "dashscope_multimodal": {
         "label": "百炼多模态",
         "param_mode": "typed",
-        "capabilities": {"quality": "none", "thinking": "none", "references": True},
+        "capabilities": {"quality": "none", "thinking": "none", "references": "array"},
     },
     "custom_endpoint": {
         "label": "自定义 JSON 接口",
         "param_mode": "free",
-        "capabilities": {"quality": "none", "thinking": "none", "references": True},
+        "capabilities": {"quality": "none", "thinking": "none", "references": "array"},
     },
     "astrbot_native": {
         "label": "AstrBot 原生 Provider",
         "param_mode": "ignored",
-        "capabilities": {"quality": "none", "thinking": "none", "references": True},
+        "capabilities": {"quality": "none", "thinking": "none", "references": "inline"},
     },
     "xai_image": {
         "label": "xAI 图像接口",
         "param_mode": "typed",
-        "capabilities": {"quality": "undocumented", "thinking": "none", "references": True},
+        "capabilities": {"quality": "undocumented", "thinking": "none", "references": "edits"},
     },
 }
 
@@ -257,7 +257,7 @@ def capabilities(api_type: str) -> dict[str, Any]:
     """返回某协议的 ``capabilities``（未知类型给全 none）。"""
     meta = API_TYPE_META.get(api_type)
     if meta is None:
-        return {"quality": "none", "thinking": "none", "references": False}
+        return {"quality": "none", "thinking": "none", "references": "none"}
     return dict(meta["capabilities"])
 
 

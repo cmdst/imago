@@ -19,6 +19,7 @@ from ..core.config import matches_template
 from ..core.errors import ConfigurationError, NoOutputError, ProviderError
 from ..core.models import DrawTask, ImageResult, TaskStage, TaskState
 from ..core.prompting import REFERENCE_RELATION_SUFFIX, reference_relation_suffix
+from ..core.references import CAPTION_MAX_IMAGES, classify_rejection
 from ..core.security import redact_debug
 from ..providers import ADAPTERS
 
@@ -93,12 +94,28 @@ class _ProxySession:
 
 
 class TaskScheduler:
-    def __init__(self, config_getter, session, runner: Callable[[DrawTask, list[ImageResult]], Awaitable[bool]], logger, debug=None):
+    def __init__(
+        self,
+        config_getter,
+        session,
+        runner: Callable[[DrawTask, list[ImageResult]], Awaitable[bool]],
+        logger,
+        debug=None,
+        *,
+        rescue=None,
+        info=None,
+        warn=None,
+    ):
         self.config_getter = config_getter
         self.session = session
         self.runner = runner
         self.logger = logger
         self.debug = debug or (lambda *args, **kwargs: None)
+        # v1.3.0 S6：参考图降级的实际执行（识图摘要/遮挡编辑/文字重建）在 main 侧，
+        # 调度器只做条件闸门、快照与唯一一次调用，保证"每任务 ≤1 次额外生成"。
+        self.rescue = rescue
+        self.info = info or (lambda *args, **kwargs: None)
+        self.warn = warn or (lambda *args, **kwargs: None)
         self.accepting = True
         self.tasks: dict[str, tuple[DrawTask, asyncio.Task]] = {}
         self.recent: dict[str, tuple[DrawTask, float]] = {}
@@ -319,11 +336,147 @@ class TaskScheduler:
         except Exception as exc:
             task.errors.append(f"terminal_notice:{type(exc).__name__}")
 
-    async def _generate(self, task: DrawTask) -> list[ImageResult]:
+    @staticmethod
+    def _provider_complete(provider) -> bool:
+        """节点是否完整（与 ``core.config.load_config`` 的丢弃口径一致）。"""
+        if provider.api_type == "astrbot_native":
+            return bool(str(provider.astrbot_provider_id or "").strip())
+        return bool(str(provider.base_url or "").strip()) and bool(provider.api_keys)
+
+    def _record_rejection(self, task: DrawTask, verdict, attempt, request, status=None) -> None:
+        """记录首个拒绝事件；首个可降级（或 safety）事件锁定内存请求副本。"""
+        if verdict.kind == "unknown":
+            return
+        runtime = task.runtime
+        if "reference_rejection" not in runtime:
+            runtime["reference_rejection"] = {
+                "provider_id": attempt.id,
+                "model": attempt.model,
+                "api_type": attempt.api_type,
+                "status": status,
+                "kind": verdict.kind,
+                "convertible": bool(verdict.convertible),
+                "evidence": str(verdict.evidence or "")[:120],
+                "reason": str(verdict.detail or "")[:200],
+            }
+        if verdict.kind not in {"image_unsupported", "image_invalid", "safety"}:
+            return
+        if runtime.get("fallback_locked"):
+            self.debug(
+                task,
+                "task=%s 参考图降级 忽略后续拒绝 kind=%s",
+                task.id[:8], verdict.kind,
+            )
+            return
+        # rev3.1 §7.2：锁定该次实际请求的稳定内存副本（图片字节只留在内存，
+        # 不进 task.json / 清单 / 日志）；后续尝试不得覆盖，也不得靠元数据重采样。
+        runtime["fallback_request"] = {
+            "request": replace(request, references=tuple(request.references)),
+            "provider_id": attempt.id,
+            "model": attempt.model,
+            "api_type": attempt.api_type,
+            "thinking": str(attempt.thinking or ""),
+            "user_prompt": str(task.runtime.get("original_user_prompt") or task.request.prompt),
+            "prompt_has_auto_caption": bool(runtime.get("auto_caption_injected", False)),
+        }
+        runtime["fallback_locked"] = True
+
+    async def _maybe_reference_fallback(self, task: DrawTask, config, remaining: float):
+        """S6 条件闸门 + 唯一一次降级调用；返回 None 表示不降级/降级失败。"""
+        fb = getattr(config, "reference_fallback", None)
+        exp = getattr(config, "experimental_reference", None)
+        rejection = task.runtime.get("reference_rejection") or {}
+        locked = task.runtime.get("fallback_request")
+        reason = ""
+        if task.state == TaskState.CANCELLED:
+            reason = "cancelled"
+        elif not fb or not fb.enable:
+            reason = "disabled"
+        elif not rejection:
+            reason = "no_rejection"
+        elif rejection.get("kind") not in {"image_unsupported", "image_invalid", "safety"}:
+            reason = "not_convertible"
+        elif task.runtime.get("reference_fallback"):
+            reason = "used"
+        elif not locked:
+            reason = "no_snapshot"
+        elif not str(getattr(config, "vision_provider_id", "") or "").strip():
+            reason = "no_vision_provider"
+        elif remaining < float(fb.vision_timeout_seconds) + 15 + 20:
+            reason = "budget"
+        else:
+            target = next(
+                (item for item in config.providers if item.id == locked["provider_id"]),
+                None,
+            )
+            if target is None or not target.enabled or not self._provider_complete(target):
+                reason = "target_disabled"
+            else:
+                references = list(locked["request"].references)
+                n = len(references)
+                occluder = str(getattr(exp, "occluder_provider_id", "") or "").strip() if exp else ""
+                occluder_node = next(
+                    (item for item in config.providers if item.id == occluder), None,
+                ) if occluder else None
+                occluder_ready = bool(
+                    exp and exp.enable and occluder_node is not None
+                    and occluder_node.enabled and self._provider_complete(occluder_node)
+                )
+                kind = rejection.get("kind")
+                if occluder_ready:
+                    capacity = max(1, min(int(exp.max_images), 3))
+                    if n > capacity and kind == "safety":
+                        # 安全拒绝不允许退化成"只传部分图"，容量不够就终止。
+                        reason = "capacity_safety"
+                    elif n > CAPTION_MAX_IMAGES:
+                        # rev3.1：技术拒绝且图数超出摘要容量 → 整组文字也做不了。
+                        reason = "capacity_over_caption"
+                elif kind == "safety":
+                    reason = "safety_needs_occlusion"
+                elif n > CAPTION_MAX_IMAGES:
+                    reason = "capacity_over_caption"
+                elif not n:
+                    reason = "no_references"
+        if reason:
+            self.debug(
+                task, "task=%s 参考图降级 跳过 reason=%s", task.id[:8], reason,
+            )
+            task.runtime.setdefault(
+                "reference_fallback",
+                {
+                    "attempted": False,
+                    "reason": reason,
+                    "extra_attempts": 0,
+                    # rev3.1：容量不足未降级必须在失败输出路径也有告知。
+                    "notice": (
+                        "（参考图数量超出降级上限，本次未改按文字重绘。）"
+                        if reason in {"capacity_over_caption", "capacity_safety"}
+                        else ""
+                    ),
+                },
+            )
+            return None
+        if self.rescue is None:  # pragma: no cover - 测试/降级接线缺失
+            self.debug(task, "task=%s 参考图降级 跳过 reason=no_vision_provider", task.id[:8])
+            task.runtime["reference_fallback"] = {
+                "attempted": False, "reason": "no_vision_provider", "extra_attempts": 0,
+            }
+            return None
+        return await self.rescue(task, config, max(0.0, remaining), rejection, locked)
+
+    async def _generate(self, task: DrawTask, remaining: float | None = None) -> list[ImageResult]:
         config = self.config_getter()
-        providers = list(config.providers)
+        if remaining is None:
+            deadline = task.created_at + float(config.generation_timeout)
+            remaining = deadline - time.monotonic()
         proxy_url = config.proxy_url
-        if not providers: raise ConfigurationError("未配置有效图片节点")
+        # v1.3.0 F1：停用节点完全不参与路由；"完整"口径与 load_config 一致。
+        providers = [
+            item for item in config.providers
+            if item.enabled and self._provider_complete(item)
+        ]
+        if not providers:
+            raise ConfigurationError("没有可用的绘图节点（全部停用或配置不完整）")
         primary_id = str(task.runtime.get("primary_provider_id", ""))
         # ``模板名/模型名`` 覆写：仅当开关开启且前缀确实是已配置模板名时生效，因此
         # ``cpa_Gemini/web-gemini-image`` 这类原生 id 不会被劫持（DESIGN §4 A4）。
@@ -350,11 +503,32 @@ class TaskScheduler:
                 models = [""]
             for model_index, model in enumerate(models, start=1):
                 attempt = replace(provider, model=model)
-                # ``config`` 是本函数开头（``:314``）已取好的 RuntimeConfig，不新增一次
+                # ``config`` 是本函数开头已取好的 RuntimeConfig，不新增一次
                 # load_config（逐图重复解析的教训就在那儿）。
                 attempt_request = self._request_for_attempt(task, attempt, config)
                 task.runtime["current_provider_id"] = attempt.id
                 task.runtime["current_model"] = model
+                # rev3.1 §7.2：``attempt_meta`` 每次尝试覆盖写，只存元数据。
+                task.runtime["attempt_meta"] = {
+                    "provider_id": attempt.id,
+                    "model": model,
+                    "api_type": attempt.api_type,
+                    "explicit_count": len(task.request.references),
+                    "persona_count": int(
+                        task.runtime.get("current_persona_reference_count", 0) or 0
+                    ),
+                    "references": [
+                        {
+                            "role": "explicit"
+                            if index < len(task.request.references) else "persona",
+                            "index": index,
+                            "mime_type": image.mime_type,
+                            "bytes": len(image.data or b""),
+                        }
+                        for index, image in enumerate(attempt_request.references)
+                    ],
+                    "prompt_len": len(attempt_request.prompt),
+                }
                 self.set_stage(task, TaskStage.REQUESTING_PROVIDER)
                 # ``astrbot_native`` 节点由 AstrBot provider 自理鉴权，api_keys 可以
                 # 为空；空元组上取模会抛 ZeroDivisionError（异常发生在 try 之外，
@@ -403,6 +577,13 @@ class TaskScheduler:
                         task.runtime.get("current_persona_reference_count", 0),
                         type(exc).__name__, str(exc),
                     )
+                    self._record_rejection(
+                        task,
+                        classify_rejection(exc, api_type=attempt.api_type, model=model),
+                        attempt,
+                        attempt_request,
+                        getattr(exc, "status", None),
+                    )
                     self.logger(attempt, exc, task)
                 except _AiohttpClientError as exc:
                     wrapped = ProviderError(f"网络请求失败 ({type(exc).__name__})")
@@ -429,7 +610,28 @@ class TaskScheduler:
             bool(no_output_error),
             type(last_error).__name__ if last_error else "-",
         )
+        fallback = await self._maybe_reference_fallback(task, config, remaining)
+        if fallback is not None:
+            return fallback
         raise no_output_error or last_error or ProviderError("所有节点都失败")
+
+    async def invoke(self, provider, request, *, timeout: float | None = None):
+        """单次适配器调用（供降级/遮挡链路复用 key 轮转、代理与超时语义）。
+
+        不做路由、不写 attempt_errors、不做拒绝判定；调用方负责预算与失败处理。
+        """
+        adapter = ADAPTERS[provider.api_type](provider)
+        key_index = self._key_indices.get(provider.id, 0)
+        key = provider.api_keys[key_index % len(provider.api_keys)] if provider.api_keys else ""
+        self._key_indices[provider.id] = key_index + 1
+        proxy_url = self.config_getter().proxy_url
+        async with asyncio.timeout(provider.timeout if timeout is None else timeout):
+            return await adapter.generate(
+                _ProxySession(self.session, proxy_url)
+                if provider.enable_proxy and proxy_url else self.session,
+                request,
+                key,
+            )
 
     async def close(self) -> None:
         self.accepting = False

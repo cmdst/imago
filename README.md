@@ -2,7 +2,7 @@
 
 IMAGO·FUSION 是 **IMAGO·映相** 骨架与 **大香蕉（astrbot_plugin_big_banana）AstrBot 原生 Provider 桥接** 的融合插件：保留映相的提示词优化、Persona 出镜、绘图额度、多节点 fallback 与素材管理，新增「走 AstrBot 已配置 Provider（反代 / 网页端模型）出图」的原生路由。
 
-- 版本：`1.2.0`（`metadata.yaml` / `__init__.py` / `main.py` 的 `@register` / 本行**四处一致**；更新内容见 `CHANGELOG.md` 顶部的 1.2.0 节）
+- 版本：`1.3.0`（`metadata.yaml` / `__init__.py` / `main.py` 的 `@register` / 本行**四处一致**；更新内容见 `CHANGELOG.md` 顶部的 1.3.0 节）
 - AstrBot：`>=4.16,<5`
 - 依赖：`aiohttp>=3.9,<4`（不引入 Pillow：插件侧不做格式转换）
 
