@@ -3,16 +3,22 @@ from __future__ import annotations
 from collections.abc import Mapping
 from typing import Any
 
-from .models import ProviderConfig, QuotaConfig, RuntimeConfig, EnhanceConfig, UpscaleConfig
+from .models import (
+    DEFAULT_OCCLUSION_PROMPT,
+    EnhanceConfig,
+    ExperimentalReferenceConfig,
+    ProviderConfig,
+    QuotaConfig,
+    ReferenceFallbackConfig,
+    RuntimeConfig,
+    UpscaleConfig,
+)
+from .params import API_TYPE_ORDER, THINKING_VALUES
 
-API_TYPES = {
-    "openai_image",
-    "openai_chat",
-    "gemini_official",
-    "dashscope_multimodal",
-    "custom_endpoint",
-    "astrbot_native",
-}
+# 七种接口类型：六个旧类型顺序不变，``xai_image`` 追加在末尾（v1.3.0 契约 C1）。
+# 顺序的唯一事实源是 ``core.params.API_TYPE_ORDER``；``providers/__init__.py`` 的
+# ``ADAPTERS`` 必须与这个集合逐项相等（门禁守卫）。
+API_TYPES = set(API_TYPE_ORDER)
 STYLES = {"none", "default", "realistic", "real3d", "cg3d", "illustration", "pixel", "logo", "auto"}
 STYLE_OPTIONS = {
     "None(无)": "none",
@@ -100,7 +106,9 @@ def matches_template(providers: list[ProviderConfig], reference: str, *, enabled
         return False
     template_name = reference.partition("/")[0].strip()
     for item in providers:
-        if item.id != template_name:
+        if item.id != template_name or not item.enabled:
+            # 停用节点不参与覆写判定：命中停用的模板名视为「未命中」，
+            # 引用整体交给后续原生/普通节点解析（v1.3.0 契约 §4）。
             continue
         if item.api_type == "astrbot_native":
             # 同名原生节点存在：跳过覆写，避免遮蔽原生路由。
@@ -129,6 +137,28 @@ def _warn_template_collision(template_name: str, reference: str) -> None:
         template_name,
         reference,
     )
+
+
+def _thinking_value(value: Any) -> str:
+    """思考控制一级键：只接受全局词汇表里的值，其余一律按「不发送」处理。
+
+    不做协议级校验（那是发送时的事，见 ``core.params.resolve_thinking``），这样切
+    ``api_type`` 时配置值可以原样保留（字典 §4）。
+    """
+    text = str(value or "").strip().lower()
+    return text if text in THINKING_VALUES else ""
+
+
+def _enabled_value(value: Any) -> bool:
+    """节点启停开关：兼容面板 bool、文本 ``true/false`` 与缺键（默认启用）。"""
+    if value is None:
+        return True
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"false", "0", "no", "off"}:
+        return False
+    return True
 
 
 def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
@@ -168,6 +198,10 @@ def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
             stream=bool(item.get("stream", False)) if native else False,
             enable_proxy=bool(item.get("enable_proxy", False)),
             fallback_order=_int_or_default(item.get("fallback_order"), 0),
+            # v1.3.0 三新键：缺键时取 True/""/""，与 v1.2.0 完全等价（契约 F1/F3）。
+            enabled=_enabled_value(item.get("enabled")),
+            thinking=_thinking_value(item.get("thinking")),
+            custom_params=str(item.get("custom_params", "") or ""),
         ))
     # 回退顺序：数字小的先试，同值保持列表顺序（Python 排序稳定）。
     providers.sort(key=lambda item: item.fallback_order)
@@ -177,6 +211,8 @@ def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
     storage = raw.get("storage_config", {}) or {}
     enhance_raw = raw.get("enhance_config", {}) or {}
     upscale_raw = raw.get("upscale_config", {}) or {}
+    reference_fallback_raw = raw.get("reference_fallback_config", {}) or {}
+    experimental_raw = raw.get("experimental_reference_config", {}) or {}
     style = _style(optimizer.get("optimizer_style", "default(通用)"))
     checkin_min = max(0, int(quota_raw.get("daily_checkin_quota_min", 1) or 0))
     checkin_max = max(checkin_min, int(quota_raw.get("daily_checkin_quota_max", 3) or 0))
@@ -245,6 +281,37 @@ def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
             ),
             timeout_seconds=max(5, min(60, _int_or_default(upscale_raw.get("timeout_seconds"), 20))),
             enable_proxy=bool(upscale_raw.get("enable_proxy", False)),
+        ),
+        # 参考图文字降级（`reference_fallback_config`，5 键，默认关闭）：关闭时
+        # 与 v1.2.0 逐字节等价，不产生任何额外请求/文件/费用（契约 F6）。
+        reference_fallback=ReferenceFallbackConfig(
+            enabled=bool(reference_fallback_raw.get("enable", False)),
+            max_extra_attempts=max(
+                0, min(1, _int_or_default(reference_fallback_raw.get("max_extra_attempts"), 1)),
+            ),
+            caption_max_chars=max(
+                80, min(400, _int_or_default(reference_fallback_raw.get("caption_max_chars"), 200)),
+            ),
+            vision_timeout_seconds=max(
+                5, min(60, _int_or_default(reference_fallback_raw.get("vision_timeout_seconds"), 20)),
+            ),
+            notify_user=bool(reference_fallback_raw.get("notify_user", True)),
+        ),
+        # 实验遮挡（`experimental_reference_config`，6 键，默认关闭，t8 rev3）：
+        # 只影响降级阶段；降级关闭时本组不生效。依赖 occluder_provider_id 指向一个
+        # 存在、启用且完整的节点，缺失时实验路径整体跳过。
+        experimental_reference=ExperimentalReferenceConfig(
+            enable=bool(experimental_raw.get("enable", False)),
+            occluder_provider_id=str(experimental_raw.get("occluder_provider_id", "")).strip(),
+            occlusion_prompt=(
+                str(experimental_raw.get("occlusion_prompt", "") or "").strip()
+                or DEFAULT_OCCLUSION_PROMPT
+            )[:500],
+            max_images=max(1, min(3, _int_or_default(experimental_raw.get("max_images"), 1))),
+            timeout_seconds=max(5, min(60, _int_or_default(experimental_raw.get("timeout_seconds"), 20))),
+            caption_max_chars=max(
+                80, min(400, _int_or_default(experimental_raw.get("caption_max_chars"), 200)),
+            ),
         ),
     )
 

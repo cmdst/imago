@@ -16,24 +16,41 @@ def _data_url(mime_type: str, data: bytes) -> str:
     return f"data:{mime_type};base64,{base64.b64encode(data).decode()}"
 
 
-def _parameter_value(key: str, value: str) -> Any:
+def _parameter_value(key: str, value: Any) -> Any:
+    """把参数值转成百炼 ``parameters`` 需要的类型（已是 bool/int 的原样保留）。"""
+    if isinstance(value, bool):
+        return value
     if key in _BOOLEAN_PARAMS:
-        lowered = value.strip().lower()
+        if isinstance(value, (int, float)):
+            return bool(value)
+        lowered = str(value).strip().lower()
         if lowered in {"true", "1", "yes", "on"}:
             return True
         if lowered in {"false", "0", "no", "off"}:
             return False
         raise ProviderError(f"DashScope 参数 {key} 必须是布尔值")
     if key in _INTEGER_PARAMS:
+        if isinstance(value, int):
+            return value
         try:
-            return int(value)
+            return int(str(value))
         except ValueError as exc:
             raise ProviderError(f"DashScope 参数 {key} 必须是整数") from exc
     return value
 
 
 class DashScopeMultimodalAdapter(ProviderAdapter):
-    async def generate(self, session, request: GenerationRequest, api_key: str):
+    """百炼多模态生图。
+
+    v1.3.0 起：节点 ``custom_params``（``prompt_extend``/``watermark``/``seed``/
+    ``negative_prompt``/未知键）与调用级 ``extra_params`` 一起合并进 ``parameters``；
+    ``size`` 仍走专用槽（调用级 → 节点参数 → 节点默认）。百炼没有思考控制字段，
+    ``thinking`` 只会记 DEBUG（``core.params.resolve_thinking``）。
+    """
+
+    _dedicated = frozenset({"size", "n"})
+
+    async def generate(self, session, request: GenerationRequest, api_key: str) -> list[ImageResult]:
         async with session.post(
             self.config.base_url,
             headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
@@ -49,17 +66,19 @@ class DashScopeMultimodalAdapter(ProviderAdapter):
         ]
         content.append({"text": request.prompt})
 
+        params = self.merged_params(request, reserved=self._dedicated)
+        self.log_param_errors()
+        self.thinking_decision()  # 百炼无思考字段：只写 DEBUG，不发任何东西
         parameters: dict[str, Any] = {
             "prompt_extend": True,
             "n": request.count,
         }
         # size 原样透传（不换算 x→*）：需要星号的模型请在配置或参数里直接写 1024*1024
-        size = request.size or self.config.default_size
+        size = self.effective_size(request)
         if size:
             parameters["size"] = size
-        for key, value in request.extra_params.items():
-            if key not in {"n", "size"}:
-                parameters[key] = _parameter_value(key, value)
+        for key, value in params.items():
+            parameters[key] = _parameter_value(key, value)
 
         return {
             "model": self.config.model,
@@ -92,7 +111,8 @@ class DashScopeMultimodalAdapter(ProviderAdapter):
                 detail = f" code={code}" if code else ""
                 if message:
                     detail += f" message={message}"
-                raise ProviderError(f"DashScope{detail}")
+                # ``code`` 同时作为结构化字段交给拒绝分类器（如 DataInspectionFailed=安全）。
+                raise ProviderError(f"DashScope{detail}", code=str(payload.get("code", "")))
         if not results:
             raise NoOutputError("DashScope 响应中没有可识别的图片")
         return results

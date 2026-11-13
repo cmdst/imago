@@ -15,10 +15,13 @@ SENSITIVE = re.compile(
 )
 EXTRA_KEY = re.compile(r"^[a-zA-Z][a-zA-Z0-9_-]{0,31}$")
 # 除凭据/网络键外，还必须拦截会覆盖请求保留字段的键：n/model/size/prompt/count
-# 可绕过 count 1-4 上限或覆盖节点配置，messages 可整体替换请求体。
+# 可绕过 count 1-4 上限或覆盖节点配置，messages 可整体替换请求体；v1.3.0 再加图片/
+# 参考图/蒙版类键（它们由任务模型与适配器管理，调用级参数不得注入）。
 BLOCKED_EXTRA = {
     "url", "base_url", "authorization", "api_key", "token", "secret", "password",
     "timeout", "file", "path", "n", "model", "size", "prompt", "count", "messages",
+    "image", "images", "image_url", "image_urls", "mask", "references",
+    "input_image", "input_images",
 }
 
 

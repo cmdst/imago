@@ -114,6 +114,19 @@ class NativeAdapter(ProviderAdapter):
             raise ProviderError(
                 "原生节点未选择 AstrBot Provider（astrbot_provider_id 为空）"
             )
+        # v1.3.0：原生节点不发送节点参数与思考控制（AC-25c），但必须留 DEBUG 痕迹，
+        # 不能静默丢；具体子请求计数（≤4）与调度器的适配器调用计数分开统计。
+        self.log_param_errors()
+        params, _errors = self.node_params()
+        for key in params:
+            self._debug(
+                "参数 忽略 api_type=astrbot_native key=%s reason=unsupported", key,
+            )
+        if str(self.config.thinking or "").strip():
+            self._debug(
+                "思考控制 忽略 api_type=astrbot_native value=%s reason=unsupported",
+                self.config.thinking,
+            )
         context = self.context if self.context is not None else runtime.context()
         if context is None:
             raise ProviderError("原生节点缺少 AstrBot context，无法调用 Provider")

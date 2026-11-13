@@ -97,15 +97,42 @@ def _file_uri_with_key(uri: str, api_key: str, api_host: str) -> str:
 
 
 class GeminiAdapter(ProviderAdapter):
-    async def generate(self, session, request: GenerationRequest, api_key: str):
+    """Gemini ``generateContent`` 图像生成。
+
+    v1.3.0 起：``size`` 折算 ``imageConfig.aspectRatio``；节点参数 ``image_size``
+    写 ``imageConfig.imageSize``（分辨率档，不是质量）；``thinking`` 仅在
+    ``core.params.GEMINI_THINKING_CAPS`` 显式声明的模型上发送 ``thinkingLevel``。
+    """
+
+    _dedicated = frozenset({"size", "image_size"})
+
+    async def generate(self, session, request: GenerationRequest, api_key: str) -> list[ImageResult]:
         parts = [{"text": request.prompt}]
-        parts.extend({"inlineData": {"mimeType": image.mime_type, "data": base64.b64encode(image.data).decode()}} for image in request.references)
+        parts.extend(
+            {"inlineData": {"mimeType": image.mime_type, "data": base64.b64encode(image.data).decode()}}
+            for image in request.references
+        )
+        params = self.merged_params(request, reserved=self._dedicated)
+        self.log_param_errors()
+        for key in params:
+            self._debug(
+                "参数 忽略 api_type=gemini_official key=%s reason=no_container", key,
+            )
         generation_config: dict = {"responseModalities": ["TEXT", "IMAGE"]}
-        # 尺寸真正生效（F2）：取值口径与 openai_image / custom 一致（请求优先，其次
-        # 节点默认）。识别不出比例时不写 imageConfig，保持 v1.2.2 的请求体不变。
-        ratio = _aspect_ratio(request.size or self.config.default_size)
+        # 尺寸真正生效（F2）：取值口径 = 调用级 → 节点参数 → 节点默认；识别不出比例
+        # 时不写 imageConfig，保持 v1.2.2 的请求体不变。
+        ratio = _aspect_ratio(request.size or self.node_size() or self.config.default_size)
+        image_config: dict = {}
         if ratio:
-            generation_config["imageConfig"] = {"aspectRatio": ratio}
+            image_config["aspectRatio"] = ratio
+        image_size = str(params.get("image_size", "") or "").strip().upper()
+        if image_size and image_size in {"512", "1K", "2K", "4K"}:
+            image_config["imageSize"] = image_size
+        if image_config:
+            generation_config["imageConfig"] = image_config
+        decision = self.thinking_decision()
+        if decision.applied and decision.carrier == "thinking_level":
+            generation_config["thinkingConfig"] = {"thinkingLevel": decision.value}
         body = {"contents": [{"role": "user", "parts": parts}], "generationConfig": generation_config}
         base = self.config.base_url.rstrip("/")
         # 结果图的 fileUri 只在与节点同域时补 key（跨域＝中转/第三方存储，不泄密钥）。
@@ -119,9 +146,12 @@ class GeminiAdapter(ProviderAdapter):
         candidates = payload.get("candidates", [])
         if not isinstance(candidates, list):
             raise UnsupportedResponse("Gemini candidates 格式无效")
+        finish_reason = ""
         for candidate in candidates:
             if not isinstance(candidate, dict):
                 continue
+            if not finish_reason:
+                finish_reason = str(candidate.get("finishReason") or "")
             content = candidate.get("content", {})
             parts = content.get("parts", []) if isinstance(content, dict) else []
             for part in parts if isinstance(parts, list) else []:
@@ -133,11 +163,28 @@ class GeminiAdapter(ProviderAdapter):
                         data = base64.b64decode(inline["data"], validate=True)
                     except (ValueError, binascii.Error, TypeError):
                         continue
-                    results.append(ImageResult(data=data, mime_type=inline.get("mimeType", inline.get("mime_type", "image/png"))))
+                    results.append(ImageResult(
+                        data=data,
+                        mime_type=inline.get("mimeType", inline.get("mime_type", "image/png")),
+                    ))
                 else:
                     file_data = part.get("fileData", {})
                     if isinstance(file_data, dict) and file_data.get("fileUri"):
                         # Files API 下载需带 key；同域补上，避免结果落盘下载 401。
-                        results.append(ImageResult(url=_file_uri_with_key(str(file_data["fileUri"]), api_key, api_host)))
-        if not results: raise NoOutputError("Gemini 响应中没有图片")
+                        results.append(ImageResult(
+                            url=_file_uri_with_key(str(file_data["fileUri"]), api_key, api_host),
+                        ))
+        if not results:
+            block_reason = ""
+            feedback = payload.get("promptFeedback")
+            if isinstance(feedback, dict):
+                block_reason = str(feedback.get("blockReason") or "")
+            if block_reason:
+                raise NoOutputError(
+                    "Gemini 因内容安全策略拒绝了本次请求",
+                    code=block_reason.lower(),
+                    block_reason=block_reason,
+                    finish_reason=finish_reason,
+                )
+            raise NoOutputError("Gemini 响应中没有图片", finish_reason=finish_reason)
         return results

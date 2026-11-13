@@ -72,6 +72,15 @@ class ProviderConfig:
     # Smallest value is tried first during fallback; the primary node selected in
     # the WebUI always stays first.
     fallback_order: int = 0
+    # ``enabled=False`` 的节点不参与路由：调度器完全不尝试、不算有效主节点，
+    # 但配置原样保留（v1.3.0 契约 F1；缺键时默认 True = 与 v1.2.0 等价）。
+    enabled: bool = True
+    # 思考控制的一级键（``""``/``off``/``low``/``medium``/``high``/``max``）。
+    # 它**不**写进 ``custom_params``，也不与之合并（契约 F4/F5、字典 §3.4）。
+    thinking: str = ""
+    # 节点级参数原文（``key=value`` 行）。由 ``core.params.parse_custom_params``
+    # 按协议解析后再落到请求容器；这里保留原文以便两套界面三态往返。
+    custom_params: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -177,6 +186,62 @@ class UpscaleConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ReferenceFallbackConfig:
+    """参考图文字降级（``reference_fallback_config`` 组，默认关闭）。
+
+    关闭时参考图链路与 v1.2.0 逐字节等价：零额外请求、零额外文件、零费用。
+    打开后只在"上游明确拒绝图片输入"时触发一次，且降级请求不携带任何图片
+    （契约 F6；判定器见 ``core.references.classify_rejection``）。
+
+    Attributes:
+        enabled: 总开关，默认 **False**。
+        max_extra_attempts: 每任务允许的**额外**生成次数，0..1（默认 1）。
+        caption_max_chars: 降级文字说明的总字数上限 80..400（默认 200）。
+        vision_timeout_seconds: 为降级描述图集而调用识图 Provider 的单次超时 5..60。
+        notify_user: 是否在结果尾部告知本次参考图未被使用（默认 True）。
+    """
+
+    enabled: bool = False
+    max_extra_attempts: int = 1
+    caption_max_chars: int = 200
+    vision_timeout_seconds: int = 20
+    notify_user: bool = True
+
+
+DEFAULT_OCCLUSION_PROMPT = (
+    "在你认为的敏感部位用滑稽表情挡住；只做不透明覆盖，不要描述或还原被遮挡内容。"
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ExperimentalReferenceConfig:
+    """实验遮挡（``experimental_reference_config`` 组，默认关闭，t8 rev3）。
+
+    与 t1 的"本地整图 blur"完全不同：**不**在首轮做任何图像处理，只在参考图被上游
+    拒绝后的降级阶段，调用一个**明确配置的生成节点**对失败尝试的图片做遮挡编辑，
+    再把产物与一致的文字摘要交给原目标节点重试。首轮零改动、零额外请求、零费用。
+
+    依赖 ``reference_fallback_config.enable``：降级关闭时本组即使开启也不生效。
+
+    Attributes:
+        enable: 总开关，默认 **False**。
+        occluder_provider_id: 执行遮挡编辑的节点 id，必须是"存在 + 启用 + 配置完整"
+            的 ``providers[].id``；不合法时跳过实验路径（DEBUG 记原因）。
+        occlusion_prompt: 遮挡编辑指令，≤500 字符。
+        max_images: 最多处理的图数，clamp 1..3。
+        timeout_seconds: 单次遮挡编辑的超时，clamp 5..60。
+        caption_max_chars: 与产物一致的摘要总字数上限，clamp 80..400。
+    """
+
+    enable: bool = False
+    occluder_provider_id: str = ""
+    occlusion_prompt: str = DEFAULT_OCCLUSION_PROMPT
+    max_images: int = 1
+    timeout_seconds: int = 20
+    caption_max_chars: int = 200
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeConfig:
     providers: tuple[ProviderConfig, ...]
     quota: QuotaConfig = field(default_factory=QuotaConfig)
@@ -216,6 +281,12 @@ class RuntimeConfig:
     # 百度「图像无损放大」：默认关闭，且在增强**之后**串一级（spec 变更令 v3.5）。
     # 与 ``enhance`` 各自一套阈值与熔断，互不读取对方的键。
     upscale: UpscaleConfig = field(default_factory=UpscaleConfig)
+    # 参考图文字降级：默认关闭；关闭时链路与 v1.2.0 等价（契约 F6）。
+    reference_fallback: ReferenceFallbackConfig = field(default_factory=ReferenceFallbackConfig)
+    # 实验遮挡：默认关闭，且只有降级阶段才可能用到（t8 rev3）；首轮零改动。
+    experimental_reference: ExperimentalReferenceConfig = field(
+        default_factory=ExperimentalReferenceConfig,
+    )
 
 
 @dataclass(slots=True)

@@ -21,9 +21,24 @@ class QuotaError(ImagoFusionFusionError):
 class ProviderError(ImagoFusionFusionError):
     code = "provider_error"
 
-    def __init__(self, message: str, *, status: int | None = None):
+    def __init__(
+        self,
+        message: str,
+        *,
+        status: int | None = None,
+        code: str = "",
+        finish_reason: str = "",
+        block_reason: str = "",
+    ):
         super().__init__(message)
         self.status = status
+        # v1.3.0 rev3：拒绝分类优先读结构化字段，其次才看文本正则。这里的 ``code``
+        # 是**上游**给出的错误码/原因码（与类属性 ``code`` 同名但实例覆盖），
+        # ``finish_reason``/``block_reason`` 交由各适配器从响应体填充。
+        if code:
+            self.code = code
+        self.finish_reason = finish_reason
+        self.block_reason = block_reason
 
 
 class ProviderTimeout(ProviderError):
@@ -35,9 +50,24 @@ class UnsupportedResponse(ProviderError):
 
 
 class NoOutputError(UnsupportedResponse):
-    """Provider 请求已完成，但响应中没有可用图片。"""
+    """Provider 请求已完成，但响应中没有可用图片。
+
+    v1.3.0 rev3：HTTP 200 的内容拒绝必须由适配器带**结构化** ``code`` /
+    ``finish_reason`` / ``block_reason`` 抛出，拒绝分类器才认；否则一律 ``unknown``，
+    绝不因为文本里出现 image 就降级。
+    """
 
     code = "no_output"
+
+    def __init__(
+        self,
+        message: str = "响应中没有可识别的图片",
+        *,
+        finish_reason: str = "",
+        block_reason: str = "",
+        code: str = "",
+    ):
+        super().__init__(message, code=code, finish_reason=finish_reason, block_reason=block_reason)
 
 
 class SendError(ImagoFusionFusionError):
