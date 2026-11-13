@@ -293,7 +293,7 @@ function renderGroupField(group,field,value,blocked=false){
     return renderOccluderSelect(field,value,blocked);
   }
   if(field.control==='textarea'){
-    return `<label class="wide">${label}<textarea rows="3" ${data} maxlength="${attr(field.max_length||'')}" ${disabled} placeholder="${attr(field.placeholder||'')}">${escapeHtml(value??'')}</textarea>${help}</label>`;
+    return `<label class="wide">${label}<textarea rows="3" ${data} ${field.max_length?`maxlength="${attr(field.max_length)}"`:''} ${disabled} placeholder="${attr(field.placeholder||'')}">${escapeHtml(value??'')}</textarea>${help}</label>`;
   }
   if(field.control==='select'){
     const options=(field.options||[]).map(option=>`<option value="${attr(option)}" ${String(option)===String(value??'')?'selected':''}>${escapeHtml(optionLabel(option))}</option>`).join('');

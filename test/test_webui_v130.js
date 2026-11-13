@@ -300,6 +300,17 @@ async function waitReady() {
     assert.ok(!/只处理前|只取前/.test(groupsHtml));
   });
 
+  check('无上限字段不渲染空的 maxlength 属性', () => {
+    const field = CATALOG.groups.find(g => g.key === 'experimental_reference_config')
+      .fields.find(f => f.key === 'occlusion_prompt');
+    const saved = field.max_length;
+    field.max_length = 0;
+    ui.renderGroups();
+    assert.ok(!elements['config-groups'].innerHTML.includes('maxlength=""'));
+    field.max_length = saved;
+    ui.renderGroups();
+  });
+
   check('降级开启后实验组解除置灰（依赖来自快照）', () => {
     ui.state.referenceFallback.enable = true;
     ui.renderGroups();
