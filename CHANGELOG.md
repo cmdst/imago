@@ -1,6 +1,34 @@
 # 更新日志
 
+## 1.4.0 — 2026-11-15
+
+**一句话**：删掉 v1.3.0 的**实验性遮挡重试**（整组配置、运行分支、类型、Web API/WebUI 控件与产物依赖一并移除），只保留「参考图被**明确安全/内容合规拒绝**后在**该节点内**做一次识图、再用中性文字说明重试」这一条降级路径，并把重试次数改成**逐节点、可配 0..3**。
+
+### 移除
+
+- **实验性遮挡重试整体删除**：配置组 `experimental_reference_config`（6 键）、`DEFAULT_OCCLUSION_PROMPT`、`ExperimentalReferenceConfig`、`RuntimeConfig.experimental_reference`、`main.py` 的 `_occlude_references()` / `_fallback_invoke()` / `_reference_fallback()` 与相关常量、`services/scheduler.py` 的任务级末尾救援（`rescue=` 注入、`_maybe_reference_fallback()`、`fallback_locked` / `fallback_request` 全局锁）、`integrations/web_api.py` 的实验分组定义与 `occluder_ready` / `dependency_ready` 派生字段及 `experimental_without_fallback` / `occluder_unavailable` 两条保存告警、`pages/webui/app.js` 的遮挡节点下拉与实验分组渲染。
+- **产物依赖**：不再写入 `inputs/proc-*` 遮挡产物；`inputs/NN_<sha16>.<ext>` 的原始参考图落盘与识图读取不变。
+- **旧键 `max_extra_attempts`（`0..1`）**：schema、模型、配置、WebUI、WebAPI 里全部消失（不留别名），只在新版的配置迁移路径与历史文档里出现。
+
+### 变更
+
+- **触发口径收窄**：可降级的原因从 `{图片不支持, 图片无效, 安全}` 收窄为**只有明确的安全/内容合规拒绝**（`kind == "safety"` 且带结构化证据）。图片格式不支持、图片无效、纯提示词拒绝、未知原因、超时、429/401/403、5xx、网络与参数错误**都不触发**，一律按普通失败前进（零识图、零文字调用）。HTTP 状态码单独仍不构成依据；HTTP 200 响应体内的结构化业务拒绝仍可判定。
+- **作用域从任务级改为节点级**：安全拒绝后立刻在**该节点、该模型**内处理；文字阶段失败就结束本节点，**下一个节点重新带原图正常尝试**（有自己的参考图采样与关系声明）。不再有「任务首次拒绝锁」和「所有节点都失败后再整体救援」。
+- **次数语义改为逐节点总数**：`reference_fallback_config.max_retries_per_node`（`int`，默认 `1`，`0..3`）表示**该节点纯文字生成调用的总次数**（不是 N+1）。次数在发起前占用、失败也计一次，额度按节点私有、不按模型刷新；`0` = 关闭。每节点**至多识图一次**，说明只生成一次并逐字节复用。
+- **原文来源收紧**：纯文字重试只用 `_prepare()` 入口保存的**用户原文**（`task.runtime["original_user_prompt"]`，在任何人设/关系声明/自动识图改写之前写入）重建 prompt；该值不可证明时直接 `prompt_unrebuildable` 终止，**零调用**。不再从被拒请求的 prompt 里剥离关系声明——那会带上旧的人格提示、自动识图摘要与优化器产物。
+- **用户告知收紧**：`notify_user` 为真且最终成品确实来自纯文字重试时，才在结果末尾追加一句；后续节点带图成功、或任务失败/部分失败时都不追加。
+- **预算与取消**：整条降级链路共用任务原有的 `generation_timeout`（**不延长**）；进入文字阶段前要求剩余预算 ≥ `vision_timeout_seconds + 15 s 余量 + 20 s 收尾`；取消与总超时直接终止任务，按既有 `CANCELLED` / `TIMED_OUT` 结算，不新增 sleep/轮询/退避。
+- **结算不变**：降级尝试不写 `task.errors`（避免把「A 节点文字失败、B 节点成功」错判成 `PARTIAL_SUCCESS` 并给用户发「部分图片绘制失败」），不额外扣额度、不改 `usable_output_count`；`NO_OUTPUT` / `TIMED_OUT` / `FAILED` / `CANCELLED` 与退款口径一字未改；最终成品仍只做一次「增强 → 放大」。
+- **配置迁移**：升级前必须先迁移配置再换代码（核心的完整性检查会删掉 schema 之外的键）。插件启动时执行幂等迁移 `main.py::_migrate_reference_fallback_keys()`：旧键 `max_extra_attempts` → 新键 `max_retries_per_node`（clamp `0..3`）、**新键优先**、两键都无则交给默认值、`experimental_reference_config` 整组丢弃；`utf-8-sig` 保 BOM、`ensure_ascii=False` + 2 空格缩进、顶层顺序与其它组叶值逐字节保留。回滚要**代码 + 配置成对**。
+- **版本号 `1.4.0` 四处同步**（`metadata.yaml` / `__init__.py` / `main.py` 的 `@register` / `README.md` 版本行）。配置顶层组 12 → **11 个**（`reference_fallback_config` 由 5 键替换其中的次数键）。
+
+### 保留
+
+- 7 种 `api_type`（含 `xai_image` 与 `astrbot_native`）、节点启停、`custom_params` 类型化参数、`thinking` 六值、质量/尺寸、主节点（stored/effective）、密钥轮转与清空、代理、原生实际子请求计数、模型回退顺序、`inject_reference_note`、`llm_caption*`、`EXCLUDED_STATUSES` 与 `classify_rejection()` 的判定逻辑（**逐字节未改**，只改写了一处注释）、`enhance_config` 8 键与 `upscale_config` 7 键、两级图后处理与汇总日志行。
+
 ## 1.3.0 — 2026-11-14
+
+> **v1.4.0 已移除**：本节里「实验性遮挡重试」相关的能力（配置组、运行分支、类型、Web API/WebUI 控件、遮挡产物）已在 1.4.0 **整组删除**；「参考图文字降级」也已在 1.4.0 收窄为**仅安全/内容合规拒绝**触发、改为逐节点额度。以下保留 1.3.0 当时的事实，不再更新。
 
 **一句话**：选择性吸收上游 imago v1.3.x 的三项能力（xAI 图像渠道、节点启停、类型化节点参数），并单独实现与质量分离的思考控制；新增**默认关闭**的参考图文字降级与**实验性**遮挡重试，二者只在节点明确拒绝图片输入时触发，绝不放宽或绕过上游内容策略。
 

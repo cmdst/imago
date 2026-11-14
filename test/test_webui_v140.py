@@ -1,8 +1,10 @@
-"""IMAGO·FUSION v1.3.0 Web API / WebUI 专属回归（t3）。
+"""IMAGO·FUSION v1.4.0 Web API / WebUI 专属回归。
 
 覆盖双界面契约的读写形状：catalog 单一来源、三态保存、密钥不回显、类型切换、
-主节点停用语义、两个新配置组（含 t8 rev3 的拒绝后遮挡实验组）与原子性。
-另以子进程运行 ``test/test_webui_v130.js``，验证真实 ``app.js`` 的渲染与载荷。
+主节点停用语义、参考图文字降级单组（v1.4.0 起实验遮挡整组删除）与原子性；
+并以子进程运行 ``test/test_webui_v140.js``，验证真实 ``app.js`` 的渲染与载荷。
+
+v1.4.0 新增契约用例（§10.5）：T-P1..T-P5 / T-U3 / T-Y1。
 """
 
 from __future__ import annotations
@@ -21,7 +23,7 @@ from imago_fusion.core.config import load_config
 from imago_fusion.integrations.web_api import PROVIDER_FIELDS, PageAPI
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
-JS_TEST = REPO_ROOT / "test" / "test_webui_v130.js"
+JS_TEST = REPO_ROOT / "test" / "test_webui_v140.js"
 
 
 # ---------------------------------------------------------------- 夹具
@@ -131,18 +133,10 @@ def base_config():
         "optimizer_config": {"optimizer_provider_id": "", "vision_provider_id": "vision-1"},
         "reference_fallback_config": {
             "enable": False,
-            "max_extra_attempts": 1,
+            "max_retries_per_node": 1,
             "caption_max_chars": 200,
             "vision_timeout_seconds": 20,
             "notify_user": True,
-        },
-        "experimental_reference_config": {
-            "enable": False,
-            "occluder_provider_id": "",
-            "occlusion_prompt": "默认遮挡提示词。",
-            "max_images": 1,
-            "timeout_seconds": 20,
-            "caption_max_chars": 200,
         },
     }
 
@@ -231,31 +225,19 @@ class TestProvidersRead:
         assert by_value["xai_image"]["capabilities"]["quality"] == "undocumented"
         assert "quality" not in [field["key"] for field in by_value["xai_image"]["fields"]]
 
-    def test_catalog_groups_follow_rev3_and_do_not_freeze_old_experiment(self, env):
+    def test_catalog_groups_only_expose_reference_fallback(self, env):
         groups = {group["key"]: group for group in get_state(env)["catalog"]["groups"]}
-        assert set(groups) == {"reference_fallback_config", "experimental_reference_config"}
-        experimental = groups["experimental_reference_config"]
-        assert [field["key"] for field in experimental["fields"]] == [
-            "enable", "occluder_provider_id", "occlusion_prompt",
-            "max_images", "timeout_seconds", "caption_max_chars",
+        # v1.4.0：实验遮挡组整组删除，catalog 只剩参考图文字降级这一组。
+        assert set(groups) == {"reference_fallback_config"}
+        group = groups["reference_fallback_config"]
+        assert [field["key"] for field in group["fields"]] == [
+            "enable", "max_retries_per_node", "caption_max_chars",
+            "vision_timeout_seconds", "notify_user",
         ]
-        serialized = json.dumps(experimental, ensure_ascii=False)
-        for obsolete in ("occlude_mode", "occlude_strength", "max_edge"):
+        serialized = json.dumps(group, ensure_ascii=False)
+        for obsolete in ("occluder_provider_id", "occlusion_prompt", "max_images",
+                         "max_extra_attempts", "depends_on"):
             assert obsolete not in serialized
-        assert experimental["depends_on"]["payload"] == "reference_fallback"
-        assert experimental["depends_on"]["field"] == "enable"
-
-    def test_occluder_description_says_original_image_is_sent(self, env):
-        groups = {group["key"]: group for group in get_state(env)["catalog"]["groups"]}
-        description = groups["experimental_reference_config"]["description"]
-        assert "参考原图会发送给所选遮挡节点" in description
-        # FF-10：原文“额外的一次生图调用”会低估最多 max_images 笔逐图编辑。
-        assert "额外的一次生图调用" not in description
-        assert "最多 max_images" in description
-        assert "至多一次最终生成" in description
-        assert "单独计费" in description
-        assert "不外传原图" not in description
-
     def test_get_never_echoes_api_keys(self, env):
         _status, text = request(env[0])
         body = json.dumps(text, ensure_ascii=False)
@@ -310,30 +292,17 @@ class TestProvidersRead:
         main = next(item for item in state["providers"] if item["id"] == "main")
         assert main["primary_disabled"] is True
 
-    def test_groups_get_shape_and_dependency_flags(self, env):
+    def test_groups_get_shape_and_vision_flags(self, env):
         state = get_state(env)
         fallback = state["reference_fallback"]
         assert fallback["enable"] is False
-        assert fallback["max_extra_attempts"] == 1
+        assert fallback["max_retries_per_node"] == 1
         assert fallback["vision_provider_id"] == "vision-1"
         assert fallback["vision_provider_ready"] is False  # 假 context 里没有该 chat provider
-        experimental = state["experimental_reference"]
-        for key in (
-            "enable", "occluder_provider_id", "occlusion_prompt",
-            "max_images", "timeout_seconds", "caption_max_chars",
-        ):
-            assert key in experimental
-        assert experimental["dependency_ready"] is False
-        assert experimental["occluder_ready"] is False
-
-    def test_dependency_ready_requires_fallback_and_valid_occluder(self, env):
-        env[2]["reference_fallback_config"]["enable"] = True
-        env[2]["experimental_reference_config"]["enable"] = True
-        env[2]["experimental_reference_config"]["occluder_provider_id"] = "main"
-        state = get_state(env)
-        assert state["experimental_reference"]["occluder_ready"] is True
-        assert state["experimental_reference"]["dependency_ready"] is True
-
+        for obsolete in ("experimental_reference", "occluder_ready", "dependency_ready"):
+            assert obsolete not in state
+        for obsolete in ("occluder_ready", "dependency_ready", "max_extra_attempts"):
+            assert obsolete not in fallback
     def test_success_shape_duplicates_data_for_bridge_compat(self, env):
         state = get_state(env)
         assert state["ok"] is True and state["success"] is True
@@ -608,37 +577,6 @@ class TestRepairR3:
         assert env_disk[2].saved == 1
         assert env_disk[1].store.calls == []
 
-    @pytest.mark.parametrize("bad", [{"bad": True}, ["not", "text"], 42, None])
-    def test_group_text_rejects_non_string_and_keeps_old(self, env_disk, bad):
-        status, payload = save(env_disk, {"experimental_reference": {
-            "enable": True,
-            "occluder_provider_id": "main",
-            "occlusion_prompt": bad,
-        }})
-        assert status == 200, payload
-        stored = env_disk[2]["experimental_reference_config"]
-        # 该字段保留旧值，不把 dict/list 的 repr 写进配置；同请求的其它合法字段仍可保存。
-        assert stored["occlusion_prompt"] == "默认遮挡提示词。"
-        assert disk_config(env_disk)["experimental_reference_config"]["occlusion_prompt"] == "默认遮挡提示词。"
-        warns = [w for w in payload["warnings"]
-                 if w["code"] == "param_invalid_value"
-                 and str(w.get("key", "")).endswith(".occlusion_prompt")]
-        assert warns, payload["warnings"]
-
-    def test_group_text_absent_keeps_and_empty_string_clears(self, env_disk):
-        status, payload = save(env_disk, {"experimental_reference": {
-            "enable": True, "occluder_provider_id": "main",
-        }})
-        assert status == 200, payload
-        assert env_disk[2]["experimental_reference_config"]["occlusion_prompt"] == "默认遮挡提示词。"
-
-        status, payload = save(env_disk, {"experimental_reference": {
-            "enable": True, "occluder_provider_id": "main", "occlusion_prompt": "",
-        }})
-        assert status == 200, payload
-        assert env_disk[2]["experimental_reference_config"]["occlusion_prompt"] == ""
-        assert disk_config(env_disk)["experimental_reference_config"]["occlusion_prompt"] == ""
-
     def test_new_http_node_without_key_still_rejected(self, env_disk):
         before_memory = copy.deepcopy(dict(env_disk[2]))
         status, payload = save(env_disk, {"providers": [{
@@ -813,83 +751,24 @@ class TestConfigGroups:
 
     def test_fallback_group_writes_and_clamps(self, env):
         status, payload = save(env, {"reference_fallback": {
-            "enable": True, "max_extra_attempts": 9, "caption_max_chars": 999,
+            "enable": True, "max_retries_per_node": 9, "caption_max_chars": 999,
             "vision_timeout_seconds": 1, "notify_user": False,
         }})
         assert status == 200, payload
         stored = env[2]["reference_fallback_config"]
         assert stored["enable"] is True
-        assert stored["max_extra_attempts"] == 1
+        assert stored["max_retries_per_node"] == 3
         assert stored["caption_max_chars"] == 400
         assert stored["vision_timeout_seconds"] == 5
         assert stored["notify_user"] is False
         assert payload["reference_fallback"]["enable"] is True
-
+        # 旧键不再被写入，也不会因为被提交而复活。
+        assert "max_extra_attempts" not in stored
     def test_fallback_group_invalid_value_warns_and_keeps_old(self, env):
-        status, payload = save(env, {"reference_fallback": {"max_extra_attempts": "many"}})
+        status, payload = save(env, {"reference_fallback": {"max_retries_per_node": "many"}})
         assert status == 200
-        assert env[2]["reference_fallback_config"]["max_extra_attempts"] == 1
+        assert env[2]["reference_fallback_config"]["max_retries_per_node"] == 1
         assert any(w["code"] == "param_invalid_value" for w in payload["warnings"])
-
-    def test_experimental_group_round_trip_with_all_six_keys(self, env):
-        env[2]["reference_fallback_config"]["enable"] = True
-        status, payload = save(env, {"experimental_reference": {
-            "enable": True,
-            "occluder_provider_id": "main",
-            "occlusion_prompt": "挡住脸",
-            "max_images": 2,
-            "timeout_seconds": 30,
-            "caption_max_chars": 300,
-        }})
-        assert status == 200, payload
-        stored = env[2]["experimental_reference_config"]
-        assert stored["enable"] is True
-        assert stored["occluder_provider_id"] == "main"
-        assert stored["occlusion_prompt"] == "挡住脸"
-        assert stored["max_images"] == 2
-        assert stored["timeout_seconds"] == 30
-        assert stored["caption_max_chars"] == 300
-        assert payload["experimental_reference"]["dependency_ready"] is True
-
-    def test_experimental_clamps_and_truncates_prompt(self, env):
-        status, payload = save(env, {"experimental_reference": {
-            "max_images": 99, "timeout_seconds": 2, "caption_max_chars": 1000,
-            "occlusion_prompt": "长" * 600,
-        }})
-        assert status == 200, payload
-        stored = env[2]["experimental_reference_config"]
-        assert stored["max_images"] == 3
-        assert stored["timeout_seconds"] == 5
-        assert stored["caption_max_chars"] == 400
-        assert len(stored["occlusion_prompt"]) == 500
-
-    def test_occluder_must_be_enabled_and_complete(self, env):
-        env[2]["reference_fallback_config"]["enable"] = True
-        env[2]["experimental_reference_config"]["enable"] = True
-        status, payload = save(env, {"experimental_reference": {
-            "enable": True, "occluder_provider_id": "native",
-        }})
-        assert status == 200, payload
-        # native 已停用 → 字段级拒绝，保留旧值（空）
-        assert env[2]["experimental_reference_config"]["occluder_provider_id"] == ""
-        assert any(w["code"] == "param_invalid_value" for w in payload["warnings"])
-
-    def test_experimental_without_fallback_warns(self, env):
-        status, payload = save(env, {"experimental_reference": {"enable": True}})
-        assert status == 200
-        assert any(w["code"] == "experimental_without_fallback" for w in payload["warnings"])
-        assert payload["experimental_reference"]["dependency_ready"] is False
-
-    def test_disabling_occluder_node_warns_on_next_save(self, env):
-        env[2]["reference_fallback_config"]["enable"] = True
-        env[2]["experimental_reference_config"]["enable"] = True
-        env[2]["experimental_reference_config"]["occluder_provider_id"] = "main"
-        status, payload = save(env, {"providers": [{
-            "id": "main", "api_type": "openai_image", "enabled": False,
-        }]})
-        assert status == 200
-        assert any(w["code"] == "occluder_unavailable" for w in payload["warnings"])
-
     def test_group_payload_shape_must_be_object(self, env):
         status, payload = save(env, {"reference_fallback": "on"})
         assert status == 400
@@ -898,16 +777,12 @@ class TestConfigGroups:
     def test_providers_and_groups_save_in_one_atomic_request(self, env):
         status, payload = save(env, {
             "providers": [{"id": "main", "api_type": "openai_image", "enabled": True}],
-            "reference_fallback": {"enable": True},
-            "experimental_reference": {"enable": True, "occluder_provider_id": "main"},
+            "reference_fallback": {"enable": True, "max_retries_per_node": 2},
         })
         assert status == 200, payload
         assert env[2]["reference_fallback_config"]["enable"] is True
-        assert env[2]["experimental_reference_config"]["enable"] is True
-        assert payload["experimental_reference"]["dependency_ready"] is True
+        assert env[2]["reference_fallback_config"]["max_retries_per_node"] == 2
         assert env[2].saved == 1
-
-
 # ---------------------------------------------------------------- 复审修复回归（t16）
 class TestRepairFindings:
     """覆盖 t6 复审 FF-01…FF-10 的前端/接口行为（逐条对应正式报告）。"""
@@ -1139,7 +1014,7 @@ class TestWebuiAssets:
 
     def test_node_regression_suite(self, tmp_path):
         if not JS_TEST.exists():
-            pytest.fail("缺少 test/test_webui_v130.js")
+            pytest.fail("缺少 test/test_webui_v140.js")
         # 把真实 core/params.py 的 catalog 桥接给 Node，夹具偏差会直接红。
         from imago_fusion.core.params import build_catalog
 
@@ -1153,3 +1028,104 @@ class TestWebuiAssets:
         assert result.returncode == 0, result.stdout + result.stderr
         assert "桥接" in result.stdout
         assert "全部" in result.stdout
+
+
+# ---------------------------------------------------------------- v1.4.0 契约（§10.5）
+class TestV140Contract:
+    """T-P1..T-P5 / T-U3 / T-Y1：实验遮挡整组消失，只剩参考图文字降级。"""
+
+    def test_p1_snapshot_shape(self, env):
+        state = get_state(env)
+        fallback = state["reference_fallback"]
+        assert set(fallback) >= {
+            "enable", "max_retries_per_node", "caption_max_chars",
+            "vision_timeout_seconds", "notify_user",
+            "vision_provider_id", "vision_provider_ready",
+        }
+        assert state["catalog"]["groups"][0]["key"] == "reference_fallback_config"
+        for obsolete in ("experimental_reference", "occluder_ready", "dependency_ready"):
+            assert obsolete not in state
+        assert "max_extra_attempts" not in fallback
+
+    @pytest.mark.parametrize("raw,expected", [(3, 3), (4, 3), (-1, 0), ("2", 2)])
+    def test_p2_save_clamps_retry_budget(self, env, raw, expected):
+        status, payload = save(env, {"reference_fallback": {"max_retries_per_node": raw}})
+        assert status == 200, payload
+        assert env[2]["reference_fallback_config"]["max_retries_per_node"] == expected
+
+    def test_p2_bad_type_is_field_level_reject(self, env):
+        before = copy.deepcopy(dict(env[2]))
+        status, payload = save(env, {"reference_fallback": {"max_retries_per_node": {"x": 1}}})
+        assert status == 200
+        assert env[2]["reference_fallback_config"]["max_retries_per_node"] == 1
+        assert dict(env[2]) == before
+        assert any(w["code"] == "param_invalid_value" for w in payload["warnings"])
+
+    def test_p3_legacy_payload_does_not_revive_experimental_group(self, env_disk):
+        status, payload = save(env_disk, {
+            "reference_fallback": {"enable": True},
+            "experimental_reference": {"enable": True, "occluder_provider_id": "main"},
+        })
+        assert status == 200, payload
+        assert "experimental_reference_config" not in env_disk[2]
+        stored = disk_config(env_disk)
+        assert "experimental_reference_config" not in stored
+        assert "experimental_reference" not in payload
+        assert env_disk[2]["reference_fallback_config"]["enable"] is True
+
+    def test_p4_save_failure_rolls_back_memory_and_disk(self, env_disk):
+        before_memory = copy.deepcopy(dict(env_disk[2]))
+        before_disk = disk_config(env_disk)
+        env_disk[2].fail = True
+        status, payload = save(env_disk, {"reference_fallback": {"enable": True}})
+        assert status != 200
+        assert dict(env_disk[2]) == before_memory
+        assert disk_config(env_disk) == before_disk
+        assert "experimental_reference_config" not in before_memory
+
+    def test_p5_no_experimental_warnings(self, env):
+        status, payload = save(env, {
+            "providers": [{"id": "main", "api_type": "openai_image", "enabled": True}],
+            "reference_fallback": {"enable": True},
+        })
+        assert status == 200, payload
+        codes = {w["code"] for w in payload["warnings"]}
+        assert "experimental_without_fallback" not in codes
+        assert "occluder_unavailable" not in codes
+
+    def test_u3_snapshot_with_experimental_key_is_ignored(self, env):
+        from imago_fusion.integrations.web_api import GROUP_DEFS
+
+        # 旧快照（后端已删组）里多出的键不得被当作组定义，也不得进 payload。
+        assert "experimental_reference_config" not in GROUP_DEFS
+        assert set(GROUP_DEFS) == {"reference_fallback_config"}
+        status, payload = save(env, {"providers": [], "experimental_reference": {"enable": True}})
+        assert status == 200, payload
+        assert "experimental_reference" not in payload
+
+    def test_y1_schema_group_defs_and_webui_stay_in_sync(self):
+        from imago_fusion.integrations.web_api import GROUP_DEFS
+
+        schema = json.loads((REPO_ROOT / "_conf_schema.json").read_text(encoding="utf-8"))
+        definition = GROUP_DEFS["reference_fallback_config"]
+        schema_keys = set(schema["reference_fallback_config"]["items"])
+        assert schema_keys == {field["key"] for field in definition["fields"]}
+        assert schema_keys == {
+            "enable", "max_retries_per_node", "caption_max_chars",
+            "vision_timeout_seconds", "notify_user",
+        }
+        assert set(schema) == {
+            "log_with_bot_id", "providers", "optimizer_config", "quota_config",
+            "task_config", "storage_config", "reference_fallback_config",
+            "enhance_config", "upscale_config", "proxy_url", "template_override",
+        }
+        # 边界只在两处：schema 的 default 与 web_api 的 min/max。
+        items = schema["reference_fallback_config"]["items"]
+        assert items["max_retries_per_node"]["default"] == 1
+        by_key = {field["key"]: field for field in definition["fields"]}
+        assert (by_key["max_retries_per_node"]["min"], by_key["max_retries_per_node"]["max"]) == (0, 3)
+        assert (by_key["caption_max_chars"]["min"], by_key["caption_max_chars"]["max"]) == (80, 400)
+        assert (by_key["vision_timeout_seconds"]["min"], by_key["vision_timeout_seconds"]["max"]) == (5, 60)
+        app_js = (REPO_ROOT / "pages" / "webui" / "app.js").read_text(encoding="utf-8")
+        for obsolete in ("experimental", "occluder", "occlusion", "max_extra_attempts", "遮挡"):
+            assert obsolete not in app_js

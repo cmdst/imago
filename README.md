@@ -2,7 +2,7 @@
 
 IMAGO·FUSION 是 **IMAGO·映相** 骨架与 **大香蕉（astrbot_plugin_big_banana）AstrBot 原生 Provider 桥接** 的融合插件：保留映相的提示词优化、Persona 出镜、绘图额度、多节点 fallback 与素材管理，新增「走 AstrBot 已配置 Provider（反代 / 网页端模型）出图」的原生路由。
 
-- 版本：`1.3.0`（`metadata.yaml` / `__init__.py` / `main.py` 的 `@register` / 本行**四处一致**；更新内容见 `CHANGELOG.md` 顶部的 1.3.0 节）
+- 版本：`1.4.0`（`metadata.yaml` / `__init__.py` / `main.py` 的 `@register` / 本行**四处一致**；更新内容见 `CHANGELOG.md` 顶部的 1.4.0 节）
 - AstrBot：`>=4.16,<5`
 - 依赖：`aiohttp>=3.9,<4`（不引入 Pillow：插件侧不做格式转换）
 
@@ -141,6 +141,44 @@ IMAGO·FUSION 是 **IMAGO·映相** 骨架与 **大香蕉（astrbot_plugin_big_b
 这个行为现在可以在「后台任务」组里关掉：`task_config.inject_reference_note`（**bool，默认 `true` = 与 v1.1.0 逐字节相同，无需迁移**）。关闭后**两段一起消失**，最终 prompt 与优化后的画面描述**逐字节相等**——不留空行、不删既有文本（若模型自己把类似措辞写进了画面描述，那属于模型产物，本插件不负责删除，见 `core/prompting.py` 的说明）。参考图计数（`task.runtime["current_*_reference_count"]`）开关真假都照记。
 
 配置每次现算，改完不必重启插件。
+
+## 参考图文字降级（`reference_fallback_config`，默认关闭）
+
+当**某个节点**在带参考图的那次请求上被上游**明确以安全/内容合规原因拒绝**（结构化证据优先：响应体业务码、`finish_reason`、`block_reason`；HTTP 200 响应体内的业务拒绝同样算），插件可以在**该节点内**把这次被拒的参考图改写成一段中性文字说明，然后按用户原文 + 这段说明重试纯文字生成。它**不**放宽、也**不**绕过上游内容策略：原图不会再发，说明里也不许重建被拒内容。
+
+配置组 5 个键（`reference_fallback_config`）：
+
+| 键 | 默认 | 范围 | 说明 |
+| --- | --- | --- | --- |
+| `enable` | `false` | bool | 总开关。**关闭时零额外调用、零新增文件、零新增日志、零费用**（连 `task.runtime["reference_fallback"]` 都不会建）。 |
+| `max_retries_per_node` | `1` | `0..3` | 语义是**该节点纯文字生成调用的总次数**（不是「额外次数」，所以 `1` = 只重试一次，不是两次）。`0` = 关闭。次数在发起前占用，失败也计一次。 |
+| `caption_max_chars` | `200` | `80..400` | 识图说明的长度上限，与「外观摘要」的 400 字上限相互独立。 |
+| `vision_timeout_seconds` | `20` | `5..60` | 单次识图调用的上限；同时受任务剩余预算约束（见下）。 |
+| `notify_user` | `true` | bool | 最终成品**来自纯文字重试**时，在结果消息末尾追加一句说明（只追加一次、只在干净成功时追加）。 |
+
+执行口径（都在 `services/scheduler.py` 内，逐节点）：
+
+- **触发条件全部满足才算**：开关开、`max_retries_per_node >= 1`、被拒的那次请求确实带了参考图、判定结果是 `safety` 且带证据、识图 Provider 已配置且可用、参考图数量不超过识图上限（`CAPTION_MAX_IMAGES = 4`）、任务未取消、剩余预算够（`vision_timeout_seconds + 15 s 余量 + 20 s 收尾`）。
+- **不触发**：图片格式不支持、图片本身无效、纯提示词拒绝、未知原因、超时、429 限流、401/403 鉴权、5xx、网络错误、参数错误。这些一律按普通失败前进，**不产生任何识图或文字调用**。
+- **每节点至多识图一次**，说明只生成一次并在本节点内逐字节复用；**识图失败 → 该节点 0 次文字调用**（不伪造成功）。
+- **失败后的走向**：只有安全拒绝会进入文字阶段；文字阶段里的失败（含网络/超时）**不会**消耗剩余次数继续撞墙——按普通失败结束该节点，**下一个节点重新带原图正常尝试**（它有自己的参考图采样与关系声明）。
+- **预算与取消**：整条链路共用任务原有的 `generation_timeout`，**不延长**；取消或超时直接终止任务，按既有 `CANCELLED` / `TIMED_OUT` 结算。
+- **失败不写 `task.errors`**：降级只写 `task.runtime["reference_fallback"]` 与 `task.runtime["attempt_errors"]`，所以「A 节点文字重试失败、B 节点带图成功」仍是干净成功（不会变成「部分图片绘制失败」）。
+- **用户告知**：`notify_user=true` 且最终成品来自纯文字重试时，追加一句「（本次参考图未被使用：原图被内容安全策略拒绝，已改按文字描述重绘。）」；后续节点带图成功、或任务失败/部分失败时都不追加。
+
+### 从 v1.3.0 升级
+
+v1.3.0 的 `reference_fallback_config.max_extra_attempts`（`0..1`）被 `max_retries_per_node`（`0..3`）取代，**实验性遮挡相关的配置组 `experimental_reference_config` 已整组删除**（功能本身也删干净了：运行分支、类型、API、UI、产物依赖都不再存在）。
+
+**必须先迁移配置、再换代码**：新版 schema 里已经没有 `experimental_reference_config`，核心的配置完整性检查会把 schema 之外的键当作 stale 删掉。插件启动时有一个幂等的防御迁移（`main.py::_migrate_reference_fallback_keys()`）：
+
+- 有旧键 `max_extra_attempts`、没有新键 → 取值按下表转换后写入 `max_retries_per_node`（`0`/`1` 一一对应，其它值 clamp 到 `0..3`）；
+- 新键已存在 → **新键优先**，旧键只删不改；
+- 两个都没有 → 不写键（交给 schema 默认值）；
+- `experimental_reference_config` 整组丢弃；
+- 文件用 `utf-8-sig` 读、`ensure_ascii=False` + 2 空格缩进写回，**BOM 与其余所有组的叶值逐字节保留**；没有变化时不重写文件；落盘失败只在日志里留一条 warning（本次运行仍按迁移后的内存值工作）。
+
+回滚要**成对**：只回滚代码或只回滚配置都会让两侧口径不一致（旧代码读不到 `max_retries_per_node`、新代码读不到 `max_extra_attempts`）。
 
 ## 命令
 

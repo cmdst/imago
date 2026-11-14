@@ -66,42 +66,42 @@ PROVIDER_FIELDS = (
     "custom_params",
 )
 
-# 遮挡提示词的默认文案（字典 §6）；配置里存空串时由运行时回退到它。
-DEFAULT_OCCLUSION_PROMPT = (
-    "在你认为的敏感部位用滑稽表情挡住；只做不透明覆盖，不要描述或还原被遮挡内容。"
-)
-
-# 两个新配置组的展示/校验描述。字段表是 WebUI 与 Web API 的唯一形状源
+# 参考图文字降级组的展示/校验描述。字段表是 WebUI 与 Web API 的唯一形状源
 # （catalog.groups 由它生成），前端不复制任何字段名。
 GROUP_DEFS: dict[str, dict[str, Any]] = {
     "reference_fallback_config": {
         "payload": "reference_fallback",
         "label": "参考图文字降级",
         "description": (
-            "当节点明确拒绝参考图时，把完整参考图集合改写成纯文字请求重绘；技术性拒绝最多额外 1 次，"
-            "安全类拒绝直接停止；未知原因不猜测。默认关闭，关闭时不产生任何额外调用。"
+            "仅当节点**明确**以安全/内容合规原因拒绝参考图时，在该节点内改用参考图的文字说明重试"
+            "（每节点至多识图一次，最多 max_retries_per_node 次纯文字生成）；"
+            "技术性图片无效、超时、鉴权、限流、5xx、参数错误与未知原因都不触发，也绝不重建被拒内容。"
+            "默认关闭，关闭时不产生任何额外调用。"
         ),
         "fields": [
             {
                 "key": "enable",
-                "label": "参考图被拒时改走文字重绘",
+                "label": "参考图被明确安全拒绝时改走文字重绘",
                 "control": "switch",
                 "type": "bool",
                 "default": False,
                 "help": (
-                    "优先使用结构化业务证据（响应体 code / finish_reason 等，HTTP 200 响应体内的业务拒绝也算）；"
-                    "仅有状态码或文本特征时只当辅助证据；未知原因不猜测。超时、429、401 不触发。"
+                    "只认结构化的安全/内容合规拒绝证据（HTTP 200 响应体内的业务拒绝也算）；"
+                    "状态码单独不构成依据；超时、429、401/403、5xx 与纯文字拒绝都不触发。"
                 ),
             },
             {
-                "key": "max_extra_attempts",
-                "label": "每任务最多额外生成次数",
+                "key": "max_retries_per_node",
+                "label": "每个节点最多纯文字重试次数",
                 "control": "number",
                 "type": "int",
                 "default": 1,
                 "min": 0,
-                "max": 1,
-                "help": "硬上限 1；0 = 只记录拒绝事件，不再重试；安全类拒绝即使还有剩余次数也直接停止。",
+                "max": 3,
+                "help": (
+                    "语义是「该节点纯文字生成调用的总次数」（不是额外次数）："
+                    "0 = 关闭；次数在发起前占用，失败也计一次；额度按节点计，不按模型刷新。"
+                ),
             },
             {
                 "key": "caption_max_chars",
@@ -130,79 +130,6 @@ GROUP_DEFS: dict[str, dict[str, Any]] = {
                 "type": "bool",
                 "default": True,
                 "help": "默认告知，避免用户误以为参考图仍然生效。",
-            },
-        ],
-    },
-    "experimental_reference_config": {
-        "payload": "experimental_reference",
-        "label": "实验：参考图被拒后先遮挡再重绘",
-        "description": (
-            "仅在拒绝后的降级阶段生效：把本次失败尝试的完整参考图集合发给另配的遮挡编辑节点，"
-            "逐图编辑（最多 max_images 张，每笔按供应商单独计费），再对产物识图生成与遮挡图一致的描述；"
-            "随后至多一次最终生成把遮挡产物与描述提交给原目标（原目标只收到遮挡产物和描述）。"
-            "参考图数量超过上限、或遇到容量/安全限制时，按契约改纯文字或停止，不会悄悄丢弃部分参考图。"
-            "参考原图会发送给所选遮挡节点；插件不做任何本地图像处理。依赖「参考图文字降级」开启。"
-        ),
-        "depends_on": {
-            "payload": "reference_fallback",
-            "field": "enable",
-            "message": "实验遮挡依赖「参考图文字降级」：请先开启该组，实验功能才会生效。",
-        },
-        "fields": [
-            {
-                "key": "enable",
-                "label": "实验：参考图被拒后先遮挡再重绘",
-                "control": "switch",
-                "type": "bool",
-                "default": False,
-                "help": "关闭时代码路径不可达（零文件、零额外调用）；开启但降级关闭 → 不生效。",
-            },
-            {
-                "key": "occluder_provider_id",
-                "label": "遮挡编辑节点",
-                "control": "provider_select",
-                "type": "str",
-                "default": "",
-                "help": "只列「已启用且配置完整」的节点；为空、不存在或已停用时不编辑，也不猜、不换节点。",
-            },
-            {
-                "key": "occlusion_prompt",
-                "label": "遮挡提示词",
-                "control": "textarea",
-                "type": "str",
-                "default": DEFAULT_OCCLUSION_PROMPT,
-                "max_length": 500,
-                "help": "实际发送时会追加固定后缀「只输出图片，不要文字说明。」；清空 = 使用默认提示词。",
-            },
-            {
-                "key": "max_images",
-                "label": "最多处理图片数（实验成本上限）",
-                "control": "number",
-                "type": "int",
-                "default": 1,
-                "min": 1,
-                "max": 3,
-                "help": "这是实验遮挡的成本上限，不是删图许可：实际参考图数量超过该值时不调用遮挡编辑（技术性拒绝改走纯文字降级）。",
-            },
-            {
-                "key": "timeout_seconds",
-                "label": "单张遮挡编辑超时（秒）",
-                "control": "number",
-                "type": "int",
-                "default": 20,
-                "min": 5,
-                "max": 60,
-                "help": "实际取 min(本值, 任务剩余预算 - 15 秒)。",
-            },
-            {
-                "key": "caption_max_chars",
-                "label": "产物摘要长度上限（字符）",
-                "control": "number",
-                "type": "int",
-                "default": 200,
-                "min": 80,
-                "max": 400,
-                "help": "摘要只描述产物中未被遮挡的部分。",
             },
         ],
     },
@@ -615,19 +542,10 @@ class PageAPI:
         )
         fallback["vision_provider_id"] = vision_provider_id
         fallback["vision_provider_ready"] = bool(vision_provider_id and vision_provider_id in chat_ids)
-        experimental = _group_values_from(
-            self.plugin.raw_config.get("experimental_reference_config"),
-            GROUP_DEFS["experimental_reference_config"],
-        )
-        occluder = str(experimental.get("occluder_provider_id", "")).strip()
-        experimental["occluder_ready"] = bool(occluder and occluder in usable_ids)
-        # 派生：实验依赖普通降级开启；遮挡节点无效时即使开关打开也不会生效。
-        experimental["dependency_ready"] = bool(fallback.get("enable") and experimental["occluder_ready"])
         return {
             "providers": configured,
             "catalog": _catalog(),
             "reference_fallback": fallback,
-            "experimental_reference": experimental,
             "primary_provider_id": effective,
             "stored_primary_provider_id": stored_primary,
             "chat_providers": chat_providers,
@@ -1069,7 +987,7 @@ class PageAPI:
             return _err("主节点不在当前列表中", 400, code="missing_field", field="primary_provider_id")
 
         # 组配置：缺席=保留；出现=按描述表逐键写入（非法键只告警）。
-        # 遮挡节点必须是「本次保存后」已启用且配置完整的节点。
+        # 组配置可用的候选节点必须是「本次保存后」已启用且配置完整的节点。
         if saved is not None:
             group_provider_ids = {
                 entry["id"] for entry in saved if entry.get("enabled") and _provider_complete(entry)
@@ -1100,32 +1018,6 @@ class PageAPI:
                 if ok:
                     old_group[key] = value
             merged_groups[name] = old_group
-
-        fallback_group = merged_groups.get("reference_fallback_config") or dict(
-            self.plugin.raw_config.get("reference_fallback_config") or {}
-        )
-        experimental_group = merged_groups.get("experimental_reference_config") or dict(
-            self.plugin.raw_config.get("experimental_reference_config") or {}
-        )
-        fallback_on, _ = _as_bool(fallback_group.get("enable", False), False)
-        experimental_on, _ = _as_bool(experimental_group.get("enable", False), False)
-        occluder_id = str(experimental_group.get("occluder_provider_id", "")).strip()
-        if experimental_on and not fallback_on:
-            warnings.append(
-                {
-                    "code": "experimental_without_fallback",
-                    "key": "experimental_reference_config.enable",
-                    "message": "实验遮挡已保存为开启，但「参考图文字降级」未开启，本轮不会生效。",
-                }
-            )
-        if experimental_on and fallback_on and occluder_id and occluder_id not in group_provider_ids:
-            warnings.append(
-                {
-                    "code": "occluder_unavailable",
-                    "key": "experimental_reference_config.occluder_provider_id",
-                    "message": f"遮挡编辑节点「{occluder_id}」已停用或配置不完整，实验遮挡不会生效。",
-                }
-            )
 
         optimizer_present = "optimizer_provider_id" in body or "vision_provider_id" in body
         old_optimizer = dict(self.plugin.raw_config.get("optimizer_config", {}) or {})

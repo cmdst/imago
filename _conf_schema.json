@@ -332,25 +332,25 @@
   "reference_fallback_config": {
     "description": "参考图文字降级",
     "type": "object",
-    "hint": "节点明确拒绝图片输入时，用识图描述把参考图改写成文字、去掉所有图片后重绘一次；默认关闭（关闭时零附加请求、零额外费用）。依赖「Persona 副脑与识图」里的识图 Provider。",
+    "hint": "仅在节点**明确**因安全/内容合规拒绝参考图时，才把该节点的参考图改写成中性文字描述，在同一节点内按不带图片的方式重试；默认关闭（关闭时零附加请求、零额外费用）。技术性图片错误、网络、超时、鉴权、限流一律不触发。依赖「Persona 副脑与识图」里的识图 Provider。",
     "items": {
       "enable": {
         "description": "启用参考图文字降级",
         "type": "bool",
         "default": false,
-        "hint": "仅当节点明确拒绝图片输入（结构化证据或可判定的图片拒绝文本）时触发；鉴权、限流、网络、超时与未知错误一律不触发。"
+        "hint": "仅当节点明确的安全/内容合规图片拒绝（带结构化证据）时触发；图片格式不支持、图片无效、仅提示词拒绝、鉴权、限流、网络、超时与未知错误一律不触发。"
       },
-      "max_extra_attempts": {
-        "description": "额外生成次数上限",
+      "max_retries_per_node": {
+        "description": "每节点纯文字重试次数",
         "type": "int",
         "default": 1,
-        "hint": "每任务最多一次降级重绘（范围 0-1）；0 等同关闭降级。"
+        "hint": "每个节点最多发起多少次纯文字生成（范围 0-3，是总数而不是额外次数）；0 等同关闭。额度按节点私有，不随模型切换刷新；同一节点最多识图一次、摘要只生成一次。"
       },
       "caption_max_chars": {
         "description": "降级说明字数上限",
         "type": "int",
         "default": 200,
-        "hint": "参考图文字说明的总字数上限（80-400），超出按安全截断处理。"
+        "hint": "参考图文字说明的总字数上限（80-400），超出按安全截断处理；只描述中性视觉信息，不还原被拒细节。"
       },
       "vision_timeout_seconds": {
         "description": "识图超时（秒）",
@@ -362,50 +362,7 @@
         "description": "告知用户已降级",
         "type": "bool",
         "default": true,
-        "hint": "在结果末尾追加一句说明（本次参考图未被使用、已改按文字描述重绘）；不影响图片数量与顺序。"
-      }
-    }
-  },
-  "experimental_reference_config": {
-    "description": "实验：参考图遮挡重试",
-    "type": "object",
-    "hint": "实验特性，默认关闭。开启后若节点拒绝参考图，会先调用另一个节点把参考图中的敏感区域遮挡，再用遮挡后的图片与一致的文字摘要重试一次；失败则按文字降级或终止，绝不回退原图。",
-    "items": {
-      "enable": {
-        "description": "启用遮挡重试",
-        "type": "bool",
-        "default": false,
-        "hint": "需要同时开启「参考图文字降级」，并配置可用的遮挡节点与识图 Provider。"
-      },
-      "occluder_provider_id": {
-        "description": "遮挡处理节点",
-        "type": "string",
-        "default": "",
-        "hint": "用于遮挡编辑的图片节点 ID（必须存在且启用）；建议选支持图片编辑的节点。"
-      },
-      "occlusion_prompt": {
-        "description": "遮挡提示词",
-        "type": "text",
-        "default": "在你认为的敏感部位用滑稽表情挡住；只做不透明覆盖，不要描述或还原被遮挡内容。",
-        "hint": "交给遮挡节点的编辑指令（≤500 字）；不得要求恢复或描述被遮挡内容。"
-      },
-      "max_images": {
-        "description": "最多处理图片数",
-        "type": "int",
-        "default": 1,
-        "hint": "遮挡重试最多上传的参考图数（1-3）；超出容量时技术拒绝改走整组文字降级，安全拒绝直接终止。"
-      },
-      "timeout_seconds": {
-        "description": "遮挡调用超时（秒）",
-        "type": "int",
-        "default": 20,
-        "hint": "遮挡编辑单次预算（5-60），同时受任务总预算限制。"
-      },
-      "caption_max_chars": {
-        "description": "遮挡摘要字数上限",
-        "type": "int",
-        "default": 200,
-        "hint": "与遮挡产物一致的文字说明长度上限（80-400）。"
+        "hint": "当最终成品来自纯文字重试时，在结果末尾追加一句说明；不影响图片数量与顺序。"
       }
     }
   },

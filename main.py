@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import asyncio
 import base64
-from dataclasses import replace
 from datetime import datetime
 import hashlib
 import time
@@ -33,13 +32,11 @@ from .core.config import (
     load_config,
     optimizer_in_use,
     persona_provider_settings,
-    provider_complete,
     style_arg_consumed,
 )
 from .core.dedup import DEDUPE_WINDOW_SECONDS, is_duplicate_request, request_fingerprint
 from .core.errors import ConfigurationError, DuplicateRequest, QuotaError, safe_creation_error_message
 from .core.models import (
-    DEFAULT_OCCLUSION_PROMPT,
     DrawTask,
     GenerationRequest,
     ImageInput,
@@ -47,12 +44,9 @@ from .core.models import (
     TaskStage,
     TaskState,
 )
-from .core.network import detect_image_mime, fetch_reference, materialize_result
-from .core.references import (
-    CAPTION_MAX_IMAGES,
-    ReferencePlanner,
-    quoted_reply_missing_images,
-)
+from .core.network import fetch_reference, materialize_result
+from .core.references import ReferencePlanner, quoted_reply_missing_images
+
 from .core import runtime
 from .core.prompting import (
     REFERENCE_CAPTION_SYSTEM,
@@ -78,7 +72,13 @@ from .integrations.chat_memory_context import load_chat_memory_context_state
 from .integrations.web_api import PageAPI
 from .services.persona_store import PersonaStore
 from .services.quota_store import QuotaStore, terminal_refund_amount
-from .services.scheduler import TaskScheduler
+from .services.scheduler import (
+    FALLBACK_CAPTION_SYSTEM,
+    FALLBACK_NOTICE_TEXT,
+    FALLBACK_TEXT_HEADER,
+    TaskScheduler,
+    _TEXT_GUARD_SECONDS,
+)
 from .core.enhance_client import BaiduEnhancer, EnhanceState
 from .core.upscale_client import BaiduUpscaler, UpscaleState
 
@@ -90,7 +90,7 @@ PENDING_PHOTO = "📸 正在为当前人设「{persona}」拍摄，请稍后…�
 FOREGROUND_REFERENCE_TIMEOUT = 30.0
 
 
-@register("imago_fusion", "Wolfycz", "IMAGO·FUSION：映相骨架 + AstrBot 原生 Provider（反代网页端）绘图", "1.3.0")
+@register("imago_fusion", "Wolfycz", "IMAGO·FUSION：映相骨架 + AstrBot 原生 Provider（反代网页端）绘图", "1.4.0")
 class ImagoFusion(Star):
     _STAGE_LABELS = {
         TaskStage.QUEUED: "排队中",
@@ -161,8 +161,56 @@ class ImagoFusion(Star):
             except Exception:
                 logger.warning("[ImagoFusion] providers 模板键补齐已应用，但落盘失败（仅本次运行生效）")
 
+    def _migrate_reference_fallback_keys(self) -> None:
+        """v1.3.0 → v1.4.0 的降级配置迁移（幂等，只动降级组）。
+
+        必须在核心 ``check_config_integrity()`` 之前跑完：新版 ``_conf_schema.json``
+        不再声明 ``experimental_reference_config`` 组，核心会用 schema 清理活配置里
+        的"多余键"，实验组的 6 个原值一旦被清掉就无法人工核对。所以这里先在内存里
+        迁移并落盘，再让插件加载新代码：
+
+        * ``reference_fallback_config.max_extra_attempts`` → ``max_retries_per_node``
+          （旧值语义是"每任务 0..1 次额外生成"，新键语义是"每节点 0..3 次纯文字
+          生成"，``clamp(int(old), 0, 3)`` 保持"0 仍等于关闭"）；
+        * 两个键都在时**新键优先**，旧键只删不改写；
+        * ``experimental_reference_config`` 整组删除（实验遮挡功能已移除）；
+        * 其它组一个字节都不动（迁移失败也绝不落盘）。
+        """
+        raw = self.raw_config
+        if not isinstance(raw, dict):
+            return
+        fallback = raw.get("reference_fallback_config")
+        if not isinstance(fallback, dict):
+            fallback = {}
+            raw["reference_fallback_config"] = fallback
+        changed = False
+        if "max_extra_attempts" in fallback:
+            old_value = fallback.pop("max_extra_attempts")
+            changed = True
+            if "max_retries_per_node" not in fallback:
+                try:
+                    migrated = max(0, min(3, int(old_value)))
+                except (TypeError, ValueError):
+                    migrated = 1
+                fallback["max_retries_per_node"] = migrated
+        if "experimental_reference_config" in raw:
+            raw.pop("experimental_reference_config", None)
+            changed = True
+        if not changed:
+            return
+        save_fn = getattr(raw, "save_config", None)
+        if callable(save_fn):
+            try:
+                save_fn()
+            except Exception:
+                logger.warning(
+                    "[ImagoFusion] 参考图降级配置迁移已应用，但落盘失败（仅本次运行生效）"
+                )
+
     async def initialize(self):
         self._migrate_provider_template_keys()
+        # v1.4.0：降级配置迁移必须早于核心的 schema 清理（否则实验组原值被删掉）。
+        self._migrate_reference_fallback_keys()
         # 原生路线的适配器需要 context / DEBUG 日志 / Provider 失败行，这三样由插件
         # 类提供；注入到 core.runtime 容器，调度器构造适配器时保持既有签名不变。
         runtime.configure(context=self.context, debug=self._debug, error_reporter=self._provider_error)
@@ -189,7 +237,10 @@ class ImagoFusion(Star):
             self._finish_task,
             self._provider_error,
             self._scheduler_debug,
-            rescue=self._reference_fallback,
+            # v1.4.0：节点内文字降级只需要"识图"这一件外部能力；编排（闸门/额度/
+            # 逐节点隔离）全在调度器里，main 不再持有整条降级流程。
+            captioner=self._fallback_caption,
+            info=self._scheduler_info,
         )
         api = PageAPI(self)
         for route, handler, methods, desc in (
@@ -268,6 +319,17 @@ class ImagoFusion(Star):
             for value in args
         )
         self._debug(
+            self._log_prefix(task.runtime.get("source_event")) + " " + message,
+            *safe_args,
+        )
+
+    def _scheduler_info(self, task, message, *args):
+        """调度器 INFO 行（触发/结束各一条），与 DEBUG 行共用同一套脱敏与前缀。"""
+        safe_args = tuple(
+            redact_debug(value) if isinstance(value, (str, dict, list, tuple)) else value
+            for value in args
+        )
+        logger.info(
             self._log_prefix(task.runtime.get("source_event")) + " " + message,
             *safe_args,
         )
@@ -842,36 +904,16 @@ class ImagoFusion(Star):
         return caption
 
     # ------------------------------------------------------------------
-    # v1.3.0 S6：参考图降级（文字重绘 / 实验遮挡）
+    # v1.4.0：安全/内容合规拒绝后的**节点内**参考图文字降级
     # ------------------------------------------------------------------
-    # 契约 rev3.1：每任务最多一次额外生成；实验遮挡只处理「首个被拒尝试的实际
-    # 图片集合」，产物只用于本次降级上传，绝不进增强/放大、不发送给用户。
-    _FALLBACK_TEXT_HEADER = (
-        "\n\n参考图说明（图片未能上传，仅以文字说明；用户原话优先）：\n"
-    )
-    _FALLBACK_OCCLUSION_HEADER = (
-        "\n\n参考图说明（图片已做遮挡处理，遮挡部分不参与生成；用户原话优先）：\n"
-    )
-    _OCCLUSION_TEMPLATE = (
-        "用户提供了 {n} 张参考图，其中部分区域已做遮挡处理，遮挡部分不参与本次生成。"
-    )
-    _NOTICE_TEXT = "（本次参考图未被使用：所选节点不接受图片输入，已改按文字描述重绘。）"
-    _NOTICE_OCCLUDED = "（本次参考图已做遮挡处理。）"
-    _NOTICE_PREPROCESS_FAILED = "（参考图无法处理，本次已改按文字描述重绘。）"
-    _NOTICE_OCCLUSION_FAILED = "（遮挡处理失败，本次未做遮挡重绘。）"
-    # 契约 §8：任何新增步骤启动前都要留出 15 s 余量。
-    _FALLBACK_GUARD_SECONDS = 15.0
-    # 冻结后缀（BF-06）：遮挡编辑只许出图，不得附带文字说明。
-    _OCCLUSION_SUFFIX = "\n只输出图片，不要文字说明。"
-
-    @staticmethod
-    def _mime_suffix(mime_type: str) -> str:
-        return {
-            "image/png": ".png",
-            "image/jpeg": ".jpg",
-            "image/webp": ".webp",
-            "image/gif": ".gif",
-        }.get(mime_type, ".png")
+    # 编排在 ``services/scheduler.py::_text_stage``：闸门（取消/余量/识图 Provider/
+    # 容量/来源证明）、每节点额度与快照隔离都在那儿。这里只提供两样调度器拿不到的
+    # 东西：识图调用（``context.llm_generate``）与用户告知文案。文案的唯一事实源
+    # 也在调度器模块，这里只做同名镜像，避免出现第二套会漂移的文案。
+    _FALLBACK_TEXT_HEADER = FALLBACK_TEXT_HEADER
+    _NOTICE_TEXT = FALLBACK_NOTICE_TEXT
+    # 契约 §6：任何新增步骤启动前都要留出 15 s 余量（以调度器侧同名常量为准）。
+    _FALLBACK_GUARD_SECONDS = _TEXT_GUARD_SECONDS
 
     @staticmethod
     def _data_url(image: ImageInput) -> str:
@@ -879,45 +921,58 @@ class ImagoFusion(Star):
 
     @staticmethod
     def _fallback_notice(fb, text: str) -> str:
-        """BF-10：``notify_user=false`` 时任何降级/失败告知都不产生。"""
+        """``notify_user=false`` 时任何降级告知都不产生（节点内与发送前各校一次）。"""
         return text if bool(getattr(fb, "notify_user", True)) else ""
 
-    def _fallback_gate(self, task, config, target, *, need: float) -> tuple[str, float]:
-        """BF-02：重算同一任务 deadline，并检查取消 / 余量 / 节点可用性。"""
-        if task.state == TaskState.CANCELLED:
-            return "cancelled", 0.0
-        remaining = self._remaining_seconds(task, config)
-        if remaining < max(0.0, float(need)):
-            return "budget", remaining
-        if target is None or not target.enabled or not provider_complete(target):
-            return "target_disabled", remaining
-        return "", remaining
+    @staticmethod
+    def _remaining_seconds(task: DrawTask, config) -> float:
+        """同一任务共用 ``created_at + generation_timeout``，降级阶段不延长。"""
+        return float(config.generation_timeout) - (time.monotonic() - task.created_at)
 
     async def _fallback_caption(
-        self, task: DrawTask, config, prompt_text: str, image_urls: list[str],
-        *, timeout: float, max_chars: int,
+        self,
+        task: DrawTask,
+        config,
+        prompt_text: str,
+        images,
+        *,
+        timeout: float,
+        max_chars: int,
     ) -> str:
-        """识图 Provider 生成降级说明；失败返回空串（调用方决定降级/终止）。
+        """识图 Provider 生成参考图的**中性文字说明**；失败返回空串。
 
-        BF-01：降级识图**不得**沿用主链的 ``llm_retry``，必须零隐藏重试。
+        契约 §4.2/§4.5 P4 冻结的点：``request_max_retries=0``（降级链路零隐藏重试）、
+        ``system_prompt`` 用**降级专用**的 ``FALLBACK_CAPTION_SYSTEM``（§4.5，含 B1/B2
+        明文约束）；普通自动识图（``_describe_references``）仍用
+        ``REFERENCE_CAPTION_SYSTEM``，行为不变。
+
+        注意**不越权断言**：本地用例只核对发出去的 ``system_prompt``/``prompt``/
+        ``image_urls`` 与纯文字请求的 wire（无图片字段），不声称供应商模型必然遵从，
+        也不据此宣称内容安全已被证明（§4.5 B6/B7）。
+        再用任务剩余预算把单次识图夹一次，避免 ``wait_for`` 把任务拖过
+        ``generation_timeout``（调度器已按 §6 D2 预检，这是第二道守卫）。
         """
         provider_id = (config.vision_provider_id or "").strip()
-        if not provider_id or not image_urls or timeout <= 0:
+        if not provider_id or not images or timeout <= 0:
+            return ""
+        budget = self._remaining_seconds(task, config) - self._FALLBACK_GUARD_SECONDS
+        if budget <= 0:
             return ""
         try:
             result = await asyncio.wait_for(
                 self.context.llm_generate(
                     chat_provider_id=provider_id,
                     prompt=prompt_text,
-                    system_prompt=REFERENCE_CAPTION_SYSTEM,
-                    image_urls=list(image_urls),
+                    system_prompt=FALLBACK_CAPTION_SYSTEM,
+                    image_urls=[self._data_url(image) for image in images],
                     request_max_retries=0,
                 ),
-                timeout=max(1.0, timeout),
+                timeout=max(1.0, min(float(timeout), budget)),
             )
         except Exception as exc:
+            # 失败只留 DEBUG：用户侧的结算文案由 scheduler 用既有失败路径给出。
             self._debug(
-                "%s task=%s 参考图降级识图失败 type=%s",
+                "%s task=%s 参考图文字降级 识图不可用 type=%s",
                 self._log_prefix(task.runtime.get("source_event")),
                 task.id[:8],
                 type(exc).__name__,
@@ -926,296 +981,6 @@ class ImagoFusion(Star):
         return sanitize_caption(
             getattr(result, "completion_text", "") or "", max_length=max_chars,
         )
-
-    async def _occlude_references(
-        self, task: DrawTask, config, occluder, references: list[ImageInput],
-        remaining: float, stats: dict,
-    ):
-        """BF-06：按锁定顺序**逐图一次编辑**，每图恰一个真实图片产物。
-
-        只保留 ``proc-{i}.{ext}``；任何一步失败（超时/非图片字节/多产物/数量不符）
-        都返回 ``None``，绝不取前 N 张假装成功。
-        """
-        exp = config.experimental_reference
-        capacity = max(1, min(int(exp.max_images), 3))
-        selected = list(references[:capacity])
-        if not selected:
-            stats["reason"] = "no_references"
-            return None
-        directory = self.store.task_dir(task.id) / "inputs"
-        try:
-            directory.mkdir(parents=True, exist_ok=True)
-        except Exception:
-            stats["reason"] = "occlusion_failed"
-            return None
-        images: list[ImageInput] = []
-        for index, image in enumerate(selected, start=1):
-            reason, remaining = self._fallback_gate(task, config, occluder, need=self._FALLBACK_GUARD_SECONDS)
-            if reason:
-                stats["reason"] = reason
-                return None
-            timeout = min(
-                float(exp.timeout_seconds),
-                max(0.0, remaining - self._FALLBACK_GUARD_SECONDS),
-            )
-            if timeout <= 0:
-                stats["reason"] = "budget"
-                return None
-            request = GenerationRequest(
-                prompt=str(exp.occlusion_prompt or DEFAULT_OCCLUSION_PROMPT) + self._OCCLUSION_SUFFIX,
-                count=1,
-                references=(image,),
-            )
-            stats["edit_calls"] = int(stats.get("edit_calls", 0)) + 1
-            try:
-                results = await self.scheduler.invoke(occluder, request, timeout=timeout, task=task)
-            except Exception as exc:
-                logger.warning(
-                    "%s task=%s 参考图降级 失败 kind=occlusion type=%s",
-                    self._log_prefix(task.runtime.get("source_event")),
-                    task.id[:8],
-                    type(exc).__name__,
-                )
-                stats["reason"] = "occlusion_failed"
-                return None
-            if not isinstance(results, (list, tuple)) or len(results) != 1:
-                stats["reason"] = "occlusion_failed"
-                return None
-            result = results[0]
-            try:
-                value = await materialize_result(
-                    self.session,
-                    result,
-                    directory,
-                    max_bytes=config.max_upload_bytes,
-                    block_private=config.block_private_networks,
-                )
-                data = value.read_bytes()
-            except Exception:
-                stats["reason"] = "occlusion_failed"
-                return None
-            # 魔数为准：文字/HTML 等非图片字节不能冒充产物。
-            sniffed = detect_image_mime(data)
-            if not sniffed or not data or len(data) > config.max_upload_bytes:
-                stats["reason"] = "occlusion_failed"
-                return None
-            target_path = directory / f"proc-{index}{self._mime_suffix(sniffed)}"
-            try:
-                target_path.write_bytes(data)
-            except Exception:
-                stats["reason"] = "occlusion_failed"
-                return None
-            images.append(ImageInput(data, sniffed, target_path.name))
-        return images
-
-    async def _fallback_invoke(
-        self, task: DrawTask, config, target, model: str,
-        request: GenerationRequest, remaining: float,
-    ):
-        """唯一一次降级生成（BF-01/03）：异常原样上抛，交给 ``_execute`` 结算。"""
-        timeout = min(
-            float(target.timeout),
-            max(0.0, float(remaining) - self._FALLBACK_GUARD_SECONDS),
-        )
-        if timeout <= 0:
-            raise asyncio.TimeoutError
-        return await self.scheduler.invoke(
-            replace(target, model=model), request, timeout=timeout, task=task
-        )
-
-    async def _reference_fallback(self, task, config, remaining, rejection, locked):
-        """S6 执行体（rev3.1 + BF-01/02/03/06/10/11）。
-
-        顺序：校验用户原文 → 预算/取消/目标闸门 → 实验遮挡（逐图）→ 否则文字。
-        最终生成只允许一次，且在调用**前**占用额度；异常一律上抛。
-        """
-        fb = config.reference_fallback
-        exp = config.experimental_reference
-        prefix = self._log_prefix(task.runtime.get("source_event"))
-        info = {
-            "attempted": True, "mode": "", "extra_attempts": 0,
-            "vision_calls": 0, "reason": "", "captions": 0, "notice": "",
-            "occlusion": {"edit_calls": 0, "vision_calls": 0},
-        }
-        task.runtime["reference_fallback"] = info
-        kind = str(rejection.get("kind", ""))
-
-        def stop(reason: str, *, notice: str = "") -> None:
-            info["reason"] = reason
-            if notice:
-                info["notice"] = self._fallback_notice(fb, notice)
-
-        # BF-11：final prompt 只能从 prepare 入口保存的用户原文重建；拿不到就零调用。
-        original_prompt = str(locked.get("user_prompt", "") or "").strip()
-        if not original_prompt:
-            stop("prompt_unrebuildable")
-            return None
-        if int(getattr(fb, "max_extra_attempts", 0) or 0) < 1:
-            stop("disabled")
-            return None
-        target = next(
-            (item for item in config.providers if item.id == locked.get("provider_id")), None,
-        )
-        references = list(locked["request"].references)
-        if not references:
-            stop("no_references")
-            return None
-        occluder = None
-        if exp is not None and exp.enable:
-            node = next(
-                (item for item in config.providers if item.id == exp.occluder_provider_id),
-                None,
-            )
-            if node is not None and node.enabled and provider_complete(node):
-                occluder = node
-        capacity = max(1, min(int(exp.max_images), 3)) if occluder is not None else 0
-        use_occlusion = occluder is not None and len(references) <= capacity
-
-        reason, remaining = self._fallback_gate(
-            task, config, target,
-            need=(self._FALLBACK_GUARD_SECONDS if use_occlusion
-                  else float(fb.vision_timeout_seconds) + self._FALLBACK_GUARD_SECONDS + 20),
-        )
-        if reason:
-            # 容量不足仍要在失败路径给出与容量相关的告知（rev3.1 §7.3）。
-            if reason == "budget" and kind == "safety" and occluder is not None and len(references) > capacity:
-                stop("capacity_safety", notice=self._NOTICE_OCCLUSION_FAILED)
-            elif reason == "budget" and len(references) > CAPTION_MAX_IMAGES:
-                stop("capacity_over_caption", notice="（参考图数量超出降级上限，本次未改按文字重绘。）")
-            else:
-                stop(reason)
-            return None
-        logger.info(
-            "%s task=%s 参考图降级 触发 node=%s model=%s kind=%s status=%s",
-            prefix, task.id[:8], target.id, locked.get("model", ""),
-            kind, rejection.get("status"),
-        )
-
-        if use_occlusion:
-            processed = await self._occlude_references(
-                task, config, occluder, references, remaining, info["occlusion"],
-            )
-            if processed is None:
-                blocked = str(info["occlusion"].get("reason", "") or "occlusion_failed")
-                if blocked in {"cancelled", "budget", "target_disabled"}:
-                    stop(blocked)
-                    return None
-                logger.warning(
-                    "%s task=%s 参考图降级 失败 kind=occlusion", prefix, task.id[:8],
-                )
-                info["reason"] = "occlusion_failed"
-                info["notice"] = self._fallback_notice(fb, self._NOTICE_OCCLUSION_FAILED)
-                if kind == "safety":
-                    return None
-                # 技术拒绝：遮挡编辑失败 → 允许按技术拒绝规则转文字（尚未发最终生成）。
-            else:
-                reason, remaining = self._fallback_gate(
-                    task, config, target, need=self._FALLBACK_GUARD_SECONDS,
-                )
-                if reason:
-                    stop(reason)
-                    return None
-                caption_timeout = min(
-                    float(exp.timeout_seconds),
-                    max(0.0, remaining - self._FALLBACK_GUARD_SECONDS),
-                )
-                info["occlusion"]["vision_calls"] = 1
-                info["vision_calls"] = 1
-                caption = await self._fallback_caption(
-                    task, config,
-                    "描述这些已做遮挡处理的参考图里与画面生成相关的可见内容；"
-                    "遮挡区域一律不描述、不推测、不还原。",
-                    [self._data_url(image) for image in processed],
-                    timeout=caption_timeout,
-                    max_chars=int(exp.caption_max_chars),
-                )
-                if task.state == TaskState.CANCELLED:
-                    stop("cancelled")
-                    return None
-                if not caption:
-                    caption = self._OCCLUSION_TEMPLATE.format(n=len(processed))
-                reason, remaining = self._fallback_gate(
-                    task, config, target, need=self._FALLBACK_GUARD_SECONDS,
-                )
-                if reason:
-                    stop(reason)
-                    return None
-                info["captions"] = 1
-                info["mode"] = "occlusion"
-                info["notice"] = self._fallback_notice(fb, self._NOTICE_OCCLUDED)
-                request = replace(
-                    locked["request"],
-                    prompt=f"{original_prompt}{self._FALLBACK_OCCLUSION_HEADER}{caption}",
-                    references=tuple(processed),
-                )
-                info["extra_attempts"] = 1  # 调用前占用，失败也计 1
-                results = await self._fallback_invoke(
-                    task, config, target, str(locked.get("model", "")), request, remaining,
-                )
-                logger.info(
-                    "%s task=%s 参考图降级 完成 图片=%d", prefix, task.id[:8], len(results),
-                )
-                return results
-
-        if kind == "safety":
-            stop("safety_needs_occlusion")
-            return None
-        if len(references) > CAPTION_MAX_IMAGES:
-            stop("capacity_over_caption", notice="（参考图数量超出降级上限，本次未改按文字重绘。）")
-            return None
-        reason, remaining = self._fallback_gate(
-            task, config, target,
-            need=float(fb.vision_timeout_seconds) + self._FALLBACK_GUARD_SECONDS + 20,
-        )
-        if reason:
-            stop(reason)
-            return None
-        info["vision_calls"] = 1
-        caption = await self._fallback_caption(
-            task, config,
-            reference_caption_user_prompt(original_prompt),
-            [self._data_url(image) for image in references[:CAPTION_MAX_IMAGES]],
-            timeout=min(
-                float(fb.vision_timeout_seconds),
-                max(0.0, remaining - self._FALLBACK_GUARD_SECONDS),
-            ),
-            max_chars=int(fb.caption_max_chars),
-        )
-        if task.state == TaskState.CANCELLED:
-            stop("cancelled")
-            return None
-        if not caption:
-            logger.warning(
-                "%s task=%s 参考图降级 失败 kind=vision", prefix, task.id[:8],
-            )
-            stop("vision_failed")
-            return None
-        reason, remaining = self._fallback_gate(
-            task, config, target, need=self._FALLBACK_GUARD_SECONDS,
-        )
-        if reason:
-            stop(reason)
-            return None
-        info["captions"] = 1
-        info["mode"] = "text"
-        info["notice"] = self._fallback_notice(fb, self._NOTICE_TEXT)
-        request = replace(
-            locked["request"],
-            prompt=f"{original_prompt}{self._FALLBACK_TEXT_HEADER}{caption}",
-            references=(),
-        )
-        info["extra_attempts"] = 1  # 调用前占用，失败也计 1
-        results = await self._fallback_invoke(
-            task, config, target, str(locked.get("model", "")), request, remaining,
-        )
-        logger.info(
-            "%s task=%s 参考图降级 完成 图片=%d", prefix, task.id[:8], len(results),
-        )
-        return results
-
-    @staticmethod
-    def _remaining_seconds(task: DrawTask, config) -> float:
-        return float(config.generation_timeout) - (time.monotonic() - task.created_at)
 
     async def _prepare(self, task: DrawTask):
         cfg = load_config(self.raw_config)
@@ -1745,9 +1510,13 @@ class ImagoFusion(Star):
                     chain.append(Plain(caption))
                 task.runtime["caption_applied"] = True
         fallback_info = task.runtime.get("reference_fallback") or {}
-        notice = str(fallback_info.get("notice", "") or "").strip()
-        if notice:
-            # 降级/遮挡/预处理失败的用户告知：成功与失败输出路径都要出现（rev3.1 §7.3-7）。
+        notice = self._fallback_notice(
+            cfg.reference_fallback, str(fallback_info.get("notice", "") or "").strip(),
+        )
+        if notice and generation_success and not task.errors:
+            # v1.4.0 §5.3 U1/U4：只有当**最终成品来自节点内纯文字重试**且本次干净
+            # 成功时才追加告知；失败/部分失败路径不再追加（既有失败文案已足够，
+            # 也不得让用户误以为"降级成功了"）。
             chain.append(Plain(notice))
         if head:
             # 引用/@ 永远排在整条消息最前（配文与图片在其后）。

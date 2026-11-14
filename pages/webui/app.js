@@ -1,4 +1,4 @@
-/* IMAGO·FUSION v1.3.0 管理台（原生 JS，无构建步骤） */
+/* IMAGO·FUSION v1.4.0 管理台（原生 JS，无构建步骤） */
 function getBridge(){return window.AstrBotPluginPage||null}
 async function waitBridge(){for(let i=0;i<30;i++){const b=getBridge();if(b&&typeof b.ready==='function'){await b.ready();return}await new Promise(r=>setTimeout(r,100))}throw new Error('AstrBot Plugin Page Bridge 未就绪')}
 async function apiGet(endpoint,params={}){const b=getBridge();if(!b||typeof b.apiGet!=='function')throw new Error('Bridge 未就绪');return b.apiGet(endpoint,params)}
@@ -9,7 +9,7 @@ const state={
   personas:[],current:'',providers:[],primary:'',storedPrimary:'',
   primaryChosen:false,originalIds:new Set(),originalPrimary:'',
   catalog:{version:1,api_types:[],groups:[],thinking_values:[],thinking_labels:{}},
-  referenceFallback:{},experimental:{},chatProviders:[],
+  referenceFallback:{},chatProviders:[],
   optimizerProviderId:'',visionProviderId:'',
   dirty:false,quotaDirty:false,quotas:[],quotaPolicy:{},quotaSort:{key:'user_id',direction:'asc'},
   rebuilding:false,selectedReferences:new Set(),expanded:new Set(),warnings:[]
@@ -246,7 +246,7 @@ function renderWarnings(){
 }
 
 /* ---------------------------------------------------------------- 配置组（数据驱动，字段来自 catalog.groups） */
-function groupState(payload){return payload==='experimental_reference'?state.experimental:state.referenceFallback}
+function groupState(payload){const values={reference_fallback:state.referenceFallback};return values[payload]||{}}
 function groupBlocked(group){
   const depends=group.depends_on;
   if(!depends)return false;
@@ -257,7 +257,7 @@ function groupCard(group){
   const values=groupState(group.payload)||{};
   const blocked=groupBlocked(group);
   const fields=(group.fields||[]).map(field=>renderGroupField(group,field,values[field.key],blocked)).join('');
-  const defaultOff=(group.fields||[]).some(field=>field.key==='enable'&&field.default===false)||group.payload==='experimental_reference';
+  const defaultOff=(group.fields||[]).some(field=>field.key==='enable'&&field.default===false);
   const vision=group.payload==='reference_fallback'?renderFallbackVision():'';
   const dependency=blocked&&group.depends_on?`<p class="group-dependency">${escapeHtml(group.depends_on.message||'依赖未满足，实验功能不会生效。')}</p>`:'';
   const body=fields||vision?`<div class="field-grid group-fields${blocked?' is-blocked':''}">${fields}${vision}</div>`:'<p class="hint">该组暂不提供控件；后端默认关闭，不会产生任何调用。</p>';
@@ -267,25 +267,6 @@ function groupCard(group){
     ${body}
   </article>`;
 }
-function occluderCandidates(){
-  const valid=state.providers.filter(item=>item.enabled!==false&&item.complete!==false);
-  const ids=new Set(valid.map(item=>item.id));
-  const current=String((state.experimental||{}).occluder_provider_id||'');
-  if(current&&!ids.has(current)){
-    const stale=state.providers.find(item=>item.id===current);
-    if(stale)valid.push(stale);
-  }
-  return valid;
-}
-function renderOccluderSelect(field,value,disabled){
-  const options=occluderCandidates().map(item=>{
-    const usable=item.enabled!==false&&item.complete!==false;
-    return `<option value="${attr(item.id)}" ${item.id===value?'selected':''}>${escapeHtml(item.id)}${usable?'':'（不可用）'}</option>`;
-  }).join('');
-  const stale=Boolean(value)&&!state.providers.some(item=>item.id===value&&item.enabled!==false&&item.complete!==false);
-  const hint=stale?'当前遮挡节点已停用或配置不完整：保存后实验不会生效。':String(field.help||'');
-  return `<label>${escapeHtml(field.label||field.key)}<select data-group-field="${attr(field.key)}" ${disabled?'disabled':''}><option value="">未选择</option>${options}</select><span class="hint">${escapeHtml(hint)}</span></label>`;
-}
 function renderGroupField(group,field,value,blocked=false){
   const label=escapeHtml(field.label||field.key);
   const help=field.help?`<span class="hint">${escapeHtml(field.help)}</span>`:'';
@@ -293,9 +274,6 @@ function renderGroupField(group,field,value,blocked=false){
   const disabled=blocked?'disabled':'';
   if(field.control==='switch'||field.type==='bool'){
     return `<label class="check-line">${label}<input type="checkbox" ${data} ${value?'checked':''} ${disabled}>${help}</label>`;
-  }
-  if(field.control==='provider_select'){
-    return renderOccluderSelect(field,value,blocked);
   }
   if(field.control==='textarea'){
     return `<label class="wide">${label}<textarea rows="3" ${data} ${field.max_length?`maxlength="${attr(field.max_length)}"`:''} ${disabled} placeholder="${attr(field.placeholder||'')}">${escapeHtml(value??'')}</textarea>${help}</label>`;
@@ -319,7 +297,7 @@ function renderGroups(){
   const root=$('#config-groups');
   const groups=Array.isArray(state.catalog.groups)?state.catalog.groups:[];
   if(!groups.length){root.innerHTML='';return}
-  root.innerHTML=`<div class="groups-head"><p class="eyebrow">参考图策略</p><h2>普通降级与实验功能</h2><p>两组默认关闭；关闭时不产生任何额外请求、文件或费用。</p></div>${groups.map(groupCard).join('')}`;
+  root.innerHTML=`<div class="groups-head"><p class="eyebrow">参考图策略</p><h2>参考图文字降级</h2><p>仅在节点明确以安全/内容合规原因拒绝参考图时，才在该节点内改用文字说明重试；默认关闭，关闭时不产生任何额外请求、文件或费用。</p></div>${groups.map(groupCard).join('')}`;
 }
 
 /* ---------------------------------------------------------------- 节点同步与保存 */
@@ -433,12 +411,12 @@ function buildProviderPayload(){
   if(deletedIds.length)payload.deleted_provider_ids=deletedIds;
   for(const group of (state.catalog.groups||[])){
     const groupKey=group.key;
-    if(groupKey==='reference_fallback_config'||groupKey==='experimental_reference_config'){
+    if(groupKey==='reference_fallback_config'){
+      // 后端快照在这个组里附带了只读的派生字段（识图 Provider 及其可用性），
+      // 提交时必须剥掉，否则会被当成配置值写回。
       const values={...(groupState(group.payload)||{})};
       delete values.vision_provider_id;
       delete values.vision_provider_ready;
-      delete values.dependency_ready;
-      delete values.occluder_ready;
       payload[group.payload]=values;
     }
   }
@@ -501,7 +479,6 @@ function applySnapshot(result){
   state.primaryChosen=false;
   state.catalog=result.catalog||{version:1,api_types:[],groups:[],thinking_values:[],thinking_labels:{}};
   state.referenceFallback=result.reference_fallback||{};
-  state.experimental=result.experimental_reference||{};
   state.optimizerProviderId=result.optimizer_provider_id||'';
   state.visionProviderId=result.vision_provider_id||'';
   state.chatProviders=Array.isArray(result.chat_providers)?result.chat_providers:[];

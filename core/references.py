@@ -284,8 +284,9 @@ class ReferencePlanner:
 # - HTTP 状态码本身**不是**判定依据：只有 400/413/415/422 才允许走文本正则；
 #   401/403/404/429/5xx/None 在无结构化证据时永不触发；
 # - HTTP 200 的内容拒绝必须由适配器抛结构化 ``NoOutputError``（status=None）；
-# - ``safety`` 不可文字降级（只可能走实验遮挡），``unknown``/``text_rejected``
-#   同理不降级；只有 ``image_unsupported`` / ``image_invalid`` 可直接改文字重绘。
+# - v1.4.0 起降级口径收窄：只有 ``safety``（且带证据）会触发**该节点内**的
+#   中性文字重述重试；``image_unsupported`` / ``image_invalid`` / ``text_rejected`` /
+#   ``unknown`` 一律不触发，节点按普通失败继续走向下一个节点。
 CAPTION_MAX_IMAGES = 4
 REJECTION_STATUSES = frozenset({400, 413, 415, 422})
 # rev3.1：这些状态永远不触发图片降级（鉴权/限流/不存在/服务端故障）。
@@ -390,8 +391,9 @@ class RejectionVerdict:
     """一次失败尝试的拒绝判定结果。
 
     ``kind`` 取值：``image_unsupported`` / ``image_invalid`` / ``safety`` /
-    ``text_rejected`` / ``unknown``。``convertible`` 表示是否允许改文字重绘；
-    ``safety`` 只可能走实验遮挡路径。
+    ``text_rejected`` / ``unknown``。``convertible`` 是 v1.3.0 遗留的"可直接改
+    文字重绘"标记，v1.4.0 的降级判据只认 ``kind == "safety"`` 且 ``evidence``
+    非空（``services.scheduler`` 的 ``_is_safety_rejection``）。
     """
 
     kind: str = "unknown"

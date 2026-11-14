@@ -14,49 +14,37 @@ def _node(**overrides):
     return node
 
 
-class NewGroupDefaultsTests(unittest.TestCase):
-    def test_missing_groups_are_off_with_dictionary_defaults(self):
+class ReferenceFallbackDefaultsTests(unittest.TestCase):
+    def test_missing_group_is_off_with_dictionary_defaults(self):
         cfg = load_config({"providers": [_node()]})
         fb = cfg.reference_fallback
         self.assertFalse(fb.enable)
         self.assertEqual(
-            (fb.max_extra_attempts, fb.caption_max_chars, fb.vision_timeout_seconds, fb.notify_user),
+            (fb.max_retries_per_node, fb.caption_max_chars, fb.vision_timeout_seconds,
+             fb.notify_user),
             (1, 200, 20, True),
         )
-        exp = cfg.experimental_reference
-        self.assertFalse(exp.enable)
-        self.assertEqual(exp.occluder_provider_id, "")
-        self.assertIn("滑稽表情", exp.occlusion_prompt)
-        self.assertEqual(
-            (exp.max_images, exp.timeout_seconds, exp.caption_max_chars), (1, 20, 200),
-        )
 
-    def test_groups_are_clamped(self):
+    def test_group_is_clamped(self):
         cfg = load_config({
             "providers": [_node()],
             "reference_fallback_config": {
-                "enable": True, "max_extra_attempts": 9, "caption_max_chars": 10,
+                "enable": True, "max_retries_per_node": 9, "caption_max_chars": 10,
                 "vision_timeout_seconds": 999, "notify_user": False,
             },
-            "experimental_reference_config": {
-                "enable": True, "max_images": 99, "timeout_seconds": 1,
-                "caption_max_chars": 9999,
-            },
         })
-        self.assertEqual(cfg.reference_fallback.max_extra_attempts, 1)
+        self.assertEqual(cfg.reference_fallback.max_retries_per_node, 3)
         self.assertEqual(cfg.reference_fallback.caption_max_chars, 80)
         self.assertEqual(cfg.reference_fallback.vision_timeout_seconds, 60)
         self.assertFalse(cfg.reference_fallback.notify_user)
-        self.assertEqual(cfg.experimental_reference.max_images, 3)
-        self.assertEqual(cfg.experimental_reference.timeout_seconds, 5)
-        self.assertEqual(cfg.experimental_reference.caption_max_chars, 400)
 
-    def test_occlusion_prompt_is_truncated_to_500(self):
-        cfg = load_config({
-            "providers": [_node()],
-            "experimental_reference_config": {"occlusion_prompt": "x" * 900},
-        })
-        self.assertEqual(len(cfg.experimental_reference.occlusion_prompt), 500)
+    def test_retries_clamp_bounds_and_strings(self):
+        for raw, expected in ((-1, 0), (0, 0), ("2", 2), (4, 3), (None, 1)):
+            cfg = load_config({
+                "providers": [_node()],
+                "reference_fallback_config": {"max_retries_per_node": raw},
+            })
+            self.assertEqual(cfg.reference_fallback.max_retries_per_node, expected, raw)
 
 
 class ProviderNewKeyTests(unittest.TestCase):

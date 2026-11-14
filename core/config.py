@@ -4,9 +4,7 @@ from collections.abc import Mapping
 from typing import Any
 
 from .models import (
-    DEFAULT_OCCLUSION_PROMPT,
     EnhanceConfig,
-    ExperimentalReferenceConfig,
     ProviderConfig,
     QuotaConfig,
     ReferenceFallbackConfig,
@@ -212,7 +210,6 @@ def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
     enhance_raw = raw.get("enhance_config", {}) or {}
     upscale_raw = raw.get("upscale_config", {}) or {}
     reference_fallback_raw = raw.get("reference_fallback_config", {}) or {}
-    experimental_raw = raw.get("experimental_reference_config", {}) or {}
     style = _style(optimizer.get("optimizer_style", "default(通用)"))
     checkin_min = max(0, int(quota_raw.get("daily_checkin_quota_min", 1) or 0))
     checkin_max = max(checkin_min, int(quota_raw.get("daily_checkin_quota_max", 3) or 0))
@@ -284,10 +281,13 @@ def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
         ),
         # 参考图文字降级（`reference_fallback_config`，5 键，默认关闭）：关闭时
         # 与 v1.2.0 逐字节等价，不产生任何额外请求/文件/费用（契约 F6）。
+        # v1.4.0：`max_retries_per_node` 是**每节点**纯文字调用总数（0..3），
+        # 语义不是"N 次额外"；0 等同关闭。历史键名已移除，一次性迁移见
+        # `main._migrate_reference_fallback_keys`。
         reference_fallback=ReferenceFallbackConfig(
             enable=bool(reference_fallback_raw.get("enable", False)),
-            max_extra_attempts=max(
-                0, min(1, _int_or_default(reference_fallback_raw.get("max_extra_attempts"), 1)),
+            max_retries_per_node=max(
+                0, min(3, _int_or_default(reference_fallback_raw.get("max_retries_per_node"), 1)),
             ),
             caption_max_chars=max(
                 80, min(400, _int_or_default(reference_fallback_raw.get("caption_max_chars"), 200)),
@@ -296,22 +296,6 @@ def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
                 5, min(60, _int_or_default(reference_fallback_raw.get("vision_timeout_seconds"), 20)),
             ),
             notify_user=bool(reference_fallback_raw.get("notify_user", True)),
-        ),
-        # 实验遮挡（`experimental_reference_config`，6 键，默认关闭，t8 rev3）：
-        # 只影响降级阶段；降级关闭时本组不生效。依赖 occluder_provider_id 指向一个
-        # 存在、启用且完整的节点，缺失时实验路径整体跳过。
-        experimental_reference=ExperimentalReferenceConfig(
-            enable=bool(experimental_raw.get("enable", False)),
-            occluder_provider_id=str(experimental_raw.get("occluder_provider_id", "")).strip(),
-            occlusion_prompt=(
-                str(experimental_raw.get("occlusion_prompt", "") or "").strip()
-                or DEFAULT_OCCLUSION_PROMPT
-            )[:500],
-            max_images=max(1, min(3, _int_or_default(experimental_raw.get("max_images"), 1))),
-            timeout_seconds=max(5, min(60, _int_or_default(experimental_raw.get("timeout_seconds"), 20))),
-            caption_max_chars=max(
-                80, min(400, _int_or_default(experimental_raw.get("caption_max_chars"), 200)),
-            ),
         ),
     )
 

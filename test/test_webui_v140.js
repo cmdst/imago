@@ -1,10 +1,12 @@
 #!/usr/bin/env node
 /**
- * IMAGO·FUSION v1.3.0 管理台前端回归（无第三方依赖）。
+ * IMAGO·FUSION v1.4.0 管理台前端回归（无第三方依赖）。
  *
  * 用 Node 内置 `vm` 载入真实的 `pages/webui/app.js`，配一个最小 DOM 桩与假 Bridge，
  * 断言“字段表从 catalog 来、保存载荷无损、停用/主节点/参数错误/移动端样式”等行为。
- * 由 `test/test_webui_v130.py` 以子进程调用，也可单独运行：`node test/test_webui_v130.js`。
+ * 由 `test/test_v140_webui.py` 以子进程调用，也可单独运行：`node test/test_webui_v140.js`。
+ * v1.4.0 起实验遮挡整组删除：这里只留「参考图文字降级」单组的数据驱动渲染、
+ * 保存载荷与旧快照兼容（T-U1..T-U3/T-Y1）。
  */
 'use strict';
 
@@ -145,20 +147,14 @@ const CATALOG = {
   thinking_values: ['', 'off', 'low', 'medium', 'high', 'max'],
   thinking_labels: { '': '跟随默认（不发送）', off: '关闭', low: '低', medium: '中', high: '高', max: '最高（协议支持时映射到 xhigh）' },
   groups: [
-    { key: 'reference_fallback_config', payload: 'reference_fallback', label: '参考图文字降级', description: '被拒时改走文字', fields: [
-      { key: 'enable', label: '启用降级', control: 'switch', type: 'bool', default: false, help: '默认关闭' },
-      { key: 'max_extra_attempts', label: '额外次数', control: 'number', type: 'int', default: 1, min: 0, max: 1, help: '0..1' },
-      { key: 'caption_max_chars', label: '描述长度', control: 'number', type: 'int', default: 200, min: 80, max: 400, help: '80..400' }
-    ] },
-    { key: 'experimental_reference_config', payload: 'experimental_reference', label: '实验：参考图被拒后先遮挡再重绘',
-      description: '拒绝后的降级阶段会把参考原图发给遮挡节点；向原目标只提交遮挡产物和对应描述。', depends_on: { payload: 'reference_fallback', field: 'enable', message: '实验遮挡依赖「参考图文字降级」：请先开启该组，实验功能才会生效。' },
+    { key: 'reference_fallback_config', payload: 'reference_fallback', label: '参考图文字降级',
+      description: '仅在节点明确以安全/内容合规原因拒绝参考图时，才在该节点内改用文字说明重试。',
       fields: [
-        { key: 'enable', label: '实验：参考图被拒后先遮挡再重绘', control: 'switch', type: 'bool', default: false, help: '关闭时代码路径不可达' },
-        { key: 'occluder_provider_id', label: '遮挡编辑节点', control: 'provider_select', type: 'str', default: '', help: '只列已启用且配置完整的节点' },
-        { key: 'occlusion_prompt', label: '遮挡提示词', control: 'textarea', type: 'str', default: '在你认为的敏感部位用滑稽表情挡住；只做不透明覆盖，不要描述或还原被遮挡内容。', max_length: 500, help: '实际发送追加固定后缀' },
-        { key: 'max_images', label: '最多处理图片数（实验成本上限）', control: 'number', type: 'int', default: 1, min: 1, max: 3, help: '超过该值不调用遮挡编辑，不是删图许可' },
-        { key: 'timeout_seconds', label: '单张遮挡编辑超时（秒）', control: 'number', type: 'int', default: 20, min: 5, max: 60, help: 'min(本值, 剩余预算-15)' },
-        { key: 'caption_max_chars', label: '产物摘要长度上限（字符）', control: 'number', type: 'int', default: 200, min: 80, max: 400, help: '只描述未被遮挡部分' }
+        { key: 'enable', label: '启用文字降级', control: 'switch', type: 'bool', default: false, help: '默认关闭' },
+        { key: 'max_retries_per_node', label: '每节点文字生成次数', control: 'number', type: 'int', default: 1, min: 0, max: 3, help: '0..3，0 关闭' },
+        { key: 'caption_max_chars', label: '描述长度上限', control: 'number', type: 'int', default: 200, min: 80, max: 400, help: '80..400' },
+        { key: 'vision_timeout_seconds', label: '识图超时（秒）', control: 'number', type: 'int', default: 20, min: 5, max: 60, help: '5..60' },
+        { key: 'notify_user', label: '向用户说明', control: 'switch', type: 'bool', default: true, help: '告知已改用文字说明重绘' }
       ] }
   ]
 };
@@ -179,8 +175,7 @@ const SNAPSHOT = {
       enable_proxy: false, fallback_order: 1, complete: true, primary: false, primary_disabled: true }
   ],
   catalog: CATALOG,
-  reference_fallback: { enable: false, max_extra_attempts: 1, caption_max_chars: 200, vision_timeout_seconds: 20, notify_user: true, vision_provider_id: '', vision_provider_ready: false },
-  experimental_reference: { enable: false, occluder_provider_id: '', occlusion_prompt: '在你认为的敏感部位用滑稽表情挡住；只做不透明覆盖，不要描述或还原被遮挡内容。', max_images: 1, timeout_seconds: 20, caption_max_chars: 200, dependency_ready: false, occluder_ready: false },
+  reference_fallback: { enable: false, max_retries_per_node: 1, caption_max_chars: 200, vision_timeout_seconds: 20, notify_user: true, vision_provider_id: '', vision_provider_ready: false },
   primary_provider_id: 'main',
   stored_primary_provider_id: 'old<主>',
   chat_providers: [], optimizer_provider_id: '', vision_provider_id: ''
@@ -321,66 +316,25 @@ async function waitReady() {
     assert.ok(!html.includes('old<主>'));
   });
 
-  check('普通降级组按 catalog 渲染', () => {
+  check('降级组按 catalog 渲染出 5 个控件（T-U1）', () => {
     assert.ok(groupsHtml.includes('参考图文字降级'));
-    assert.ok(groupsHtml.includes('data-group-field="enable"'));
-    assert.ok(groupsHtml.includes('data-group-field="max_extra_attempts"'));
+    ['enable', 'max_retries_per_node', 'caption_max_chars', 'vision_timeout_seconds', 'notify_user']
+      .forEach(key => assert.ok(groupsHtml.includes('data-group-field="' + key + '"'), key));
     assert.ok(groupsHtml.includes('默认关闭'));
+    // 实验面彻底消失：没有遮挡节点下拉、没有遮挡文案。
+    assert.ok(!groupsHtml.includes('occluder_provider_id'));
+    assert.ok(!groupsHtml.includes('occlusion_prompt'));
+    assert.ok(!groupsHtml.includes('实验'));
+    assert.ok(!groupsHtml.includes('遮挡'));
   });
 
-  check('实验组六键渲染；降级关闭时置灰并给出依赖提示', () => {
-    assert.ok(groupsHtml.includes('实验：参考图被拒后先遮挡再重绘'));
-    assert.ok(groupsHtml.includes('data-group-field="occluder_provider_id"'));
-    assert.ok(groupsHtml.includes('data-group-field="occlusion_prompt"'));
-    assert.ok(groupsHtml.includes('data-group-field="max_images"'));
-    assert.ok(groupsHtml.includes('data-group-field="timeout_seconds"'));
-    assert.ok(groupsHtml.includes('data-group-field="caption_max_chars"'));
-    assert.ok(groupsHtml.includes('实验遮挡依赖「参考图文字降级」'));
-    assert.ok(groupsHtml.includes('class="card config-card is-blocked"'));
-    assert.ok(groupsHtml.includes('data-group-field="enable" type="checkbox"  disabled'.replace('  ', ' ')) || groupsHtml.includes('disabled'));
-    assert.ok(!groupsHtml.includes('只取失败尝试'));
-    assert.ok(!groupsHtml.includes('不外传原图'));
-    assert.ok(groupsHtml.includes('会把参考原图发给'));
-    assert.ok(groupsHtml.includes('实验成本上限'));
-    assert.ok(!groupsHtml.includes('丢弃'));
-    assert.ok(!/只处理前|只取前/.test(groupsHtml));
-  });
 
   check('无上限字段不渲染空的 maxlength 属性', () => {
-    const field = CATALOG.groups.find(g => g.key === 'experimental_reference_config')
-      .fields.find(f => f.key === 'occlusion_prompt');
-    const saved = field.max_length;
-    field.max_length = 0;
     ui.renderGroups();
     assert.ok(!elements['config-groups'].innerHTML.includes('maxlength=""'));
-    field.max_length = saved;
-    ui.renderGroups();
   });
 
-  check('降级开启后实验组解除置灰（依赖来自快照）', () => {
-    ui.state.referenceFallback.enable = true;
-    ui.renderGroups();
-    const enabled = elements['config-groups'].innerHTML;
-    assert.ok(!enabled.includes('card config-card is-blocked'));
-    assert.ok(!enabled.includes('disabled'));
-    assert.ok(enabled.includes('data-group-field="occluder_provider_id"'));
-  });
 
-  check('遮挡节点下拉只列启用且完整的节点，并标出失效的已选值', () => {
-    ui.state.experimental.occluder_provider_id = 'old<主>';
-    ui.renderGroups();
-    const select = elements['config-groups'].innerHTML.match(/<select data-group-field="occluder_provider_id"[^>]*>([\s\S]*?)<\/select>/)[0];
-    assert.ok(select.includes('value="main"'));
-    assert.ok(select.includes('value="old&lt;主&gt;"'));
-    assert.ok(select.includes('（不可用）'));
-    assert.ok(elements['config-groups'].innerHTML.includes('当前遮挡节点已停用或配置不完整'));
-    ui.state.providers[1].enabled = true;
-    ui.renderGroups();
-    assert.ok(!elements['config-groups'].innerHTML.includes('（不可用）'));
-    ui.state.providers[1].enabled = false;
-    ui.state.experimental.occluder_provider_id = '';
-    ui.renderGroups();
-  });
 
   check('新接口类型无需改前端即可出现（catalog 驱动）', () => {
     const extended = JSON.parse(JSON.stringify(CATALOG));
@@ -415,33 +369,16 @@ async function waitReady() {
     assert.strictEqual(entry.stream, false);
   });
 
-  check('保存载荷的降级组不带只读依赖字段', () => {
+  check('保存载荷只有降级组 5 键且不含只读字段（T-U2）', () => {
     const payload = ui.buildProviderPayload();
-    assert.strictEqual(JSON.stringify(Object.keys(payload.reference_fallback).sort()), JSON.stringify(['caption_max_chars', 'enable', 'max_extra_attempts', 'notify_user', 'vision_timeout_seconds']));
+    assert.strictEqual(JSON.stringify(Object.keys(payload.reference_fallback).sort()),
+      JSON.stringify(['caption_max_chars', 'enable', 'max_retries_per_node', 'notify_user', 'vision_timeout_seconds']));
+    assert.ok(!('vision_provider_id' in payload.reference_fallback));
+    assert.ok(!('vision_provider_ready' in payload.reference_fallback));
+    assert.ok(!('experimental_reference' in payload));
   });
 
-  check('保存载荷的实验组含六键且不含派生字段', () => {
-    const payload = ui.buildProviderPayload();
-    assert.strictEqual(JSON.stringify(Object.keys(payload.experimental_reference).sort()), JSON.stringify(['caption_max_chars', 'enable', 'max_images', 'occluder_provider_id', 'occlusion_prompt', 'timeout_seconds']));
-    assert.ok(!('dependency_ready' in payload.experimental_reference));
-    assert.ok(!('occluder_ready' in payload.experimental_reference));
-  });
 
-  check('改实验开关会标脏并同步组状态', () => {
-    const card = makeElement('article');
-    card.dataset.payload = 'experimental_reference';
-    const target = makeElement('input');
-    target.dataset.groupField = 'enable';
-    target.type = 'checkbox';
-    target.checked = true;
-    target.closest = selector => selector === '[data-payload]' ? card : null;
-    ui.syncGroupField(target);
-    assert.strictEqual(ui.state.experimental.enable, true);
-    assert.strictEqual(ui.state.dirty, true);
-    assert.strictEqual(ui.buildProviderPayload().experimental_reference.enable, true);
-    ui.state.experimental.enable = false;
-    ui.renderGroups();
-  });
 
   check('改动字段会标脏并更新 payload', () => {
     const nodeElement = makeElement('article');
