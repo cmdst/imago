@@ -162,29 +162,39 @@ class ImagoFusion(Star):
                 logger.warning("[ImagoFusion] providers 模板键补齐已应用，但落盘失败（仅本次运行生效）")
 
     def _migrate_reference_fallback_keys(self) -> None:
-        """v1.3.0 → v1.4.0 的降级配置迁移（幂等，只动降级组）。
+        """v1.3.0 → v1.4.0 降级配置的**安全网**（幂等，只动降级组与实验组）。
 
-        必须在核心 ``check_config_integrity()`` 之前跑完：新版 ``_conf_schema.json``
-        不再声明 ``experimental_reference_config`` 组，核心会用 schema 清理活配置里
-        的"多余键"，实验组的 6 个原值一旦被清掉就无法人工核对。所以这里先在内存里
-        迁移并落盘，再让插件加载新代码：
+        这是兜底，不能替代部署前迁移：正式升级必须先按契约 §7.3 在**换代码之前**
+        完成"备份 → 迁移 → 校验 → 换代码 → 重载"。本方法在 ``initialize()`` 里调用，
+        而插件 ``initialize()`` 必然发生在核心 ``check_config_integrity()`` 之后，
+        届时新版 ``_conf_schema.json`` 之外的键（``experimental_reference_config``
+        整组、``max_extra_attempts``）很可能已被核心当作 stale 键删掉——删掉的值
+        这里不可能找回来。因此它只处理"核心尚未清理"或"用户手工改过配置"的残余情形。
+
+        只做三件事，且只对**已存在**的组生效：
 
         * ``reference_fallback_config.max_extra_attempts`` → ``max_retries_per_node``
           （旧值语义是"每任务 0..1 次额外生成"，新键语义是"每节点 0..3 次纯文字
-          生成"，``clamp(int(old), 0, 3)`` 保持"0 仍等于关闭"）；
-        * 两个键都在时**新键优先**，旧键只删不改写；
-        * ``experimental_reference_config`` 整组删除（实验遮挡功能已移除）；
-        * 其它组一个字节都不动（迁移失败也绝不落盘）。
+          生成"，``clamp(int(old), 0, 3)`` 保持"0 仍等于关闭"）；两个键都在时
+          **新键优先**，旧键只删不改写；
+        * ``experimental_reference_config`` 整组删除（实验遮挡功能已移除），该删除
+          与降级组是否存在、是否为 dict 无关；
+        * 组缺失就保持缺失、组不是 dict 就保持原值并只记一条 warning —— 绝不凭空
+          建组、绝不覆盖为 ``{}``（§7.3.1 M6）。
+
+        其它组一个字节都不动；没有真实改动时既不落盘也不告警。
         """
         raw = self.raw_config
         if not isinstance(raw, dict):
             return
-        fallback = raw.get("reference_fallback_config")
-        if not isinstance(fallback, dict):
-            fallback = {}
-            raw["reference_fallback_config"] = fallback
         changed = False
-        if "max_extra_attempts" in fallback:
+        fallback = raw.get("reference_fallback_config")
+        if "reference_fallback_config" in raw and not isinstance(fallback, dict):
+            # 组存在但不是对象：保持原值不动（不建组、不覆盖），只留一条告警。
+            logger.warning(
+                "[ImagoFusion] reference_fallback_config 不是对象，已跳过降级键迁移（保持原值不动）。"
+            )
+        elif isinstance(fallback, dict) and "max_extra_attempts" in fallback:
             old_value = fallback.pop("max_extra_attempts")
             changed = True
             if "max_retries_per_node" not in fallback:
@@ -209,7 +219,8 @@ class ImagoFusion(Star):
 
     async def initialize(self):
         self._migrate_provider_template_keys()
-        # v1.4.0：降级配置迁移必须早于核心的 schema 清理（否则实验组原值被删掉）。
+        # v1.4.0：降级配置的安全网（见方法 docstring——它跑在核心 schema 清理之后，
+        # 只兜住残余旧键；正式升级仍必须先做部署前迁移）。
         self._migrate_reference_fallback_keys()
         # 原生路线的适配器需要 context / DEBUG 日志 / Provider 失败行，这三样由插件
         # 类提供；注入到 core.runtime 容器，调度器构造适配器时保持既有签名不变。

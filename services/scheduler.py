@@ -601,8 +601,12 @@ class TaskScheduler:
             if task.state == TaskState.CANCELLED:
                 raise asyncio.CancelledError()
             remaining = deadline - time.monotonic()
-            if remaining <= 0:
-                # 总预算耗尽＝整个任务 TIMED_OUT，异常向外传播（不写 reason）。
+            if remaining <= _TEXT_GUARD_SECONDS:
+                # 契约 §6 D2/D6：发起纯文字调用前至少要有 ``_TEXT_GUARD_SECONDS``（15s）
+                # 余量，否则这次调用几乎必然被总 deadline 打断。此处把总超时**直接**
+                # 向外传播（由 ``_execute`` 落 TIMED_OUT），不占文字调用次数、不写节点
+                # 的 outcome/reason、也不去下一个节点。注意这不是"单次 provider 超时"：
+                # 后者仍按既有规则只结束本节点。
                 raise asyncio.TimeoutError("参考图文字降级预算已用尽")
             # 额度在**发起前**占用：该次调用即使失败/超时也不再赠送（X3）。
             text_attempts += 1
@@ -673,11 +677,15 @@ class TaskScheduler:
                 self.logger(attempt, exc, task)
                 if self._is_safety_rejection(
                     classify_rejection(exc, api_type=attempt.api_type, model=model)
-                ) and number < per_node:
-                    # 纯文字请求**又一次**被判定为安全/内容合规拒绝：还有次数就再试，
-                    # 但不会重新识图（摘要已冻结），也不回本节点其它模型。
-                    continue
-                # 其余失败（网络/鉴权/限流/5xx/参数/单次超时）立即结束本阶段，
+                ):
+                    # 纯文字请求**又一次**被判定为安全/内容合规拒绝：还有次数就再试
+                    # （不重新识图，摘要已冻结，也不回本节点其它模型）；次数用尽的
+                    # 最后一次也是安全拒绝 ⇒ 停在 ``exhausted``（§4.2 X2 / §8.2 E2），
+                    # 不是 ``text_failed``——后者只留给非安全失败。
+                    if number < per_node:
+                        continue
+                    break
+                # 其余失败（网络/鉴权/限流/5xx/参数/单次 provider 超时）立即结束本阶段，
                 # 下一个节点重新带原图尝试；不消耗剩余次数反复撞墙（§4.2 X4）。
                 stop_reason = "text_failed"
                 break

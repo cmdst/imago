@@ -205,9 +205,9 @@ class TextFallbackTests(unittest.IsolatedAsyncioTestCase):
         # 每个节点各自识图一次：A 一次，B 没有安全拒绝所以不再识图。
         self.assertEqual(len(self.captioner.calls), 1)
         info = task.runtime["reference_fallback"]
-        # 文字阶段是"非安全失败"（400 参数/内容双关也算非安全证据），
-        # 按 §4.2 X4 记为 text_failed 并结束本节点，不再消耗剩余次数。
-        self.assertEqual([node["outcome"] for node in info["nodes"]], ["text_failed"])
+        # N=1：纯文字那一次**仍然**是安全拒绝，次数用尽 ⇒ exhausted（不是 text_failed），
+        # 本节点照样结束，B 重新带图（t4/F1 回归口径）。
+        self.assertEqual([node["outcome"] for node in info["nodes"]], ["exhausted"])
 
     # ---------------------------------------------------------------- T-S3
     async def test_quota_three_gives_exactly_three_text_calls(self):
@@ -232,6 +232,10 @@ class TextFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(info["text_attempts"], 3)
         self.assertEqual(info["extra_attempts"], 3)
         self.assertEqual(len(self.captioner.calls), 1)
+        # t4/F1 回归：3 次全为可靠安全拒绝 ⇒ 额度用尽，节点终止原因是 exhausted，
+        # 不是 text_failed（后者只留给非安全失败，见 T-S26）。
+        self.assertEqual([node["outcome"] for node in info["nodes"]], ["exhausted"])
+        self.assertEqual(info["nodes"][0]["reason"], "exhausted")
 
     # ---------------------------------------------------------------- T-S4
     async def test_quota_one_gives_exactly_one_text_call(self):
@@ -664,6 +668,44 @@ class TextFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(info["text_attempts"], 0)
         self.assertEqual(info.get("nodes", []), [])
         self.assertEqual(_Adapter.calls, [])
+
+    # ---------------------------------------------------------------- T-S28
+    async def test_guard_blocks_text_call_and_task_ends_timed_out(self):
+        """t4/F2 回归：余量 ≤ ``_TEXT_GUARD_SECONDS`` 时不发起纯文字，整个任务 TIMED_OUT。
+
+        与 T-S27 的区别：这里走**真实** ``_execute``，断言终态结算落在 TIMED_OUT，
+        而不是只在 ``_text_stage`` 层看到异常。
+        """
+        clock = {"now": 1000.0}
+        advancing = _Captioner(text="一名短发女性", on_call=lambda: clock.update(now=1290.0))
+
+        def behaviour(config, request, key, index):
+            raise self._safety()
+
+        _Adapter.behaviour = behaviour
+        runtime = _runtime(
+            providers=(_provider(),),
+            generation_timeout=300,
+            reference_fallback=ReferenceFallbackConfig(
+                enable=True, max_retries_per_node=2, vision_timeout_seconds=5,
+            ),
+        )
+        scheduler = self._scheduler(runtime, captioner=advancing)
+        task = self._task()
+        task.created_at = clock["now"]
+        try:
+            with mock.patch.object(scheduler_module.time, "monotonic", lambda: clock["now"]):
+                await scheduler._execute(task)
+        finally:
+            await scheduler.close()
+        # 只发起过一次带图请求；识图发生一次，但余量跌到 10s ⇒ 一次纯文字都不发起。
+        self.assertEqual([call[2] for call in _Adapter.calls], [1])
+        info = task.runtime["reference_fallback"]
+        self.assertEqual(info["vision_calls"], 1)
+        self.assertEqual(info["text_attempts"], 0)
+        self.assertEqual(info.get("nodes", []), [])
+        # 总预算不足直接向外传播：任务 TIMED_OUT，既不换下一个节点也不写节点 reason。
+        self.assertEqual(task.state, TaskState.TIMED_OUT)
 
     # ---------------------------------------------------------------- T-S26
     async def test_non_safety_text_failure_stops_even_with_quota_left(self):

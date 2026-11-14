@@ -4,7 +4,8 @@
 - schema 只剩 11 组 / 降级组 5 键 / 默认值 1；
 - ``load_config`` 的钳制（缺省、4、-1、"2"、None）；
 - 类型面彻底删掉实验遮挡配置与旧次数键；
-- 迁移的新键优先、幂等、无键不捏造、BOM 与其余组不动、落盘失败只 warning。
+- 迁移的新键优先、幂等、无键不捏造、组缺失/非 dict 不改写、BOM 与其余组不动、
+  落盘失败只 warning。
 """
 
 from __future__ import annotations
@@ -205,3 +206,78 @@ class MigrationTests(unittest.TestCase):
         with mock.patch("builtins.open", side_effect=AssertionError("no file IO")):
             plugin._migrate_reference_fallback_keys()
         self.assertEqual(raw[GROUP][NEW_KEY], 2)
+
+
+EXPERIMENTAL = "experimental_reference_config"
+
+
+class MigrationMissingGroupTests(unittest.TestCase):
+    """t4/F3 回归（契约 §7.3.1 M6）：组缺失/非 dict 都不得被凭空创建或覆盖。
+
+    同时守住 captain 的补充口径：``experimental_reference_config`` 的整组删除是
+    **独立**动作，不依赖降级组是否存在；缺组路径不得凭空增加常规 warning。
+    """
+
+    def test_m6a_missing_group_with_experimental_group_stays_missing(self):
+        raw = _RawConfig({
+            "log_with_bot_id": True,
+            "task_config": {"generation_timeout": 300},
+            EXPERIMENTAL: {"enable": True, "occluder_provider_id": "main",
+                           "occlusion_prompt": "x" * 12, "max_images": 1,
+                           "timeout_seconds": 20, "caption_max_chars": 200},
+        })
+        with mock.patch("imago_fusion.main.logger") as fake_logger:
+            _plugin(raw)._migrate_reference_fallback_keys()
+        # 不建组、不捏造键；实验组仍被整组删除，且这是真实改动 ⇒ 落盘一次。
+        self.assertNotIn(GROUP, raw)
+        self.assertNotIn(EXPERIMENTAL, raw)
+        self.assertEqual(raw.saved, 1)
+        # 缺组不是异常路径：不该为此打常规 warning。
+        self.assertEqual(fake_logger.warning.call_args_list, [])
+
+    def test_m6b_missing_group_without_anything_to_change_writes_nothing(self):
+        raw = _RawConfig({"log_with_bot_id": True, "task_config": {"generation_timeout": 300}})
+        before = copy.deepcopy(dict(raw))
+        with mock.patch("imago_fusion.main.logger") as fake_logger:
+            _plugin(raw)._migrate_reference_fallback_keys()
+        self.assertEqual(dict(raw), before)
+        self.assertNotIn(GROUP, raw)
+        self.assertEqual(raw.saved, 0)
+        self.assertEqual(fake_logger.warning.call_args_list, [])
+
+    def test_m6c_non_dict_group_is_kept_and_experimental_group_still_dropped(self):
+        raw = _RawConfig({
+            "log_with_bot_id": True,
+            GROUP: "broken",
+            EXPERIMENTAL: {"enable": True, "occluder_provider_id": "main",
+                           "occlusion_prompt": "x" * 12, "max_images": 1,
+                           "timeout_seconds": 20, "caption_max_chars": 200},
+        })
+        with mock.patch("imago_fusion.main.logger") as fake_logger:
+            _plugin(raw)._migrate_reference_fallback_keys()
+        # 原值原样保留（不覆盖成 {}），实验组独立删除，只此一处真实改动 ⇒ 落盘一次。
+        self.assertEqual(raw[GROUP], "broken")
+        self.assertNotIn(EXPERIMENTAL, raw)
+        self.assertEqual(raw.saved, 1)
+        warnings = [call.args[0] for call in fake_logger.warning.call_args_list]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("不是对象", warnings[0])
+
+    def test_m6d_non_dict_group_without_other_change_writes_nothing(self):
+        raw = _RawConfig({"log_with_bot_id": True, GROUP: ["not", "a", "dict"]})
+        with mock.patch("imago_fusion.main.logger") as fake_logger:
+            _plugin(raw)._migrate_reference_fallback_keys()
+        self.assertEqual(raw[GROUP], ["not", "a", "dict"])
+        self.assertEqual(raw.saved, 0)
+        # 保持原值不动，但要留一条告警（不是静默吞掉）。
+        self.assertEqual(len(fake_logger.warning.call_args_list), 1)
+
+    def test_m6e_missing_group_is_recreated_by_schema_defaults_later(self):
+        """安全网不建组；组由核心按 ``_conf_schema.json`` 默认值补齐后才是 dict。"""
+        raw = _RawConfig({"log_with_bot_id": True})
+        _plugin(raw)._migrate_reference_fallback_keys()
+        self.assertNotIn(GROUP, raw)
+        # 核心补齐后的空组走正常读取路径，默认仍是"关闭 + N=1"。
+        cfg = load_config({"reference_fallback_config": {}})
+        self.assertFalse(cfg.reference_fallback.enable)
+        self.assertEqual(cfg.reference_fallback.max_retries_per_node, 1)
