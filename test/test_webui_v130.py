@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from quart import Quart
 
+from imago_fusion.core.config import load_config
 from imago_fusion.integrations.web_api import PROVIDER_FIELDS, PageAPI
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
@@ -647,6 +648,159 @@ class TestRepairR3:
         assert status == 400
         assert payload["error"]["code"] == "node_incomplete"
         assert dict(env_disk[2]) == before_memory
+
+
+# ---------------------------------------------------------------- t28 / FF-R3-01
+class FileStore:
+    """把 primary 真正写进独立 JSON 文件，用于两档持久化回归。"""
+
+    def __init__(self, path, primary="main"):
+        self.path = Path(path)
+        self.primary = primary
+        self.calls = []
+
+    def get_primary_provider_id(self):
+        return self.primary
+
+    def set_primary_provider_id(self, value):
+        self.path.write_text(
+            json.dumps({"primary_provider_id": value}, ensure_ascii=False), encoding="utf-8"
+        )
+        self.primary = value
+        self.calls.append(value)
+
+
+@pytest.fixture()
+def env_r4(tmp_path):
+    config_path = tmp_path / "imago_fusion_config.json"
+    primary_path = tmp_path / "primary_provider.json"
+    raw = RawConfig(base_config(), path=config_path)
+    raw.save_config()
+    primary_path.write_text(json.dumps({"primary_provider_id": "main"}), encoding="utf-8")
+    plugin = Plugin(raw)
+    plugin.store = FileStore(primary_path)
+    app = Quart(__name__)
+    api = PageAPI(plugin)
+    app.add_url_rule("/imago_fusion/providers", "providers", api.providers, methods=["GET"])
+    app.add_url_rule("/imago_fusion/providers/save", "save_providers", api.save_providers, methods=["POST"])
+    return app, plugin, raw, config_path, primary_path
+
+
+def save_r4(env, body):
+    return request(env[0], "POST", "/imago_fusion/providers/save", body)
+
+
+def disk_json(path):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+def loaded_ids(env):
+    return [item.id for item in load_config(env[2]).providers]
+
+
+class TestRepairR4:
+    def test_http_to_native_with_clear_keeps_new_provider_and_stream(self, env_r4):
+        """原 HTTP → 新 native 同时 clear：必须保留新 provider/stream/启停。"""
+
+        status, payload = save_r4(env_r4, {"providers": [{
+            "id": "main",
+            "api_type": "astrbot_native",
+            "astrbot_provider_id": "vision-test",
+            "stream": True,
+            "enabled": True,
+            "clear_api_keys": True,
+        }]})
+        assert status == 200, payload
+        stored = env_r4[2]["providers"][0]
+        assert stored["api_type"] == "astrbot_native"
+        assert stored["astrbot_provider_id"] == "vision-test"
+        assert stored["stream"] is True
+        assert stored["enabled"] is True
+        assert stored["api_keys"] == []
+        on_disk = disk_json(env_r4[3])["providers"][0]
+        assert on_disk["astrbot_provider_id"] == "vision-test"
+        assert on_disk["stream"] is True
+        assert on_disk["enabled"] is True
+        assert on_disk["api_keys"] == []
+        assert disk_json(env_r4[4])["primary_provider_id"] == "main"
+        # 真实 load_config 必须保留这个节点且字段一致，不能 200 后丢节点。
+        loaded = {item.id: item for item in load_config(env_r4[2]).providers}
+        assert "main" in loaded
+        assert loaded["main"].api_type == "astrbot_native"
+        assert loaded["main"].astrbot_provider_id == "vision-test"
+        assert loaded["main"].stream is True
+        assert loaded["main"].enabled is True
+
+    def test_new_native_with_clear_keeps_new_provider_and_stream(self, env_r4):
+        """新建 native 同时 clear：old={}，不得回写成空 provider。"""
+
+        status, payload = save_r4(env_r4, {"providers": [{
+            "id": "new-native",
+            "api_type": "astrbot_native",
+            "astrbot_provider_id": "vision-test",
+            "stream": True,
+            "enabled": True,
+            "clear_api_keys": True,
+        }]})
+        assert status == 200, payload
+        stored = next(item for item in env_r4[2]["providers"] if item["id"] == "new-native")
+        assert stored["astrbot_provider_id"] == "vision-test"
+        assert stored["stream"] is True
+        on_disk = next(
+            item for item in disk_json(env_r4[3])["providers"] if item["id"] == "new-native"
+        )
+        assert on_disk["astrbot_provider_id"] == "vision-test"
+        assert on_disk["stream"] is True
+        loaded = {item.id: item for item in load_config(env_r4[2]).providers}
+        assert "new-native" in loaded
+        assert loaded["new-native"].astrbot_provider_id == "vision-test"
+
+    def test_existing_native_clear_keeps_original_enabled_true_and_false(self, env_r4):
+        env_r4[2]["providers"][1]["enabled"] = True
+        env_r4[2].save_config()
+        for requested in (False, True):
+            status, payload = save_r4(env_r4, {"providers": [{
+                "id": "native",
+                "api_type": "astrbot_native",
+                "clear_api_keys": True,
+                "enabled": requested,
+                "stream": not requested,
+                "astrbot_provider_id": "other/provider",
+            }]})
+            assert status == 200, payload
+            stored = env_r4[2]["providers"][1]
+            assert stored["enabled"] is True
+            assert stored["astrbot_provider_id"] == "cpa/gemini"
+            assert stored["stream"] is True
+            assert disk_json(env_r4[3])["providers"][1]["enabled"] is True
+            assert env_r4[1].store.primary == "main"
+
+    def test_http_to_native_without_clear_keeps_dormant_keys_and_loads(self, env_r4):
+        status, payload = save_r4(env_r4, {"providers": [{
+            "id": "main",
+            "api_type": "astrbot_native",
+            "astrbot_provider_id": "vision-test",
+            "stream": False,
+        }]})
+        assert status == 200, payload
+        stored = env_r4[2]["providers"][0]
+        assert stored["api_type"] == "astrbot_native"
+        assert stored["astrbot_provider_id"] == "vision-test"
+        assert stored["api_keys"] == ["sk-main", "sk-backup"]
+        loaded = {item.id: item for item in load_config(env_r4[2]).providers}
+        assert "main" in loaded
+        assert loaded["main"].api_keys == ("sk-main", "sk-backup")
+
+    def test_http_clear_control_still_forces_off(self, env_r4):
+        status, payload = save_r4(env_r4, {"providers": [{
+            "id": "main",
+            "api_type": "openai_image",
+            "clear_api_keys": True,
+            "enabled": True,
+        }]})
+        assert status == 200, payload
+        assert env_r4[2]["providers"][0]["enabled"] is False
+        assert env_r4[2]["providers"][0]["api_keys"] == []
 
 
 # ---------------------------------------------------------------- 配置组

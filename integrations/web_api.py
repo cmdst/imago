@@ -897,10 +897,12 @@ class PageAPI:
                     # 不接受客户端“清空但仍启用”的组合。
                     enabled = False
 
-                # FF-R2-01：显式清空按类型分治。HTTP 节点由服务端强制停用；
-                # 原生节点只清休眠的 HTTP key，不改原有 enabled / provider / stream
-                # （即使请求里带了相反的值）。成功回包后前端用 snapshot 复位临时 flag。
-                if clear_keys and native:
+                # FF-R2-01 / FF-R3-01：显式清空按“原类型 + 最终类型”分治。
+                # HTTP 节点由服务端强制停用；只有原本就是原生节点的显式清空才保留
+                # 原有 enabled / provider / stream（即使请求里带了相反的值）。
+                # HTTP→native 或新建 native 时，上一步校验过的 provider/stream/启停
+                # 必须原样落盘，禁止用 old（通常为空）覆盖后 200 却让 load_config 丢节点。
+                if clear_keys and native and old_api_type == "astrbot_native":
                     enabled = stored_enabled
                     astrbot_provider_id = str(old.get("astrbot_provider_id", "")).strip()
                     stream = _as_bool(old.get("stream", False), False)[0]
