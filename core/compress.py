@@ -39,7 +39,7 @@ except Exception:  # pragma: no cover - 缺失时下面所有路径都走"原图
 JPEG_MIME_TYPE = "image/jpeg"
 PNG_MIME_TYPE = "image/png"
 
-#: 质量阶梯的下探步长与绝对下界（契约 §3.5：q、q-10、q-20，下界 ``max(40, q-30)``）。
+#: 质量阶梯的下探步长与绝对下界（契约 §3.5：``max(40, q0-10*i)``, i=0..2）。
 QUALITY_FLOOR = 40
 QUALITY_STEPS = (0, 10, 20)
 #: 尺寸阶梯：1.0 / 0.85 / 0.7225（0.85²，与 2000→1700→1445 的定点口径一致）。
@@ -97,15 +97,6 @@ class CompressOutcome:
 def available() -> bool:
     """Pillow 是否可用；不可用时上层整体跳过压缩（不建 runtime 键）。"""
     return Image is not None and ImageOps is not None
-
-
-def _suffix_for(filename: str) -> str:
-    """取原文件名的扩展名（小写，含点）；没有则空串。"""
-    name = str(filename or "").strip().rsplit("/", 1)[-1].rsplit("\\", 1)[-1]
-    dot = name.rfind(".")
-    if dot <= 0:
-        return ""
-    return name[dot:].lower()
 
 
 def output_filename(filename: str, suffix: str) -> str:

@@ -16,13 +16,21 @@ AstrBot 运行期）；**全程不联网、不写生产目录**。
   必须**等于压缩后的字节**（不是原字节、也不只看长度）。
 """
 
+import base64
+import contextlib
+import hashlib
 import io
 import json
+import os
 import random
+import time
 import unittest
+import uuid
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from unittest.mock import patch
+
+import aiohttp
 
 
 from imago_fusion.core import compress as logic
@@ -771,3 +779,257 @@ class SourceCoverageTests(unittest.IsolatedAsyncioTestCase):
         # 同一份字节 ⇒ 完全相同的压缩产物（与来源、文件名无关）。
         self.assertEqual((bytes_c, mime_c), (direct_bytes, direct_mime))
         self.assertTrue(name_c.endswith(".jpg"))
+
+
+# ── CORE-13：入口级 e2e（真实 loopback HTTP 接收端，不用 CaptureSession 替身）─────
+
+
+class Image:
+    """轻量 ``Image`` 组件替身：``core/references.py`` 按类名匹配（含 "image"）。"""
+
+    def __init__(self, path="", url="", file="", converter=None):
+        self.path = path
+        self.url = url
+        self.file = file
+        self._converter = converter
+
+    async def convert_to_file_path(self):
+        if self._converter is None:
+            raise ValueError("no converter")
+        return await self._converter()
+
+
+class _EditServer:
+    """真实 loopback HTTP 接收端：解析 multipart，逐 ``image[]`` part 记录原始字节。
+
+    契约 rev3 §7.2 B1/CORE-13 要求接收端按真实网络栈读 part（``request.multipart()``），
+    不能用 ``CaptureSession`` + email 解析替代——那样测不到 aiohttp 真正发出的字节。
+    """
+
+    def __init__(self, ref_payload: bytes = b""):
+        self.ref_payload = ref_payload
+        self.parts: list[tuple[str, str, bytes]] = []
+        self.edits = 0
+        self.ref_hits = 0
+        self.port = 0
+
+    async def __aenter__(self):
+        from aiohttp import web
+
+        async def edit(request):
+            self.edits += 1
+            reader = await request.multipart()
+            async for part in reader:
+                if part.name in {"image[]", "image"}:
+                    self.parts.append((
+                        part.filename or "",
+                        part.headers.get("Content-Type", ""),
+                        await part.read(decode=False),
+                    ))
+            body = noise_png(80, 60, seed=99)
+            return web.json_response(
+                {"data": [{"b64_json": base64.b64encode(body).decode("ascii")}]}
+            )
+
+        async def ref(request):
+            self.ref_hits += 1
+            return web.Response(body=self.ref_payload, content_type="image/png")
+
+        app = web.Application()
+        app.router.add_post("/v1/images/edits", edit)
+        app.router.add_get("/ref.png", ref)
+        self._runner = web.AppRunner(app)
+        await self._runner.setup()
+        site = web.TCPSite(self._runner, "127.0.0.1", 0)
+        await site.start()
+        self.port = site._server.sockets[0].getsockname()[1]
+        return self
+
+    async def __aexit__(self, *exc):
+        await self._runner.cleanup()
+        return False
+
+
+@contextlib.asynccontextmanager
+async def _netguard_allow(port: int):
+    """门禁 netguard 只放行**显式许可**的 loopback 端口，用完立即还原。"""
+
+    previous = os.environ.get("IMAGO_NETGUARD_ALLOW")
+    entry = f"127.0.0.1:{port}"
+    os.environ["IMAGO_NETGUARD_ALLOW"] = f"{previous},{entry}" if previous else entry
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("IMAGO_NETGUARD_ALLOW", None)
+        else:
+            os.environ["IMAGO_NETGUARD_ALLOW"] = previous
+
+
+class EntryE2ETests(unittest.IsolatedAsyncioTestCase):
+    """CORE-13：真实入口 → 真实 adapter → 真实 HTTP 接收端，逐 part 比对字节。"""
+
+    async def asyncSetUp(self):
+        self._tmpdir = TemporaryDirectory()
+        self._tmp = Path(self._tmpdir.name)
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=None, connect=5)
+        )
+
+    async def asyncTearDown(self):
+        await self.session.close()
+        self._tmpdir.cleanup()
+
+    # ── 装配 ────────────────────────────────────────────────────────────
+    def _plugin(self, port: int, *, compress_enabled: bool = True, max_edge: int = 768):
+        from imago_fusion.core.config import load_config
+        from imago_fusion.services.persona_store import PersonaStore
+        from imago_fusion.services.scheduler import TaskScheduler
+
+        plugin = object.__new__(_plugin_class())
+        plugin.raw_config = {
+            "providers": [
+                {
+                    "id": "local",
+                    "api_type": "openai_image",
+                    "base_url": f"http://127.0.0.1:{port}/v1",
+                    "api_keys": ["API_KEY_TEST"],
+                    "model": "test-model",
+                    "default_size": "1024x1024",
+                    "timeout": 30,
+                }
+            ],
+            "storage_config": {"max_upload_mb": 20, "block_private_networks": False},
+            "reference_compress_config": {
+                "enable": compress_enabled,
+                "max_edge": max_edge,
+                "jpeg_quality": 85,
+                "target_kb": 128,
+                "min_bytes": 0,
+                "keep_alpha": False,
+                "max_pixels": 40000000,
+            },
+        }
+        plugin.session = self.session
+        plugin.store = PersonaStore(self._tmp, lambda: 20 * 1024 * 1024)
+        plugin.quota_store = None
+
+        async def runner(task, chain=None):
+            return None
+
+        plugin.scheduler = TaskScheduler(
+            lambda: load_config(plugin.raw_config),
+            self.session,
+            runner,
+            lambda provider, exc, task=None: None,
+            lambda *args, **kwargs: None,
+            info=lambda *args, **kwargs: None,
+            warn=lambda *args, **kwargs: None,
+        )
+        return plugin
+
+    async def _run_entry(self, plugin, components, *, prompt="画一只猫"):
+        """真实入口：组件 → ``_plan_task_references`` → ``_prepare`` → ``_generate``。"""
+
+        local, deferred = await plugin._plan_task_references(components)
+        task = DrawTask(
+            uuid.uuid4().hex,
+            "umo://test",
+            # 与 `_submit` 一致：`_resolve_deferred_references` 会 append 到该列表。
+            GenerationRequest(prompt, references=list(local)),
+            created_at=time.monotonic(),
+        )
+        task.runtime["source_event"] = None
+        task.runtime["deferred_references"] = list(deferred)
+        await plugin._prepare(task)
+        results = await plugin.scheduler._generate(task)
+        return task, results
+
+    # ── 用例 ────────────────────────────────────────────────────────────
+    async def test_local_entry_sends_exactly_the_compressed_bytes(self):
+        payload = photo_like_png(1400, 1000)
+        path = self._tmp / "entry.png"
+        path.write_bytes(payload)
+
+        async with _EditServer() as server, _netguard_allow(server.port):
+            plugin = self._plugin(server.port)
+            task, results = await self._run_entry(plugin, [Image(path=str(path))])
+
+        sent = task.runtime["send_references"]
+        self.assertEqual(len(sent), 1)
+        self.assertNotEqual(sent[0].data, payload)  # 确实压过
+        self.assertLess(len(sent[0].data), len(payload))
+        # 接收端逐 part 字节 == 压缩后的 ImageInput.data（不是长度、不是原字节）
+        self.assertEqual(server.edits, 1)
+        self.assertEqual([part[2] for part in server.parts], [sent[0].data])
+        self.assertEqual(server.parts[0][1], sent[0].mime_type)
+        self.assertEqual(server.parts[0][0], sent[0].filename)
+        self.assertEqual(len(results), 1)
+
+    async def test_disabled_sends_original_bytes_and_inputs_untouched(self):
+        payload = photo_like_png(1400, 1000)
+        path = self._tmp / "raw.png"
+        path.write_bytes(payload)
+
+        async with _EditServer() as server, _netguard_allow(server.port):
+            plugin = self._plugin(server.port, compress_enabled=False)
+            task, _ = await self._run_entry(plugin, [Image(path=str(path))])
+
+        self.assertNotIn("send_references", task.runtime)
+        self.assertNotIn("reference_compress", task.runtime)
+        self.assertEqual([part[2] for part in server.parts], [payload])
+        records = task.runtime["input_records"]
+        self.assertEqual(records[0]["size"], len(payload))
+        self.assertEqual(
+            (plugin.store.task_dir(task.id) / "inputs" / records[0]["file"]).read_bytes(),
+            payload,
+        )
+
+    async def test_attempt_meta_matches_sent_bytes_and_differs_from_inputs(self):
+        payload = photo_like_png(1600, 1100)
+        path = self._tmp / "meta.png"
+        path.write_bytes(payload)
+
+        async with _EditServer() as server, _netguard_allow(server.port):
+            plugin = self._plugin(server.port)
+            task, _ = await self._run_entry(plugin, [Image(path=str(path))])
+
+        sent = task.runtime["send_references"]
+        meta = task.runtime["attempt_meta"]
+        records = task.runtime["input_records"]
+        # attempt_meta 记的是**发出去**的字节；inputs/ 记的是**收到**的字节。
+        self.assertEqual([item["bytes"] for item in meta["references"]], [len(sent[0].data)])
+        self.assertEqual([item["role"] for item in meta["references"]], ["explicit"])
+        self.assertEqual(records[0]["size"], len(payload))
+        self.assertNotEqual(meta["references"][0]["bytes"], records[0]["size"])
+        digest = hashlib.sha256(payload).hexdigest()
+        self.assertEqual(task.runtime["reference_compress_map"][digest]["bytes"], len(sent[0].data))
+        self.assertEqual(
+            (plugin.store.task_dir(task.id) / "inputs" / records[0]["file"]).read_bytes(),
+            payload,
+        )
+
+    async def test_every_source_entry_converges_to_the_same_sent_bytes(self):
+        payload = photo_like_png(1200, 900)
+        path = self._tmp / "shared.png"
+        path.write_bytes(payload)
+        encoded = base64.b64encode(payload).decode("ascii")
+
+        async with _EditServer(ref_payload=payload) as server, _netguard_allow(server.port):
+            entries = {
+                "local": Image(path=str(path)),
+                "data": Image(url="data:image/png;base64," + encoded),
+                "base64": Image(url="base64://" + encoded),
+                "http": Image(url=f"http://127.0.0.1:{server.port}/ref.png"),
+            }
+            sent_by_source = {}
+            for name, component in entries.items():
+                plugin = self._plugin(server.port)
+                task, _ = await self._run_entry(plugin, [component])
+                sent_by_source[name] = task.runtime["send_references"][0].data
+
+        # 同一份入站字节 ⇒ 四个入口产出**逐字节相同**的发送副本。
+        self.assertEqual(len(set(sent_by_source.values())), 1, sent_by_source.keys())
+        self.assertEqual(server.ref_hits, 1)  # http 入口真的取过图
+        self.assertEqual(len(server.parts), len(entries))
+        self.assertTrue(all(part[2] == sent_by_source["local"] for part in server.parts))

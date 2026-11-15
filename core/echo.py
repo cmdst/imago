@@ -18,6 +18,7 @@
 from __future__ import annotations
 
 import hashlib
+import io
 from dataclasses import dataclass, field
 from typing import Iterable, Sequence
 
@@ -70,7 +71,7 @@ def normalized_pixels(data: bytes) -> tuple[int, int, bytes] | None:
     if len(data) > MAX_COMPARE_BYTES:
         return None
     try:
-        with Image.open(__import__("io").BytesIO(data)) as opened:
+        with Image.open(io.BytesIO(data)) as opened:
             if int(getattr(opened, "n_frames", 1) or 1) > 1:
                 opened.seek(0)
             if int(opened.size[0]) * int(opened.size[1]) > MAX_COMPARE_PIXELS:
@@ -149,7 +150,7 @@ def dimensions_of(data: bytes) -> str:
     if not available() or not data:
         return "-"
     try:
-        with Image.open(__import__("io").BytesIO(data)) as opened:
+        with Image.open(io.BytesIO(data)) as opened:
             width, height = opened.size
             return f"{int(width)}x{int(height)}"
     except Exception:  # noqa: BLE001
