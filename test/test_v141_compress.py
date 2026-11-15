@@ -389,6 +389,46 @@ class PluginCompressTests(unittest.TestCase):
         self.assertNotIn("reference_compress", task.runtime)
 
 
+class PillowMissingTests(unittest.TestCase):
+    """Pillow 不可用 ⇒ 全量降级原图、只告警一次、不新增任务失败（契约 §3.8 / T-C15）。"""
+
+    def test_missing_pillow_degrades_to_originals_once(self):
+        from unittest.mock import patch
+
+        from imago_fusion.core import compress as logic
+
+        payload = noise_png(400, 300, seed=21)
+        images = [ImageInput(payload, "image/png", "a.png")]
+        warnings = []
+        with patch.object(logic, "Image", None), patch.object(logic, "_missing_pillow_warned", False):
+            outgoing, stats = logic.compress_all(
+                images, config(), warn=warnings.append, debug=lambda *a: None,
+            )
+            # 第二次不再重复告警（进程内一次）。
+            logic.compress_all(images, config(), warn=warnings.append)
+        self.assertIsNone(stats)
+        self.assertEqual([item.data for item in outgoing], [payload])
+        self.assertEqual(warnings, [logic.MISSING_PILLOW_WARNING])
+
+    def test_missing_pillow_leaves_task_untouched(self):
+        from unittest.mock import patch
+
+        from imago_fusion.core import compress as logic
+
+        payload = noise_png(400, 300, seed=22)
+        task = DrawTask("t2", "umo", GenerationRequest("draw", references=(ImageInput(payload, "image/png", "a.png"),)))
+        task.runtime["persona_references"] = []
+        plugin = object.__new__(_plugin_class())
+        plugin.raw_config = {}
+        with patch.object(logic, "Image", None), patch.object(logic, "_missing_pillow_warned", False):
+            plugin._apply_reference_compression(task, RuntimeConfig(providers=(), reference_compress=config()))
+        # 没有统计就没有 runtime 键：任务照常把原图发出去，errors 不受影响。
+        self.assertNotIn("reference_compress", task.runtime)
+        self.assertNotIn("send_references", task.runtime)
+        self.assertEqual(task.request.references[0].data, payload)
+        self.assertEqual(task.errors, [])
+
+
 class ManifestTests(unittest.IsolatedAsyncioTestCase):
     async def test_finalize_persists_bounded_compress_and_attempt_sections(self):
         from imago_fusion.services.persona_store import PersonaStore
