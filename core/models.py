@@ -214,6 +214,42 @@ class ReferenceFallbackConfig:
 
 
 @dataclass(frozen=True, slots=True)
+class ReferenceCompressConfig:
+    """入站参考图压缩（``reference_compress_config`` 组，**默认开启**）。
+
+    只压缩**发往 provider 的副本**：``task.request.references`` 与
+    ``inputs/`` 落盘的原素材逐字节不变（契约 §3.2），Compress 在任务准备阶段
+    一次性算出"要发出去的字节"，不就地替换原 ``ImageInput``。
+
+    Attributes:
+        enable: 总开关，默认 **True**；关闭时六条零开销成立（不解码、不落文件、
+            不新增日志、不建 runtime 键、发出字节==入站字节、终态与 v1.4.0 一致）。
+        max_edge: 长边上限（px），0 = **禁止任何缩放**（只重编码）；clamp 0..4096。
+        jpeg_quality: JPEG 起始质量，clamp 40..95；质量阶梯按 q、q-10、q-20 下探，
+            下界固定在 ``max(40, q-30)``。
+        target_kb: 目标体积（KiB，1 KB = 1024 B），clamp 32..2048；达标即早停，
+            未达标时输出"不膨胀的最小候选"并标记 ``target_unmet``。
+        min_bytes: 小于该字节数**不压缩也不解码**（默认 32 KiB，clamp 0..1 MiB）。
+        keep_alpha: 保留透明通道（输出 PNG）；关闭时透明区域合成**白底** JPEG。
+        max_pixels: 像素总数上限（宽×高），超过只读头即放弃（不解码全图），
+            clamp 1e6..1e8；默认 4 000 万，防止解压炸弹在解码阶段炸内存。
+    """
+
+    enable: bool = True
+    max_edge: int = 1536
+    jpeg_quality: int = 85
+    target_kb: int = 128
+    min_bytes: int = 32768
+    keep_alpha: bool = False
+    max_pixels: int = 40_000_000
+
+    @property
+    def target_bytes(self) -> int:
+        """目标体积（字节）：``target_kb`` × 1024（1 KB = 1024 B，契约 §2.2）。"""
+        return int(self.target_kb) * 1024
+
+
+@dataclass(frozen=True, slots=True)
 class RuntimeConfig:
     providers: tuple[ProviderConfig, ...]
     quota: QuotaConfig = field(default_factory=QuotaConfig)
@@ -255,6 +291,9 @@ class RuntimeConfig:
     upscale: UpscaleConfig = field(default_factory=UpscaleConfig)
     # 参考图文字降级：默认关闭；关闭时链路与 v1.2.0 等价（契约 F6）。
     reference_fallback: ReferenceFallbackConfig = field(default_factory=ReferenceFallbackConfig)
+    # 入站参考图压缩：默认**开启**（契约 §3，v1.4.1）。只压缩发往 provider 的副本，
+    # 原素材与 ``inputs/`` 逐字节不变；关闭时六条零开销成立（见 compress 模块）。
+    reference_compress: ReferenceCompressConfig = field(default_factory=ReferenceCompressConfig)
 
 
 @dataclass(slots=True)

@@ -2,9 +2,9 @@
 
 IMAGO·FUSION 是 **IMAGO·映相** 骨架与 **大香蕉（astrbot_plugin_big_banana）AstrBot 原生 Provider 桥接** 的融合插件：保留映相的提示词优化、Persona 出镜、绘图额度、多节点 fallback 与素材管理，新增「走 AstrBot 已配置 Provider（反代 / 网页端模型）出图」的原生路由。
 
-- 版本：`1.4.0`（`metadata.yaml` / `__init__.py` / `main.py` 的 `@register` / 本行**四处一致**；更新内容见 `CHANGELOG.md` 顶部的 1.4.0 节）
+- 版本：`1.4.1`（`metadata.yaml` / `__init__.py` / `main.py` 的 `@register` / 本行**四处一致**；更新内容见 `CHANGELOG.md` 顶部的 1.4.1 节）
 - AstrBot：`>=4.16,<5`
-- 依赖：`aiohttp>=3.9,<4`（不引入 Pillow：插件侧不做格式转换）
+- 依赖：`aiohttp>=3.9,<4`（**不新增依赖**：参考图压缩用的是 AstrBot 运行时已带的 Pillow，实测 12.2.0；缺失时自动降级为原图直发）
 
 运行数据写入 AstrBot 分配的 `plugin_data/imago_fusion/`，**不读写** `plugin_data/imago/`（如需继承原插件的 Persona 素材，手工复制该目录）。
 
@@ -74,6 +74,60 @@ IMAGO·FUSION 是 **IMAGO·映相** 骨架与 **大香蕉（astrbot_plugin_big_b
 `template_override` 开启后，主节点可以写成 `模板名/模型名` 覆写该模板的模型。判据要求 `/` 前**确实是已配置的模板名**，因此 AstrBot 原生 id（`cpa_Gemini/web-gemini-image`）不会被误当作覆写语法 —— 这是与大香蕉原实现的关键差异：原实现先按模板名查表再 `partition("/")`，只要用户建了一个与原生 id 前缀同名的模板，原生路由就会被静默换成「模板 base_url + 模板 key + 覆写模型名」。
 
 **不推荐开启**：该语法与 AstrBot 原生 provider id 形态相同（都含 `/`），一旦命名碰撞就会改变主节点的实际去向。插件已加碰撞守卫——若 `/` 前的模板名与某个 `astrbot_native` 节点 id **完全相同**，会记一条 WARNING 并**跳过覆写**，把引用留给原生节点解析（例如模板名写成 `cpa_Gemini` 而原生节点 id 就是 `cpa_Gemini`）。守卫只覆盖完全同名的情况，语义上仍建议用节点的 `available_models` 做模型回退，而不是依赖本开关。
+
+## 参考图压缩（默认开启，`reference_compress_config`，7 键）
+
+**为什么**：发往绘图节点的参考图决定了上传耗时与失败率。1.4.1 起，凡是**发往 provider 的参考图副本**都会先压缩一次；本地 `inputs/` 里的原素材、出图结果、增强/放大产物**完全不参与**压缩。
+
+**覆盖面（同一个入口，七类来源一视同仁）**：①消息链里的 `Image` 组件；②`data:image/...;base64`；③`base64://`；④`http(s)` 链接（含引用消息与正文 Markdown 链接）；⑤引用消息里的图片（deferred 解析）；⑥后台 deferred 的链接；⑦Persona 参考图（含 `ref-upload` 上传的素材）。压缩发生在「参考图全部就绪之后、第一次请求节点之前」，每任务只算一次，重试与切换节点不会重复有损。
+
+| 键 | 默认 | 限制 | 说明 |
+| --- | --- | --- | --- |
+| `enable` | **true** | bool | 关闭后**零解码、零新增文件、零新增日志**，发送字节与 1.4.0 逐字节一致（超时修复与回吐守卫**不受影响**） |
+| `max_edge` | 1536 | 0–4096 | 最长边上限，**只缩不放**；`0` = 完全不缩放（含未达标后的缩边轮次） |
+| `jpeg_quality` | 85 | 40–95 | JPEG 起始质量；未达标按 10 递减，下限 40 |
+| `target_kb` | 128 | 32–2048 | 目标体积，**1 KB = 1024 字节** |
+| `min_bytes` | 32768 | 0–1048576 | 小于该字节数直接原样发送（零解码）；`0` = 全部参与 |
+| `keep_alpha` | false | bool | 关闭时透明区域合成白底再按 JPEG 输出；开启时保留 alpha 并输出 PNG |
+| `max_pixels` | 40000000 | 1000000–100000000 | 超过该像素数不参与压缩（不解码，避免超大图耗尽内存） |
+
+**算法**：先看体积（低于 `min_bytes` 不动）→ 只读图片头取尺寸（超过 `max_pixels` 直接不解码就放弃）→ 解码首帧 + EXIF 方向归一 → 透明处理 → 长边缩放 → 质量阶梯。最多 9 次编码（3 个质量档 × 3 个尺寸档），达标即停；**最终只接受"比原图更小"的候选**，否则原样发送（`no_gain`）；达不到 `target_kb` 时保留最小候选并标 `target_unmet`，不会为了达标把图压花。
+
+**产物与命名**：默认输出 `image/jpeg`，文件名后缀随之改成 `.jpg`；`keep_alpha=true` 且确实带 alpha 时输出 `image/png` + `.png`。压缩只影响发给节点的副本，`task.json` 的 `inputs[]` 仍是**原始字节与原始 sha256**。
+
+**诊断（不含图片内容 / URL / base64）**：
+
+- INFO：`参考图压缩 in=<字节>B out=<字节>B <长边>px q<质量> <耗时>ms`（未达标追加 ` target_unmet`）
+- DEBUG：`参考图压缩 skip reason=<under_min_bytes|too_many_pixels|no_gain> bytes=<n>`
+- WARNING（每任务至多一条）：`参考图压缩失败，回退原图: <异常类型与消息>`；Pillow 不可用时为 `参考图压缩不可用：Pillow 未安装，参考图按原样发送`
+- `task.json` 的 `reference_compress` 记 `in_bytes / out_bytes / compressed / target_unmet / skipped / failed` 的有界摘要；每次尝试实际发出的字节数记在运行期的 `task.runtime["attempt_meta"]["references"][]`。
+
+**体积口径**：`storage_config.max_upload_mb` 是**入站**上限，按 1 MB = 1024×1024 字节算，默认 20 MB = **20971520 字节**；压缩发生在该判定**之后**，所以不会把一张超限的入站图片"救回来"。
+
+## 回吐守卫（默认开启，无配置键）
+
+模型偶尔会把参考图**原样**当成"成品"返回（反代 / 网页端模型常见）。1.4.1 在"成品图已落盘、尚未增强/放大"的位置加了一道闸门：拿这张成品与**本次成功尝试实际发出去的那组参考图**（含压缩后的副本与被采样的 Persona 图）比对，命中即丢弃这张"成品"。
+
+**命中判据（精确，不近似）**：
+
+1. 字节完全相同；或
+2. EXIF 方向归一后**同尺寸**，且解码出的 RGBA 像素**逐像素完全相等**。
+
+不做感知哈希、灰度缩略图或"相似度"阈值；任一侧解码失败、超出比较上限（4000 万像素 / 64 MiB）、或取不到成功尝试的快照时，**一律放行**并只记 `unknown`。
+
+**结果分类**：全部被拦 → `NO_OUTPUT` + `no_change`，用户收到固定文案「这次没有生成新图，模型把参考图原样送了回来。请重试或换个节点。」；部分被拦 → `PARTIAL_SUCCESS`，只发有效图；未命中 → 照旧。**不自动重试、不额外调用节点**（零新增费用），被拦的 provider 原件保留在 `outputs/`（但不进 `task.json` 的 `outputs[]`）。
+
+**诊断**：INFO `回吐闸 检查=<n> 拦下=<m> 放行=<k>`；`task.json` 的 `echo_guard` 记 `checked / blocked / unknown / no_change` 与被拦文件的相对名（不含图片内容）。
+
+## 三层超时（1.4.1 起语义分开）
+
+| 层 | 位置 | 默认 | 到期结果 |
+| --- | --- | --- | --- |
+| L1 节点 | `providers[].timeout`（每节点） | 180 s | 该节点判 `ProviderTimeout`，记进 `attempts` 后**继续 fallback**，任务不结束 |
+| L2 任务 | `task_config.generation_timeout`（从任务创建起算） | 300 s | 任务 `TIMED_OUT`，`errors` 必有 `timeout`，`runtime.last_provider_error=任务超时`，**不退款**（额度口径不变） |
+| L3 上传窗口 | 内部常量 | ≈15 s | 只影响单张参考图上传；超出即按该节点失败处理 |
+
+L1 到期**不会**再被结算成"任务超时"（1.4.0 曾出现"单节点 117 s 超时 → 任务判 timed_out 且 errors 为空"）；反过来，L2 真到期也不会被误判成节点失败。取消（`CANCELLED`）保持原样向上传播并退款。适配器网络异常额外记录 `phase`（`connect` / `upload` / `wait_response` / `read_body` / `unknown`）、`elapsed`、`up_bytes`、`timeout`，其中 `up_bytes` 来自 aiohttp 分片回调的真实计数，**不按图片大小猜**。
 
 ## 图像清晰度增强（可选，**默认关闭**）
 

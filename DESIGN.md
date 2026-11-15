@@ -95,7 +95,7 @@ config/astrbot_plugin_big_banana_config.json  encoding=utf-8-sig  -> OK
 data/plugins/imago_fusion/
 ├── metadata.yaml                  [改] name=imago_fusion, display_name=IMAGO·FUSION, version=1.0.0
 ├── __init__.py                    [改] __version__ = "1.0.0"（与 metadata.yaml 一致）
-├── requirements.txt               [复制] aiohttp>=3.9,<4（不引 PIL：imago 侧不做格式转换）
+├── requirements.txt               [复制] aiohttp>=3.9,<4（1.4.1 起参考图压缩改用 AstrBot 运行时自带的 Pillow，仍不新增依赖）
 ├── README.md                      [新] 反代节点配置 + 与原 imago 的差异化说明
 ├── _conf_schema.json              [改] providers 模板项新增 4 字段（见 §3）
 ├── main.py                        [改] Star 类改名 + 传 context 给 scheduler + 3 处小修（见 §5）
@@ -633,3 +633,45 @@ curl -s -o /dev/null -w '%{http_code}\n' http://127.0.0.1:8317/v1/models
 curl -s -o /dev/null -w '%{http_code}\n' -X POST -d '{}' \
   http://127.0.0.1:8317/v1beta/models/gemini-3.1-flash-image:generateContent
 ```
+
+## 9. v1.4.1 实现决策：参考图压缩 / 回吐守卫 / 三层超时
+
+### 9.1 为什么压缩放在 `main._prepare()` 的单一入口
+
+七类参考图来源（消息链 `Image`、`data:`、`base64://`、`http(s)` 链接、引用消息 deferred、后台 deferred、Persona 磁盘素材）最终都收敛成两份列表：`task.request.references`（显式）与 `task.runtime["persona_references"]`（Persona 池）。在两者就绪之后、`_request_for_attempt()` 第一次被调用之前压一次，等价于"所有入口都过同一个 ingest"，同时天然满足"每任务只压一次、重试不重复有损"。
+
+替代方案及其问题：①在 `core/references.py` 的 `ReferencePlanner` 里压——只覆盖事件阶段能拿到的图，Persona 与 deferred 漏掉；②在 `scheduler._request_for_attempt()` 里压——会被每个节点 × 每个模型重复调用，同一张图反复有损；③在 `providers/openai_image.py` 的 multipart 里压——只覆盖一种协议，且会把"成品图下载"（`materialize_result` 共用 `fetch_reference`）卷进来。
+
+### 9.2 为什么原素材与运行期副本分离
+
+`persist_task_inputs()` 写 `inputs/` 的是**入站原始字节**（去重、sha256、体积都以它为准），压缩结果只写 `task.runtime["send_*"]`，由 `_request_for_attempt()` 消费。这样：任务记录与历史素材不受压缩策略变化影响；关掉压缩就是逐字节回退到 1.4.0；`attempt_meta.references[].bytes` 与 `inputs[].size` 的差异本身就成了一条可诊断证据（压缩是否真的生效）。
+
+### 9.3 为什么回吐判据是"精确相等"而不是相似度
+
+感知哈希/灰度缩略图（例如 64×64 + MAD 阈值）在"用户真的只改了色调或加了一行字"的场景会误杀，而误杀的代价是用户看不到图且任务被改判 `NO_OUTPUT`。精确判据的两个分支（同字节；方向归一后同尺寸且 RGBA 逐像素相等）语义明确、可解释、可测试，误杀概率≈0；代价是"模型把图重编码了一遍"这类回吐漏检——这属于可接受残余风险（§4.10 R-E1..R-E3）。
+
+### 9.4 顺序图
+
+```text
+参考图（七类入口） ──► _prepare()：inputs/ 原文落盘 ──► [压缩一次] ──► runtime["send_*"]
+                                                                    │
+节点请求（多节点 × 多模型 fallback） ◄── _request_for_attempt() ◄────┘
+        │
+        ├─ L1 节点超时 ──► ProviderTimeout ──► 记 attempt_errors ──► 继续下一个
+        │
+        ▼
+   _finish_task()
+        │
+   逐张：materialize（provider 原件落 outputs/）
+        │
+        ├─► [回吐闸] 命中 ⇒ 丢弃（不进 chain / output_paths，不增强不放大）
+        │
+        ├─► 增强（尺寸不变） ──► 放大（2×） ──► chain
+        │
+        ▼
+   L2 任务预算到期 ⇒ TIMED_OUT + errors=timeout（不退款）
+```
+
+### 9.5 三层超时的判定依据
+
+任务级超时只认 `created_at + generation_timeout` 这一个 deadline：外层 `asyncio.timeout(remaining)` 到期时 `scope.expired()` 为真；节点级超时在 `_generate` 的每次尝试出口被包成 `ProviderTimeout`（`code=provider_timeout`），因此不会再从 `_execute` 逃逸。唯一的例外是"生成阶段抛出的裸 `TimeoutError`"（历史兼容口径，BF-03/F11 的终态矩阵用例钉住），准备 / 配文 / 发送阶段的 `TimeoutError` 按普通失败结算。

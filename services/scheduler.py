@@ -15,8 +15,9 @@ except ImportError:  # 允许在不含 AstrBot 运行依赖的源码环境运行
     class _AiohttpClientError(Exception):
         pass
 
+from ..core import diagnostics
 from ..core.config import available_providers, matches_template
-from ..core.errors import ConfigurationError, NoOutputError, ProviderError
+from ..core.errors import ConfigurationError, NoOutputError, ProviderError, ProviderTimeout
 from ..core.models import DrawTask, ImageResult, TaskStage, TaskState
 from ..core.prompting import (
     REFERENCE_RELATION_SUFFIX,
@@ -203,8 +204,20 @@ class TaskScheduler:
         声明的注入开关（``task_config.inject_reference_note``）就在里面。漏传必须炸，
         不许静默按 True/False 走 —— 这是 ``core/enhance.plan(*, remaining)`` 的同一条教训。
         """
-        explicit_references = list(task.request.references)
-        persona_references = list(task.runtime.get("persona_references", []) or [])
+        # v1.4.1 C-COMPRESS：主流程在 ``_prepare`` 末尾把"发往 provider 的副本"算好并
+        # 放进 runtime（``send_references`` / ``send_persona_references``）。这里优先取
+        # 副本；缺失时退回原图（例如压缩关闭、单元测试直接调本方法）。**不得**在这里
+        # 现场压缩——同一任务多次 attempt 会重复解码，且违反"一次性"约束（§3.13）。
+        explicit_references = list(
+            task.runtime["send_references"]
+            if "send_references" in task.runtime
+            else task.request.references
+        )
+        persona_references = list(
+            task.runtime["send_persona_references"]
+            if "send_persona_references" in task.runtime
+            else (task.runtime.get("persona_references", []) or [])
+        )
         limit = max(0, int(getattr(provider, "reference_image_limit", 0) or 0))
         if limit > 0:
             persona_budget = max(0, limit - len(explicit_references))
@@ -251,6 +264,7 @@ class TaskScheduler:
 
     async def _execute(self, task: DrawTask) -> None:
         config = self.config_getter()
+        scope = None
         try:
             remaining = config.generation_timeout - max(0.0, time.monotonic() - task.created_at)
             if remaining <= 0:
@@ -262,7 +276,8 @@ class TaskScheduler:
                 max(0.0, time.monotonic() - task.created_at),
                 task.request.count,
             )
-            async with asyncio.timeout(remaining):
+            scope = asyncio.timeout(remaining)
+            async with scope:
                 async with self._limiter.slot():
                     task.state = TaskState.RUNNING
                     self.set_stage(task, TaskStage.PREPARING_REFERENCES)
@@ -287,12 +302,16 @@ class TaskScheduler:
                         error = str(getattr(outcome, "error", "") or "")
                         if error:
                             task.errors.append(f"delivery:{error}")
-        except asyncio.TimeoutError:
-            task.state = TaskState.TIMED_OUT
-            task.runtime.setdefault("generation_success", False)
-            task.runtime.setdefault("usable_output_count", 0)
-            # 供失败配文透传原因（脱敏后转述给用户）。
-            task.runtime.setdefault("last_provider_error", "任务超时")
+        except asyncio.TimeoutError as exc:
+            # v1.4.1 C-TIMEOUT：只有**任务总预算真的到期**才是 TIMED_OUT。准备/投递/
+            # 节点适配器内部抛出的 TimeoutError 不是总超时，必须按普通失败结算
+            # （否则"节点超时"会伪装成"总超时"：契约 §5.1 / §5.3）。
+            if not self._deadline_expired(task, config, scope):
+                self._record_failure(task, exc)
+                if not task.runtime.get("runner_started"):
+                    await self._send_terminal_notice(task)
+                return
+            self._record_task_timeout(task, config)
             # 超时时若主发送流程尚未完成（runner 未运行，或已运行但平台发送没
             # 走完且没有成功投递记录），补发一次超时通知：配文/发送把预算耗尽时
             # 用户不应静默收不到任何消息。runner 已完成主发送（_finish_task 已置
@@ -313,19 +332,7 @@ class TaskScheduler:
             task.state = TaskState.CANCELLED
             raise
         except Exception as exc:
-            task.errors.append(type(exc).__name__)
-            # 供失败配文透传原因：脱敏 + 截断，避免上游任意文本直接进 LLM 上下文。
-            task.runtime["last_provider_error"] = redact_debug(str(exc))[:200] or type(exc).__name__
-            if task.runtime.get("generation_success"):
-                task.state = TaskState.DELIVERY_FAILED
-            elif isinstance(exc, NoOutputError):
-                task.state = TaskState.NO_OUTPUT
-            elif task.runtime.get("output_processing_completed"):
-                task.state = TaskState.NO_OUTPUT
-            else:
-                task.state = TaskState.FAILED
-            task.runtime.setdefault("generation_success", False)
-            task.runtime.setdefault("usable_output_count", 0)
+            self._record_failure(task, exc)
             if not task.runtime.get("runner_started"):
                 await self._send_terminal_notice(task)
         finally:
@@ -378,6 +385,62 @@ class TaskScheduler:
                 task.errors.append(f"terminal_notice:{error or 'SendFailed'}")
         except Exception as exc:
             task.errors.append(f"terminal_notice:{type(exc).__name__}")
+
+    @staticmethod
+    def _deadline_expired(task: DrawTask, config, scope) -> bool:
+        """任务总预算是否**真的**到期（不把内部 TimeoutError 误判成总超时）。"""
+        if task.runtime.get("timeout_guard_exhausted"):
+            # 文字降级前的保护余量判定为"预算不够"：这是事实上的总预算到期。
+            return True
+        try:
+            if scope is not None and scope.expired():
+                return True
+        except Exception:  # pragma: no cover - 旧版 asyncio 没有 expired()
+            pass
+        budget = float(getattr(config, "generation_timeout", 0) or 0)
+        if budget <= 0:
+            return True
+        elapsed = max(0.0, time.monotonic() - float(task.created_at or time.monotonic()))
+        if elapsed >= budget - 0.05:
+            return True
+        # 生成阶段抛出的裸 TimeoutError：``_generate`` 出口已把节点/单次调用超时统一
+        # 包成 ``ProviderTimeout``，因此这里只可能是任务级超时（v1.4.0 兼容口径，
+        # BF-03/F11 的终态矩阵用例钉住这一条）。其余阶段（准备参考图、配文、发送）
+        # 抛出的 TimeoutError 属于**内部**异常，按普通失败结算，不冒充总超时。
+        return task.stage == TaskStage.REQUESTING_PROVIDER
+
+    def _record_task_timeout(self, task: DrawTask, config) -> None:
+        """TIMED_OUT 的统一结算：状态 + 非空 errors + 可诊断的余量事实（§5.4）。"""
+        task.state = TaskState.TIMED_OUT
+        task.runtime.setdefault("generation_success", False)
+        task.runtime.setdefault("usable_output_count", 0)
+        # 供失败配文透传原因（脱敏后转述给用户）。
+        task.runtime.setdefault("last_provider_error", "任务超时")
+        budget = int(getattr(config, "generation_timeout", 0) or 0)
+        elapsed = max(0.0, time.monotonic() - float(task.created_at or time.monotonic()))
+        task.runtime.setdefault("timeout_kind", "task_budget")
+        task.runtime["timeout_budget"] = budget
+        task.runtime["timeout_elapsed"] = round(elapsed, 1)
+        # 契约 §5.4：FAILED/TIMED_OUT/DELIVERY_FAILED 的 errors 必须非空；这里只加**一条**
+        # 与 v1.4.0 兼容的稳定标记，避免同一任务被同一原因刷屏。
+        if "timeout" not in task.errors:
+            task.errors.append("timeout")
+
+    def _record_failure(self, task: DrawTask, exc: BaseException) -> None:
+        """普通失败结算（异常路径的唯一入口，TIMED_OUT 不走这里）。"""
+        task.errors.append(type(exc).__name__)
+        # 供失败配文透传原因：脱敏 + 截断，避免上游任意文本直接进 LLM 上下文。
+        task.runtime["last_provider_error"] = redact_debug(str(exc))[:200] or type(exc).__name__
+        if task.runtime.get("generation_success"):
+            task.state = TaskState.DELIVERY_FAILED
+        elif isinstance(exc, NoOutputError):
+            task.state = TaskState.NO_OUTPUT
+        elif task.runtime.get("output_processing_completed"):
+            task.state = TaskState.NO_OUTPUT
+        else:
+            task.state = TaskState.FAILED
+        task.runtime.setdefault("generation_success", False)
+        task.runtime.setdefault("usable_output_count", 0)
 
     @staticmethod
     def _record_adapter_subcalls(task: DrawTask, adapter) -> None:
@@ -607,6 +670,10 @@ class TaskScheduler:
                 # 向外传播（由 ``_execute`` 落 TIMED_OUT），不占文字调用次数、不写节点
                 # 的 outcome/reason、也不去下一个节点。注意这不是"单次 provider 超时"：
                 # 后者仍按既有规则只结束本节点。
+                # v1.4.1：这条路径确实是"任务预算不够了"，必须让 ``_execute`` 按
+                # TIMED_OUT 结算而不是普通失败（契约 §5.4）。打上事实标记后抛出。
+                task.runtime["timeout_kind"] = "text_guard"
+                task.runtime["timeout_guard_exhausted"] = True
                 raise asyncio.TimeoutError("参考图文字降级预算已用尽")
             # 额度在**发起前**占用：该次调用即使失败/超时也不再赠送（X3）。
             text_attempts += 1
@@ -633,13 +700,23 @@ class TaskScheduler:
                     task.runtime.get("current_persona_reference_count", 0),
                 )
                 try:
-                    async with asyncio.timeout(min(float(attempt.timeout), remaining)):
-                        results = await adapter.generate(
-                            _ProxySession(self.session, config.proxy_url)
-                            if attempt.enable_proxy and config.proxy_url else self.session,
-                            text_request,
-                            key,
-                        )
+                    try:
+                        async with asyncio.timeout(min(float(attempt.timeout), remaining)):
+                            results = await adapter.generate(
+                                _ProxySession(self.session, config.proxy_url)
+                                if attempt.enable_proxy and config.proxy_url else self.session,
+                                text_request,
+                                key,
+                            )
+                    except TimeoutError as exc:
+                        # 单次调用超时同样是 L1：包装成 ProviderTimeout 后按"本节点
+                        # 文字阶段失败"结束，不冒充任务级超时（契约 §5.1）。
+                        if time.monotonic() >= deadline:
+                            raise
+                        raise ProviderTimeout(
+                            f"节点超时 node={attempt.id} model={model} "
+                            f"timeout={min(float(attempt.timeout), remaining):.0f}s"
+                        ) from exc
                 finally:
                     # 原生节点单次调用内部的子请求（≤4）单独实计，纯文字不例外。
                     self._record_adapter_subcalls(task, adapter)
@@ -790,6 +867,10 @@ class TaskScheduler:
                 # 为空；空元组上取模会抛 ZeroDivisionError（异常发生在 try 之外，
                 # 任务只会记一个不可诊断的除零错误）。
                 adapter = ADAPTERS[attempt.api_type](attempt)
+                # v1.4.1：每次 attempt 一份上传事实（aiohttp trace 回调写入），
+                # 失败时只记录 phase/耗时/上行字节/预算，绝不落图片或 URL。
+                trace = diagnostics.AttemptTrace().begin()
+                trace_token = diagnostics.push(trace)
                 key_index = self._key_indices.get(attempt.id, 0)
                 key = attempt.api_keys[key_index % len(attempt.api_keys)] if attempt.api_keys else ""
                 self._key_indices[attempt.id] = key_index + 1
@@ -804,13 +885,25 @@ class TaskScheduler:
                         task.runtime.get("current_persona_reference_count", 0),
                     )
                     try:
-                        async with asyncio.timeout(attempt.timeout):
-                            results = await adapter.generate(
-                                _ProxySession(self.session, proxy_url)
-                                if attempt.enable_proxy and proxy_url else self.session,
-                                attempt_request,
-                                key,
-                            )
+                        try:
+                            async with asyncio.timeout(attempt.timeout):
+                                results = await adapter.generate(
+                                    _ProxySession(self.session, proxy_url)
+                                    if attempt.enable_proxy and proxy_url else self.session,
+                                    attempt_request,
+                                    key,
+                                )
+                        except TimeoutError as exc:
+                            # L1（节点/单次调用超时）：必须复用 ``ProviderTimeout``，让上层
+                            # 按"这个节点超时了，继续下一个"处理；**绝不**把裸超时抛到
+                            # ``_execute`` 去冒充任务级 TIMED_OUT（契约 §5.1）。真到总预算
+                            # 时这里直接放行原异常，交给总超时结算。
+                            if time.monotonic() >= deadline:
+                                raise
+                            raise ProviderTimeout(
+                                f"节点超时 node={attempt.id} model={model} "
+                                f"timeout={attempt.timeout}s"
+                            ) from exc
                     finally:
                         # BF-01：原生节点单次调用内部的子请求（≤4）单独累计，
                         # 成功/失败/超时都要计数，不能只按 adapter 调用次数。
@@ -824,6 +917,18 @@ class TaskScheduler:
                         ["bytes" if item.data is not None else "local" if item.local_path else "url" for item in results],
                         sum(len(item.data or b"") for item in results),
                     )
+                    # v1.4.1 C-ECHO：基线只能是**这次成功 attempt 实际发出的**图集
+                    # （压缩后的副本 + 实际采样到的 Persona）。原素材在 inputs/，
+                    # 但文件名/字节都已不同，不能用它重建基线（契约 rev2 §1）。
+                    delivered = list(attempt_request.references)
+                    task.runtime["delivered_references"] = delivered
+                    task.runtime["delivered_reference_files"] = [
+                        str(image.filename or "")[:120] for image in delivered
+                    ]
+                    task.runtime["delivered_reference_digests"] = [
+                        __import__("hashlib").sha256(image.data or b"").hexdigest()
+                        for image in delivered
+                    ]
                     return results
                 except (ProviderError, asyncio.TimeoutError) as exc:
                     last_error = exc
@@ -871,6 +976,31 @@ class TaskScheduler:
                                 no_output_error = text_outcome.error
                         break
                 except _AiohttpClientError as exc:
+                    phase = trace.phase(exc)
+                    elapsed = trace.elapsed
+                    diagnostics.record(
+                        task,
+                        provider_id=attempt.id,
+                        model=model,
+                        phase=phase,
+                        elapsed=elapsed,
+                        up_bytes=trace.up_bytes,
+                        timeout=attempt.timeout,
+                        error_type=type(exc).__name__,
+                        detail=str(exc),
+                    )
+                    self.warn(
+                        diagnostics.log_line(
+                            provider_id=attempt.id,
+                            model=model,
+                            phase=phase,
+                            elapsed=elapsed,
+                            up_bytes=trace.up_bytes,
+                            timeout=attempt.timeout,
+                            error_type=type(exc).__name__,
+                            detail=str(exc),
+                        )
+                    )
                     wrapped = ProviderError(f"网络请求失败 ({type(exc).__name__})")
                     last_error = wrapped
                     task.runtime.setdefault("attempt_errors", []).append(
@@ -885,6 +1015,8 @@ class TaskScheduler:
                         type(wrapped).__name__, str(wrapped),
                     )
                     self.logger(attempt, wrapped, task)
+                finally:
+                    diagnostics.pop(trace_token)
         # 零输出说明至少一次 Provider 请求已经完成并可能产生费用。
         # 全部尝试结束后仍以 no_output 优先结算，避免误按 failed 退款。
         self.debug(

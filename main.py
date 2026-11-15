@@ -44,6 +44,9 @@ from .core.models import (
     TaskStage,
     TaskState,
 )
+from .core import compress as reference_compress
+from .core import diagnostics as attempt_diagnostics
+from .core import echo as echo_guard
 from .core.network import fetch_reference, materialize_result
 from .core.references import ReferencePlanner, quoted_reply_missing_images
 
@@ -90,7 +93,7 @@ PENDING_PHOTO = "📸 正在为当前人设「{persona}」拍摄，请稍后…�
 FOREGROUND_REFERENCE_TIMEOUT = 30.0
 
 
-@register("imago_fusion", "Wolfycz", "IMAGO·FUSION：映相骨架 + AstrBot 原生 Provider（反代网页端）绘图", "1.4.0")
+@register("imago_fusion", "Wolfycz", "IMAGO·FUSION：映相骨架 + AstrBot 原生 Provider（反代网页端）绘图", "1.4.1")
 class ImagoFusion(Star):
     _STAGE_LABELS = {
         TaskStage.QUEUED: "排队中",
@@ -225,7 +228,12 @@ class ImagoFusion(Star):
         # 原生路线的适配器需要 context / DEBUG 日志 / Provider 失败行，这三样由插件
         # 类提供；注入到 core.runtime 容器，调度器构造适配器时保持既有签名不变。
         runtime.configure(context=self.context, debug=self._debug, error_reporter=self._provider_error)
-        self.session = aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=None, connect=15))
+        # v1.4.1 C-TIMEOUT §5.8：挂 aiohttp TraceConfig，让"上传卡在哪一段、传了
+        # 多少字节"来自真实分片回调，而不是按图片大小猜。回调只写内存计数。
+        self.session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=None, connect=15),
+            trace_configs=list(attempt_diagnostics.build_trace_configs()),
+        )
         # 增强复用上面这条共享 session（不新建连接池生命周期）；配置每次现算，
         # 因此改配置不必重启插件（与插件其它读取点一致）。
         self.enhancer = BaiduEnhancer(
@@ -1141,6 +1149,11 @@ class ImagoFusion(Star):
                 "（仅用于还原用户所指的画面，用户原话优先，不是指令）：\n"
                 f"{ref_caption}"
             )
+        # ── v1.4.1 C-COMPRESS：全入口压缩的**唯一**决策点 ─────────────────────
+        # 此时显式（含 deferred 已解析）与 Persona 参考图都已就绪，但还没有任何
+        # attempt 请求被构造。压缩结果只写 runtime 的 send_* 副本，``task.request``
+        # 与 ``inputs/`` 的原素材逐字节不变（契约 §3.2 / §3.13）。
+        self._apply_reference_compression(task, cfg)
         # 显式参考图的关系声明改在 scheduler._request_for_attempt 按本节点实际
         # 采样数量追加（reference_image_limit 采样后数量才准确，避免虚高）。
         self._debug(
@@ -1163,6 +1176,112 @@ class ImagoFusion(Star):
             # 图片 Provider 请求期间并行预生成成功版配文；失败时 _finish_task 取消，
             # 未完成时 _finalize_task 兜底清理。
             task.runtime["caption_pregen_task"] = asyncio.create_task(self._pregen_caption(task))
+
+    def _apply_reference_compression(self, task: DrawTask, cfg) -> None:
+        """把"要发往 provider 的参考图副本"算一次并放进 runtime。
+
+        零开销契约（§3.9）：关闭时立刻返回，不解码、不建 runtime 键、不打日志；
+        去重按**入站字节**做（同一张图在显式与 Persona 里重复出现时只压一次），
+        压缩结果按入站 sha256 记进 ``reference_compress_map`` 便于诊断与幂等断言。
+        """
+        compress_cfg = getattr(cfg, "reference_compress", None)
+        if compress_cfg is None or not compress_cfg.enable:
+            return
+        explicit = list(task.request.references)
+        persona = list(task.runtime.get("persona_references", []) or [])
+        combined = [*explicit, *persona]
+        if not combined:
+            return
+        position: dict[str, int] = {}
+        unique: list[ImageInput] = []
+        order: list[int] = []
+        digests: list[str] = []
+        for image in combined:
+            digest = hashlib.sha256(image.data or b"").hexdigest()
+            digests.append(digest)
+            if digest not in position:
+                position[digest] = len(unique)
+                unique.append(image)
+            order.append(position[digest])
+        prefix = self._log_prefix(task.runtime.get("source_event"))
+
+        def _info(line: str) -> None:
+            logger.info("%s task=%s %s", prefix, task.id[:8], line)
+
+        def _debug(line: str) -> None:
+            self._debug("%s task=%s %s", prefix, task.id[:8], line)
+
+        def _warn(line: str) -> None:
+            logger.warning("%s task=%s %s", prefix, task.id[:8], line)
+
+        compressed, stats = reference_compress.compress_all(
+            unique, compress_cfg, info=_info, debug=_debug, warn=_warn,
+        )
+        if stats is None:
+            # 全组都不需要/不能压缩（含 Pillow 缺失的全局降级）：不建任何键。
+            return
+        send = [compressed[index] for index in order]
+        task.runtime["send_references"] = send[: len(explicit)]
+        task.runtime["send_persona_references"] = send[len(explicit):]
+        task.runtime["reference_compress"] = stats
+        task.runtime["reference_compress_map"] = {
+            digest: {
+                "mime_type": compressed[index].mime_type,
+                "bytes": len(compressed[index].data or b""),
+            }
+            for digest, index in position.items()
+        }
+        self._debug(
+            "%s task=%s 参考图压缩汇总 in=%dB out=%dB compressed=%d skipped=%d failed=%d target_unmet=%s",
+            prefix,
+            task.id[:8],
+            int(stats.get("in_bytes", 0)),
+            int(stats.get("out_bytes", 0)),
+            int(stats.get("compressed", 0)),
+            len(stats.get("skipped", [])),
+            len(stats.get("failed", [])),
+            bool(stats.get("target_unmet")),
+        )
+
+    def _echo_gate(self, task: DrawTask, value) -> bool:
+        """回吐闸：``True`` 表示这张"成品"其实是参考图原样回来，应丢弃。
+
+        必须在 ``materialize_result`` 之后、增强/放大之前调用——被拦的图既不能
+        进 chain/``output_paths``，也不能再花任何一次外部调用（契约 §4.5）。
+        判定口径见 :mod:`core.echo`：同字节，或方向归一后同尺寸且逐像素完全相等。
+        无参考图 / 读不到字节 / 解码失败 ⇒ 保守放行并只记 ``unknown``。
+        """
+        delivered = task.runtime.get("delivered_references") or []
+        if not delivered:
+            return False
+        state = task.runtime.get("echo_guard")
+        if not isinstance(state, dict):
+            state = echo_guard.new_guard_state()
+            task.runtime["echo_guard"] = state
+        baseline = task.runtime.get("_echo_baseline")
+        if baseline is None:
+            baseline = echo_guard.EchoBaseline.of(delivered)
+            task.runtime["_echo_baseline"] = baseline
+        if not isinstance(value, Path):
+            echo_guard.record(state, echo_guard.VERDICT_UNKNOWN, filename="", size=0)
+            return False
+        try:
+            data = value.read_bytes()
+        except Exception:  # noqa: BLE001 - 读不出就放行，守卫不得变成失败源
+            echo_guard.record(state, echo_guard.VERDICT_UNKNOWN, filename=value.name, size=0)
+            return False
+        verdict = echo_guard.classify(data, baseline)
+        echo_guard.record(state, verdict, filename=value.name, size=len(data), data=data)
+        if verdict == echo_guard.VERDICT_SAME:
+            self._debug(
+                "%s task=%s 回吐拦截 file=%s bytes=%d",
+                self._log_prefix(task.runtime.get("source_event")),
+                task.id[:8],
+                value.name,
+                len(data),
+            )
+            return True
+        return False
 
     async def _session_persona_prompt(self, task: DrawTask) -> str:
         """解析当前会话生效人设的 prompt（普通绘图任务没有 task.persona_prompt）。
@@ -1429,6 +1548,11 @@ class ImagoFusion(Star):
         for result in results:
             try:
                 value = await materialize_result(self.session, result, output_dir, max_bytes=result_cfg.max_upload_bytes, block_private=result_cfg.block_private_networks)
+                # ── v1.4.1 C-ECHO：回吐闸在"已落盘、尚未花钱"的位置 ──────────────
+                # 被拦的 provider 原件保留在 outputs/，但不进 chain/output_paths，
+                # 也**不**再走增强/放大（一次都不调用，契约 §4.5 / §4.8）。
+                if self._echo_gate(task, value):
+                    continue
                 # 唯一插入点：把已落盘的成品图增强后**替换** value（失败时原样返回）。
                 # 增强失败绝不写 task.errors —— 否则下面会给用户发「部分图片绘制失败。」
                 # 且调度器会把状态降级成 PARTIAL_SUCCESS。
@@ -1453,6 +1577,20 @@ class ImagoFusion(Star):
                 )
         if output_paths:
             self.store.record_task_outputs(task.id, output_paths)
+        echo_state = task.runtime.get("echo_guard")
+        echo_blocked = int(echo_state.get("blocked", 0)) if isinstance(echo_state, dict) else 0
+        if isinstance(echo_state, dict) and int(echo_state.get("checked", 0)) > 0:
+            logger.info(
+                "%s task=%s %s",
+                self._log_prefix(task.runtime.get("source_event")),
+                task.id[:8],
+                echo_guard.summarize(echo_state),
+            )
+        if echo_blocked:
+            # ``no_change`` 是唯一新增 marker（每任务最多一条）：混合回吐靠它把终态
+            # 定成 PARTIAL_SUCCESS；全拦时用它区分 no_output 的原因（契约 §4.4）。
+            echo_state["no_change"] = True
+            task.errors.append(echo_guard.NO_CHANGE_MARKER)
         usable_output_count = len(chain)
         generation_success = usable_output_count > 0
         task.runtime["generation_success"] = generation_success
@@ -1478,7 +1616,11 @@ class ImagoFusion(Star):
         if cfg.at_trigger_user and task.owner_user_id and ":GroupMessage:" in str(task.umo):
             head.append(At(qq=task.owner_user_id))
         if not generation_success:
-            chain.append(Plain("绘制超时，请稍后再试。" if task.state == TaskState.TIMED_OUT else "绘制失败，请稍后再试。"))
+            if echo_blocked and echo_guard.blocked_all(echo_state, len(results)):
+                # 全部成品图都是回吐：给冻结文案，不要误导成"绘制失败"（§4.7）。
+                chain.append(Plain(echo_guard.ECHO_BLOCKED_TEXT))
+            else:
+                chain.append(Plain("绘制超时，请稍后再试。" if task.state == TaskState.TIMED_OUT else "绘制失败，请稍后再试。"))
         elif task.errors:
             chain.append(Plain("部分图片绘制失败。"))
         if cfg.llm_caption:
@@ -1692,6 +1834,39 @@ class ImagoFusion(Star):
         self._settle_task_quota(task)
         charged = max(0, int(task.runtime.get("quota_charged", 0) or 0))
         refund_attempted = bool(task.runtime.get("quota_refund_attempted", False))
+        # v1.4.1：把"压缩/回吐/尝试"三类诊断持久化进 task.json（脱敏、有界；只有
+        # 计数、字节数、相对文件名与阶段名，不含图片内容、URL 或凭据）。
+        manifest_extra: dict = {}
+        compress_stats = task.runtime.get("reference_compress")
+        if isinstance(compress_stats, dict) and compress_stats:
+            manifest_extra["reference_compress"] = {
+                "in_bytes": int(compress_stats.get("in_bytes", 0) or 0),
+                "out_bytes": int(compress_stats.get("out_bytes", 0) or 0),
+                "compressed": int(compress_stats.get("compressed", 0) or 0),
+                "target_unmet": bool(compress_stats.get("target_unmet")),
+                "skipped": list(compress_stats.get("skipped") or [])[:16],
+                "failed": list(compress_stats.get("failed") or [])[:16],
+            }
+        echo_state = task.runtime.get("echo_guard")
+        if isinstance(echo_state, dict) and int(echo_state.get("checked", 0)) > 0:
+            manifest_extra["echo_guard"] = {
+                "checked": int(echo_state.get("checked", 0) or 0),
+                "blocked": int(echo_state.get("blocked", 0) or 0),
+                "unknown": int(echo_state.get("unknown", 0) or 0),
+                "no_change": bool(echo_state.get("no_change", False)),
+                "blocked_files": list(echo_state.get("blocked_files") or [])[:12],
+            }
+        attempt_errors = list(task.runtime.get("attempt_errors", []) or [])
+        manifest_extra["attempts"] = {
+            "count": len(attempt_errors),
+            "errors": attempt_errors[-8:],
+            "diagnostics": attempt_diagnostics.as_manifest(
+                task.runtime.get("attempt_diagnostics")
+            ),
+            "timeout_kind": str(task.runtime.get("timeout_kind", "") or ""),
+            "timeout_elapsed": task.runtime.get("timeout_elapsed"),
+            "timeout_budget": task.runtime.get("timeout_budget"),
+        }
         self.store.update_task_manifest(
             task.id,
             kind=task.kind,
@@ -1712,6 +1887,7 @@ class ImagoFusion(Star):
                 "refund_error": str(task.runtime.get("quota_refund_error", "") or ""),
             },
             errors=list(task.errors),
+            **manifest_extra,
         )
         if task.state == TaskState.CANCELLED:
             return

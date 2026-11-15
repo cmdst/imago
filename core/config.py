@@ -7,6 +7,7 @@ from .models import (
     EnhanceConfig,
     ProviderConfig,
     QuotaConfig,
+    ReferenceCompressConfig,
     ReferenceFallbackConfig,
     RuntimeConfig,
     UpscaleConfig,
@@ -159,6 +160,24 @@ def _enabled_value(value: Any) -> bool:
     return True
 
 
+def _bool_or_default(value: Any, default: bool) -> bool:
+    """布尔键容错解析：面板 bool、文本 ``true/false``、缺键时取 ``default``。
+
+    与 ``_enabled_value`` 的区别只有默认值方向——``_enabled_value`` 用于"缺键=开"
+    的节点启停，这里用于"缺键=关"的 ``keep_alpha`` 一类开关（契约 §6.2）。
+    """
+    if value is None:
+        return default
+    if isinstance(value, bool):
+        return value
+    text = str(value).strip().lower()
+    if text in {"false", "0", "no", "off", ""}:
+        return False
+    if text in {"true", "1", "yes", "on"}:
+        return True
+    return default
+
+
 def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
     providers: list[ProviderConfig] = []
     seen: set[str] = set()
@@ -210,6 +229,7 @@ def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
     enhance_raw = raw.get("enhance_config", {}) or {}
     upscale_raw = raw.get("upscale_config", {}) or {}
     reference_fallback_raw = raw.get("reference_fallback_config", {}) or {}
+    reference_compress_raw = raw.get("reference_compress_config", {}) or {}
     style = _style(optimizer.get("optimizer_style", "default(通用)"))
     checkin_min = max(0, int(quota_raw.get("daily_checkin_quota_min", 1) or 0))
     checkin_max = max(checkin_min, int(quota_raw.get("daily_checkin_quota_max", 3) or 0))
@@ -296,6 +316,26 @@ def load_config(raw: Mapping[str, Any]) -> RuntimeConfig:
                 5, min(60, _int_or_default(reference_fallback_raw.get("vision_timeout_seconds"), 20)),
             ),
             notify_user=bool(reference_fallback_raw.get("notify_user", True)),
+        ),
+        # 入站参考图压缩（`reference_compress_config`，7 键，默认**开启**）：
+        # 只压缩发往 provider 的副本；关闭时零解码/零文件/零新增日志（契约 §3.9）。
+        # 数值 clamp 一律按 §3.3：max_edge 0-4096（0=禁止缩放）、jpeg_quality 40-95、
+        # target_kb 32-2048、min_bytes 0-1 MiB、max_pixels 1e6-1e8。
+        reference_compress=ReferenceCompressConfig(
+            enable=_enabled_value(reference_compress_raw.get("enable")),
+            max_edge=max(0, min(4096, _int_or_default(reference_compress_raw.get("max_edge"), 1536))),
+            jpeg_quality=max(
+                40, min(95, _int_or_default(reference_compress_raw.get("jpeg_quality"), 85)),
+            ),
+            target_kb=max(32, min(2048, _int_or_default(reference_compress_raw.get("target_kb"), 128))),
+            min_bytes=max(
+                0, min(1_048_576, _int_or_default(reference_compress_raw.get("min_bytes"), 32768)),
+            ),
+            keep_alpha=_bool_or_default(reference_compress_raw.get("keep_alpha"), False),
+            max_pixels=max(
+                1_000_000,
+                min(100_000_000, _int_or_default(reference_compress_raw.get("max_pixels"), 40_000_000)),
+            ),
         ),
     )
 

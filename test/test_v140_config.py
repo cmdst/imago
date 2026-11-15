@@ -55,13 +55,28 @@ def _plugin(raw):
 
 
 class SchemaShapeTests(unittest.TestCase):
-    def test_c1_schema_has_eleven_groups_and_five_fallback_keys(self):
+    def test_c1_schema_has_twelve_groups_and_five_fallback_keys(self):
         schema = json.loads(SCHEMA_PATH.read_text(encoding="utf-8"))
+        # v1.4.1：新增 ``reference_compress_config``（契约 §6.1），组序固定 12 个。
         self.assertEqual(set(schema), {
             "log_with_bot_id", "providers", "optimizer_config", "quota_config",
-            "task_config", "storage_config", GROUP,
+            "task_config", "storage_config", GROUP, "reference_compress_config",
             "enhance_config", "upscale_config", "proxy_url", "template_override",
         })
+        compress_items = schema["reference_compress_config"]["items"]
+        self.assertEqual(set(compress_items), {
+            "enable", "max_edge", "jpeg_quality", "target_kb",
+            "min_bytes", "keep_alpha", "max_pixels",
+        })
+        self.assertEqual(compress_items["enable"]["default"], True)
+        self.assertEqual(compress_items["max_edge"]["default"], 1536)
+        self.assertEqual(compress_items["jpeg_quality"]["default"], 85)
+        self.assertEqual(compress_items["target_kb"]["default"], 128)
+        self.assertEqual(compress_items["min_bytes"]["default"], 32768)
+        self.assertEqual(compress_items["keep_alpha"]["default"], False)
+        self.assertEqual(compress_items["max_pixels"]["default"], 40000000)
+        for field in compress_items.values():
+            self.assertEqual(set(field) & {"min", "max"}, set())
         items = schema[GROUP]["items"]
         self.assertEqual(set(items), {
             "enable", NEW_KEY, "caption_max_chars", "vision_timeout_seconds", "notify_user",

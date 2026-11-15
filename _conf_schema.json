@@ -366,6 +366,55 @@
       }
     }
   },
+  "reference_compress_config": {
+    "description": "参考图压缩",
+    "type": "object",
+    "hint": "发往绘图节点的参考图副本会先按最长边与目标体积压缩（显式参考图、引用消息、URL/base64/data、Persona 参考图一视同仁）；本地的 inputs/ 原素材与出图结果都不受影响。关闭时零解码、零新增文件、零新增日志。",
+    "items": {
+      "enable": {
+        "description": "启用参考图压缩",
+        "type": "bool",
+        "default": true,
+        "hint": "开启后每张参考图在发送前压缩一次；同一张图只压一次，不会因为重试而重复有损。关闭后按原字节发送，行为与 1.4.0 完全一致。"
+      },
+      "max_edge": {
+        "description": "最长边上限（像素）",
+        "type": "int",
+        "default": 1536,
+        "hint": "范围 0-4096。只缩小、不放大；0 表示完全不缩放（仍会尝试降低质量档，但绝不会缩边）。"
+      },
+      "jpeg_quality": {
+        "description": "JPEG 起始质量",
+        "type": "int",
+        "default": 85,
+        "hint": "范围 40-95。未达标时按 10 递减重试，最低不低于 40，不会把质量档压到糊图。"
+      },
+      "target_kb": {
+        "description": "目标体积（KB）",
+        "type": "int",
+        "default": 128,
+        "hint": "范围 32-2048，按 1 KB = 1024 字节计算。达不到目标时保留最小候选并标注 target_unmet，不会为了达标把图压坏。"
+      },
+      "min_bytes": {
+        "description": "压缩起点（字节）",
+        "type": "int",
+        "default": 32768,
+        "hint": "小于该字节数的参考图直接原样发送（零解码）；0 表示所有参考图都参与压缩。"
+      },
+      "keep_alpha": {
+        "description": "保留透明通道",
+        "type": "bool",
+        "default": false,
+        "hint": "关闭时透明区域合成白底后按 JPEG 输出（体积最小）；开启时保留 alpha 并输出 PNG，体积通常更大。"
+      },
+      "max_pixels": {
+        "description": "像素总数上限",
+        "type": "int",
+        "default": 40000000,
+        "hint": "范围 1000000-100000000。超过该像素数的参考图不参与压缩（避免解码超大图耗尽内存），按原样发送。"
+      }
+    }
+  },
   "enhance_config": {
     "description": "图像清晰度增强（百度）",
     "type": "object",

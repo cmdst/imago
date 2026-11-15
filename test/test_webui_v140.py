@@ -1117,6 +1117,7 @@ class TestV140Contract:
         assert set(schema) == {
             "log_with_bot_id", "providers", "optimizer_config", "quota_config",
             "task_config", "storage_config", "reference_fallback_config",
+            "reference_compress_config",
             "enhance_config", "upscale_config", "proxy_url", "template_override",
         }
         # 边界只在两处：schema 的 default 与 web_api 的 min/max。
