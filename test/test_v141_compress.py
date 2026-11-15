@@ -102,6 +102,29 @@ def orientation_jpeg(width: int, height: int, orientation: int = 6, seed: int = 
     return buffer.getvalue()
 
 
+
+def photo_like_png(width: int = 3000, height: int = 2000, amp: int = 9, block: int = 4) -> bytes:
+    """T-C04 夹具：3000×2000、约 0.8 MB 的"照片感" PNG。
+
+    纯噪声 PNG 会到十几 MB 且 JPEG 压不进 128 KB（``target_unmet`` 恒为 1）；
+    纯渐变又小到触发 ``no_gain``。平滑渐变 + 块状纹理让源图落在几百 KB 量级，
+    缩边到 1536px 再转码后又确实能过 128 KB，正好覆盖"大图一次到位"这条路径。
+    """
+    from PIL import Image, ImageChops
+
+    gradient = Image.linear_gradient("L").resize((width, height), Image.Resampling.BILINEAR)
+    base = Image.merge(
+        "RGB",
+        (gradient, gradient.rotate(90), gradient.transpose(Image.Transpose.FLIP_LEFT_RIGHT)),
+    )
+    noise = Image.effect_noise((width // block, height // block), amp).convert("L")
+    noise = noise.resize((width, height), Image.Resampling.NEAREST)
+    merged = Image.merge("RGB", [ImageChops.add(channel, noise, scale=2) for channel in base.split()])
+    buffer = io.BytesIO()
+    merged.save(buffer, format="PNG")
+    return buffer.getvalue()
+
+
 def config(**overrides) -> ReferenceCompressConfig:
     options = {"enable": True, "min_bytes": 0, "target_kb": 2048}
     options.update(overrides)
@@ -302,6 +325,65 @@ def _image_parts(form) -> list[bytes]:
     return parts
 
 
+class _Resp:
+    """最小 aiohttp 响应替身：只实现适配器会用到的那几项。"""
+
+    status = 200
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, *exc):
+        return False
+
+    async def json(self, content_type=None):
+        return {"data": [{"b64_json": "aGVsbG8="}]}
+
+    async def text(self):
+        return ""
+
+
+class _CaptureWriter:
+    """接住 multipart 写入的最小 writer（aiohttp 的 ``MultipartWriter`` 只要求这两个）。"""
+
+    def __init__(self):
+        self.buffer = bytearray()
+
+    async def write(self, chunk):
+        self.buffer += bytes(chunk)
+        return len(chunk)
+
+    async def write_eof(self, data=b""):
+        self.buffer += bytes(data)
+
+
+async def _serialized_parts(form) -> list[tuple[str, bytes]]:
+    """把 ``FormData`` 真的序列化成 multipart 字节流，再从**接收端**解析回来。
+
+    ``FormData._gen_form_data()`` 就是 aiohttp 发请求时走的那条路径；解析用标准库
+    ``email``，因此拿到的是"线上那几个 part 的真实载荷"，而不是 ``_fields`` 里的对象。
+    """
+    import aiohttp
+    from email.parser import BytesParser
+    from email.policy import default as email_policy
+
+    writer = form._gen_form_data()
+    capture = _CaptureWriter()
+    await writer.write(capture)
+    content_type = writer.headers.get(aiohttp.hdrs.CONTENT_TYPE, "multipart/form-data")
+    raw = (
+        b"Content-Type: " + str(content_type).encode("utf-8")
+        + b"\r\nMIME-Version: 1.0\r\n\r\n"
+        + bytes(capture.buffer)
+    )
+    message = BytesParser(policy=email_policy).parsebytes(raw)
+    parts: list[tuple[str, bytes]] = []
+    for part in message.iter_parts():
+        name = part.get_param("name", header="content-disposition") or ""
+        parts.append((str(name), part.get_payload(decode=True) or b""))
+    return parts
+
+
 class MultipartTests(unittest.IsolatedAsyncioTestCase):
     async def test_edit_multipart_sends_compressed_bytes(self):
         """B1：真实适配器 + 真实 FormData，断言分片字节 == 压缩产物。"""
@@ -313,21 +395,6 @@ class MultipartTests(unittest.IsolatedAsyncioTestCase):
             def post(self, url, *, headers=None, data=None):
                 self.form = data
                 return _Resp()
-
-        class _Resp:
-            status = 200
-
-            async def __aenter__(self):
-                return self
-
-            async def __aexit__(self, *exc):
-                return False
-
-            async def json(self, content_type=None):
-                return {"data": [{"b64_json": "aGVsbG8="}]}
-
-            async def text(self):
-                return ""
 
         original = [noise_png(700, 500, seed=8), noise_png(700, 500, seed=9)]
         outgoing, _ = logic.compress_all(
@@ -343,6 +410,73 @@ class MultipartTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(parts, [item.data for item in outgoing])
         self.assertNotEqual(parts, original)
         self.assertLess(sum(len(part) for part in parts), sum(len(item) for item in original))
+
+    async def test_receiver_parses_exactly_the_compressed_bytes(self):
+        """P3 集成：发送副本 → 真实适配器 → 接收端逐 part 比对压缩后字节。"""
+
+        class CaptureSession:
+            def __init__(self):
+                self.form = None
+
+            def post(self, url, *, headers=None, data=None):
+                self.form = data
+                return _Resp()
+
+        original = [photo_like_png(900, 700, amp=9), noise_png(700, 500, seed=31)]
+        outgoing, stats = logic.compress_all(
+            [ImageInput(payload, "image/png", f"src{index}.png") for index, payload in enumerate(original)],
+            ReferenceCompressConfig(),
+        )
+        self.assertEqual(stats["compressed"], 2)
+        adapter = OpenAIImageAdapter(
+            ProviderConfig("node", "openai_image", "https://example.invalid/v1", ("key",), model="m")
+        )
+        session = CaptureSession()
+        request = GenerationRequest("draw", count=1, size="1024x1024", references=outgoing)
+        await adapter._edit_multipart(session, request, "key", "https://example.invalid/v1/images/edits")
+        parts = await _serialized_parts(session.form)
+        images = [payload for name, payload in parts if name == "image[]"]
+        fields = {name: payload for name, payload in parts if name != "image[]"}
+        self.assertEqual(images, [item.data for item in outgoing])
+        self.assertNotEqual(images, original)
+        self.assertEqual(fields["model"], b"m")
+        self.assertEqual(fields["prompt"], b"draw")
+        self.assertEqual(fields["n"], b"1")
+        # 压缩后更小：这条断言同时证明发出去的不是原图。
+        self.assertLess(sum(len(item) for item in images), sum(len(item) for item in original))
+
+    async def test_disabled_reference_compress_sends_original_bytes(self):
+        """``enable=false``：part 字节逐字节等于入站原图（§3.9）。"""
+
+        class CaptureSession:
+            def __init__(self):
+                self.form = None
+
+            def post(self, url, *, headers=None, data=None):
+                self.form = data
+                return _Resp()
+
+        plugin = object.__new__(_plugin_class())
+        plugin.raw_config = {}
+        originals = [
+            ImageInput(noise_png(800, 600, seed=41), "image/png", "a.png"),
+            ImageInput(noise_png(800, 600, seed=42), "image/png", "b.png"),
+        ]
+        task = DrawTask("t9", "umo", GenerationRequest("draw", references=tuple(originals)))
+        task.runtime["persona_references"] = []
+        plugin._apply_reference_compression(
+            task, RuntimeConfig(providers=(), reference_compress=config(enable=False))
+        )
+        self.assertNotIn("send_references", task.runtime)
+        adapter = OpenAIImageAdapter(
+            ProviderConfig("node", "openai_image", "https://example.invalid/v1", ("key",), model="m")
+        )
+        session = CaptureSession()
+        request = GenerationRequest("draw", count=1, references=tuple(originals))
+        await adapter._edit_multipart(session, request, "key", "https://example.invalid/v1/images/edits")
+        parts = await _serialized_parts(session.form)
+        images = [payload for name, payload in parts if name == "image[]"]
+        self.assertEqual(images, [item.data for item in originals])
 
 
 class PluginCompressTests(unittest.TestCase):
@@ -468,3 +602,172 @@ class ManifestTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class LargePhotoTests(unittest.TestCase):
+    """T-C04：3000×2000 的大图在默认 7 键下必须**一次**压到 ≤131072 B。"""
+
+    def test_t_c04_large_photo_meets_target(self):
+        source = photo_like_png()
+        self.assertGreater(len(source), 500_000, "夹具必须够大，否则测不到缩边+转码链路")
+        outcome = logic.compress_reference(
+            ImageInput(source, "image/png", "photo.png"), ReferenceCompressConfig()
+        )
+        self.assertEqual(outcome.skipped, "")
+        self.assertEqual(outcome.failed, "")
+        self.assertTrue(outcome.changed)
+        self.assertLessEqual(len(outcome.image.data), 128 * 1024)
+        self.assertFalse(outcome.target_unmet)
+        self.assertLess(len(outcome.image.data), len(source))
+        self.assertLessEqual(max(logic._open_first_frame(outcome.image.data).size), 1536)
+        self.assertEqual(outcome.image.mime_type, "image/jpeg")
+        self.assertTrue(outcome.image.filename.endswith(".jpg"))
+
+    def test_size_ladder_works_on_max_edge_clamped_long_edge(self):
+        """尺寸档必须作用在 ``max_edge`` 收口后的长边（t14 验收 3）。
+
+        先乘系数再 clamp 会让三档都被 ``max_edge`` 截成同一个长边，尺寸阶梯
+        形同虚设；这里用"必须继续降尺寸才达标"的场景钉住顺序。
+        """
+        source = photo_like_png(1600, 1200, amp=9)
+        outcome = logic.compress_reference(
+            ImageInput(source, "image/png", "photo.png"),
+            config(max_edge=1024, jpeg_quality=95, target_kb=32),
+        )
+        self.assertTrue(outcome.changed)
+        self.assertLess(outcome.edge, 1024, "第二/三档必须真的把长边压到 1024 以下")
+        self.assertGreaterEqual(outcome.edge, 700)
+        self.assertLess(len(outcome.image.data), len(source))
+        self.assertLessEqual(max(logic._open_first_frame(outcome.image.data).size), 1024)
+
+
+class EncodeFailureTests(unittest.TestCase):
+    """CORE-04：任一编码异常**立即**回原图，不保留前几轮产生的有损候选。"""
+
+    def test_encode_error_rolls_back_to_original(self):
+        source = noise_png(600, 400, seed=21)
+        image = ImageInput(source, "image/png", "r.png")
+        records = {"info": [], "debug": [], "warn": []}
+        with patch.object(logic, "_encode", side_effect=OSError("encoder exploded")):
+            outgoing, stats = logic.compress_all(
+                [image],
+                config(max_edge=512, target_kb=32),
+                info=records["info"].append,
+                debug=records["debug"].append,
+                warn=records["warn"].append,
+            )
+        self.assertIs(outgoing[0], image)
+        self.assertEqual(stats["compressed"], 0)
+        self.assertEqual(stats["failed"], [{"index": 1, "reason": logic.FAIL_ERROR}])
+        self.assertEqual(stats["skipped"], [])
+        self.assertEqual(len(records["warn"]), 1)
+        self.assertIn("回退原图", records["warn"][0])
+        self.assertIn("OSError", records["warn"][0])
+        self.assertEqual(records["info"], [])
+
+    def test_encode_error_detail_is_truncated_and_redacted(self):
+        source = noise_png(600, 400, seed=22)
+        image = ImageInput(source, "image/png", "r.png")
+        long_message = "boom " + "x" * 500 + " https://user:pass@example.invalid/secret"
+        with patch.object(logic, "_encode", side_effect=RuntimeError(long_message)):
+            outcome = logic.compress_reference(image, config(max_edge=512))
+        self.assertEqual(outcome.failed, logic.FAIL_ERROR)
+        self.assertFalse(outcome.changed)
+        self.assertIs(outcome.image, image)
+        self.assertLessEqual(len(outcome.detail), 120)
+        self.assertNotIn("pass@", outcome.detail)
+
+    def test_no_gain_is_not_a_failure(self):
+        from PIL import Image
+
+        raw = io.BytesIO()
+        Image.open(io.BytesIO(noise_png(200, 200, seed=23))).save(raw, format="JPEG", quality=25)
+        image = ImageInput(raw.getvalue(), "image/jpeg", "already.jpg")
+        outcome = logic.compress_reference(image, config(max_edge=0, jpeg_quality=95))
+        self.assertEqual(outcome.skipped, logic.SKIP_NO_GAIN)
+        self.assertEqual(outcome.failed, "")
+        self.assertIs(outcome.image, image)
+
+
+class InputsPreservedTests(unittest.TestCase):
+    """T-C11：``inputs/`` 落的是**原字节**，运行期发送副本才是压缩产物。"""
+
+    def test_inputs_keep_original_bytes_while_send_copy_shrinks(self):
+        from imago_fusion.services.persona_store import PersonaStore
+
+        source = noise_png(1200, 800, seed=51)
+        image = ImageInput(source, "image/png", "big.png")
+        plugin = object.__new__(_plugin_class())
+        plugin.raw_config = {}
+        with TemporaryDirectory() as tmp:
+            store = PersonaStore(Path(tmp), lambda: 20 * 1024 * 1024)
+            plugin.store = store
+            plugin.quota_store = None
+            import hashlib
+
+            records = store.persist_task_inputs("a" * 32, [image])
+            task = DrawTask("a" * 32, "umo", GenerationRequest("draw", references=(image,)))
+            task.runtime["persona_references"] = []
+            plugin._apply_reference_compression(
+                task,
+                RuntimeConfig(
+                    providers=(),
+                    reference_compress=config(max_edge=768, target_kb=2048),
+                ),
+            )
+            send = task.runtime["send_references"][0]
+            self.assertLess(len(send.data), len(source))
+            # inputs/ 仍是原字节：大小与 sha256 都对得上。
+            self.assertEqual(records[0]["size"], len(source))
+            self.assertEqual(records[0]["sha256"], hashlib.sha256(source).hexdigest())
+            written = (store.task_dir("a" * 32) / "inputs" / records[0]["file"]).read_bytes()
+            self.assertEqual(written, source)
+            # 去重键用的也是原字节。
+            key = hashlib.sha256(source).hexdigest()
+            self.assertIn(key, task.runtime["reference_compress_map"])
+            self.assertEqual(task.runtime["reference_compress_map"][key]["bytes"], len(send.data))
+
+
+class SourceCoverageTests(unittest.IsolatedAsyncioTestCase):
+    """契约 rev2 §4：不同来源的**同一张图**必须收敛到同一个发送副本。
+
+    事件图片 / Persona 磁盘图本身就是 ``ImageInput``；``data:`` 与 ``base64://``
+    由 :func:`imago_fusion.core.network.fetch_reference` 解出来后也进同一个
+    :func:`ingest_reference`。http(s) 走同一条 ``fetch_reference`` 分支，但需要
+    网络栈，这里不覆盖（由 ``/ref-upload`` 与离线集成测试兜底）。
+    """
+
+    async def test_data_and_base64_sources_reuse_the_same_ingest(self):
+        import base64
+
+        from imago_fusion.core.network import fetch_reference
+
+        payload = photo_like_png(900, 700, amp=9)
+        cfg = ReferenceCompressConfig()
+        direct_bytes, direct_mime, direct_name, direct_outcome = logic.ingest_reference(
+            payload, "image/png", "shot.png", cfg
+        )
+        self.assertTrue(direct_outcome.changed)
+
+        data_url = "data:image/png;base64," + base64.b64encode(payload).decode("ascii")
+        fetched = await fetch_reference(
+            None, data_url, max_bytes=20 * 1024 * 1024, block_private=False
+        )
+        self.assertEqual(fetched.data, payload)  # 入站仍是原字节
+        bytes_b, mime_b, name_b, outcome_b = logic.ingest_reference(
+            fetched.data, fetched.mime_type, fetched.filename, cfg
+        )
+        # 字节与 mime 必须一致；文件名保留来源差异（data: 没有原始文件名）。
+        self.assertEqual((bytes_b, mime_b), (direct_bytes, direct_mime))
+        self.assertTrue(name_b.endswith(".jpg"))
+
+        inline = "base64://" + base64.b64encode(payload).decode("ascii")
+        fetched_base64 = await fetch_reference(
+            None, inline, max_bytes=20 * 1024 * 1024, block_private=False
+        )
+        bytes_c, mime_c, name_c, _ = logic.ingest_reference(
+            fetched_base64.data, fetched_base64.mime_type, "persona.png", cfg
+        )
+        # 同一份字节 ⇒ 完全相同的压缩产物（与来源、文件名无关）。
+        self.assertEqual((bytes_c, mime_c), (direct_bytes, direct_mime))
+        self.assertTrue(name_c.endswith(".jpg"))

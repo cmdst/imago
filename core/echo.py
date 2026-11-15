@@ -158,7 +158,14 @@ def dimensions_of(data: bytes) -> str:
 
 def new_guard_state() -> dict:
     """``task.runtime["echo_guard"]`` 的初始形状（契约 §4.9）。"""
-    return {"checked": 0, "blocked": 0, "unknown": 0, "blocked_files": []}
+    return {
+        "checked": 0,
+        "blocked": 0,
+        "unknown": 0,
+        "passed": 0,
+        "references_sent": 0,
+        "blocked_files": [],
+    }
 
 
 def record(state: dict, verdict: str, *, filename: str, size: int, data: bytes = b"") -> None:
@@ -175,6 +182,8 @@ def record(state: dict, verdict: str, *, filename: str, size: int, data: bytes =
         )
     elif verdict == VERDICT_UNKNOWN:
         state["unknown"] = int(state.get("unknown", 0)) + 1
+    # passed 与 INFO 行同源：一次检查要么拦下、要么放行（unknown 也算放行）。
+    state["passed"] = passed_count(state)
 
 
 def passed_count(state: dict) -> int:

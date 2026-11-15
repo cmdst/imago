@@ -212,13 +212,33 @@ class TerminalMatrixTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.state, TaskState.NO_OUTPUT)
         self.assertEqual(terminal_refund_amount(task.state, 1), 0)
 
-    async def test_final_timeout_means_timed_out_and_no_refund(self):
+    async def test_real_deadline_expiry_means_timed_out_and_no_refund(self):
+        """v1.4.1 C-TIMEOUT：只有按 ``created_at`` 算出的真实预算到期才是 TIMED_OUT。
+
+        t14 起不再用"``_generate`` 裸抛 TimeoutError"模拟总超时（那是内部异常），
+        改用**真实 deadline**：把 ``created_at`` 往前拨到预算之外。
+        """
+        from imago_fusion.services.quota_store import terminal_refund_amount
+
+        task = _task()
+        config = _terminal_config()
+        task.created_at = time.monotonic() - (config.generation_timeout + 5.0)
+        await self._scheduler(config, asyncio.TimeoutError())._execute(task)
+        self.assertEqual(task.state, TaskState.TIMED_OUT)
+        self.assertEqual(task.errors, ["timeout"])
+        self.assertEqual(task.runtime["last_provider_error"], "任务超时")
+        self.assertEqual(terminal_refund_amount(task.state, 1), 0)
+
+    async def test_internal_timeout_error_means_failed_and_refund(self):
+        """内部 ``asyncio.TimeoutError``（预算未到期）按普通失败结算并退款（验收 2）。"""
         from imago_fusion.services.quota_store import terminal_refund_amount
 
         task = _task()
         await self._scheduler(_terminal_config(), asyncio.TimeoutError())._execute(task)
-        self.assertEqual(task.state, TaskState.TIMED_OUT)
-        self.assertEqual(terminal_refund_amount(task.state, 1), 0)
+        self.assertEqual(task.state, TaskState.FAILED)
+        self.assertEqual(task.errors, ["TimeoutError"])
+        self.assertNotIn("timeout", task.runtime.get("timeout_kind", ""))
+        self.assertEqual(terminal_refund_amount(task.state, 1), 1)
 
     async def test_final_provider_error_means_failed_and_refund(self):
         from imago_fusion.services.quota_store import terminal_refund_amount

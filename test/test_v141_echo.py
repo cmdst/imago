@@ -360,6 +360,121 @@ class DiagnosticsPersistenceTests(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(str(Path(plugin.store.task_dir(task.id))), json.dumps(guard, ensure_ascii=False))
         self.assertNotIn("iVBORw0KGgo", json.dumps(manifest, ensure_ascii=False))
 
+    async def test_passed_and_references_sent_are_persisted(self):
+        """``passed = checked - blocked``；``references_sent`` 区分"不需要比"（验收 9/10）。"""
+        from unittest.mock import patch
+
+        first, second = png_bytes(seed=0), png_bytes(seed=1)
+
+        class _Logger:
+            def __init__(self):
+                self.lines = []
+
+            def info(self, message, *args):
+                self.lines.append(message % args if args else message)
+
+            def warning(self, message, *args):  # pragma: no cover
+                pass
+
+            def error(self, message, *args):  # pragma: no cover
+                pass
+
+            def debug(self, message, *args):  # pragma: no cover
+                pass
+
+        logger = _Logger()
+        with TemporaryDirectory() as directory:
+            plugin = object.__new__(_plugin_class())
+            plugin.raw_config = {}
+            plugin.session = None
+            plugin.store = PersonaStore(Path(directory), lambda: 20 * 1024 * 1024)
+            plugin.scheduler = _Scheduler()
+            plugin.enhancer = _Counter()
+            plugin.upscaler = _Counter()
+            plugin.sender = _Sender()
+            plugin.quota_store = None
+            task = DrawTask("f" * 32, "umo", GenerationRequest("draw", count=2))
+            task.runtime["source_event"] = _Event()
+            task.runtime["original_user_prompt"] = "draw"
+            task.runtime["delivered_references"] = [ImageInput(first, PNG_MIME, "ref.png")]
+            with patch("imago_fusion.main.logger", logger):
+                # 一张回吐（拦下）、一张真实新图（放行）⇒ checked=2, blocked=1, passed=1。
+                await plugin._finish_task(
+                    task,
+                    [
+                        ImageResult(data=first, mime_type=PNG_MIME),
+                        ImageResult(data=second, mime_type=PNG_MIME),
+                    ],
+                )
+                task.state = TaskState.PARTIAL_SUCCESS
+                await plugin._finalize_task(task)
+            manifest = json.loads((plugin.store.task_dir(task.id) / "task.json").read_text("utf-8"))
+        guard = manifest["echo_guard"]
+        self.assertEqual(guard["checked"], 2)
+        self.assertEqual(guard["blocked"], 1)
+        self.assertEqual(guard["passed"], 1)
+        self.assertEqual(guard["passed"], guard["checked"] - guard["blocked"])
+        self.assertEqual(guard["references_sent"], 1)
+        summary = [line for line in logger.lines if "回吐闸" in line][0]
+        self.assertIn("放行=1", summary)
+        self.assertIn("未知=0", summary)
+
+    async def test_text_only_snapshot_logs_and_persists_zero_references(self):
+        """纯文字降级：闸门跑了但没发参考图 ⇒ ``references_sent=0``，仍要留痕（验收 10）。"""
+
+        from unittest.mock import patch
+
+        class _Logger:
+            def __init__(self):
+                self.lines = []
+
+            def info(self, message, *args):
+                self.lines.append(message % args if args else message)
+
+            def warning(self, message, *args):  # pragma: no cover
+                pass
+
+            def error(self, message, *args):  # pragma: no cover
+                pass
+
+            def debug(self, message, *args):  # pragma: no cover
+                pass
+
+        logger = _Logger()
+        payload = png_bytes()
+        with TemporaryDirectory() as directory:
+            plugin = object.__new__(_plugin_class())
+            plugin.raw_config = {}
+            plugin.session = None
+            plugin.store = PersonaStore(Path(directory), lambda: 20 * 1024 * 1024)
+            plugin.scheduler = _Scheduler()
+            plugin.enhancer = _Counter()
+            plugin.upscaler = _Counter()
+            plugin.sender = _Sender()
+            plugin.quota_store = None
+            task = DrawTask("c" * 32, "umo", GenerationRequest("draw", count=1))
+            task.runtime["source_event"] = _Event()
+            task.runtime["original_user_prompt"] = "draw"
+            # 文字降级成功的哨兵：显式空快照，不借旧图硬拦。
+            task.runtime["delivered_references"] = []
+            task.runtime["delivered_references_text"] = True
+            with patch("imago_fusion.main.logger", logger):
+                await plugin._finish_task(task, [ImageResult(data=payload, mime_type=PNG_MIME)])
+                task.state = TaskState.SUCCEEDED
+                await plugin._finalize_task(task)
+            manifest = json.loads((plugin.store.task_dir(task.id) / "task.json").read_text("utf-8"))
+        guard = manifest["echo_guard"]
+        self.assertEqual(guard["checked"], 0)
+        self.assertEqual(guard["blocked"], 0)
+        self.assertEqual(guard["passed"], 0)
+        self.assertEqual(guard["references_sent"], 0)
+        summary = [line for line in logger.lines if "回吐闸" in line]
+        self.assertTrue(summary)
+        self.assertIn("references_sent=0", summary[0])
+        # 空快照不能反过来把真实成品拦掉。
+        self.assertEqual(task.runtime["usable_output_count"], 1)
+        self.assertNotIn("no_change", manifest["errors"])
+
 
 if __name__ == "__main__":
     unittest.main()

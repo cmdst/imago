@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import random
 import time
 import uuid
@@ -388,10 +389,12 @@ class TaskScheduler:
 
     @staticmethod
     def _deadline_expired(task: DrawTask, config, scope) -> bool:
-        """任务总预算是否**真的**到期（不把内部 TimeoutError 误判成总超时）。"""
-        if task.runtime.get("timeout_guard_exhausted"):
-            # 文字降级前的保护余量判定为"预算不够"：这是事实上的总预算到期。
-            return True
+        """任务总预算是否**真的**到期（不把内部 TimeoutError 误判成总超时）。
+
+        判据只有三条硬事实：外层 ``asyncio.timeout`` 自己过期、预算非正、或者按
+        ``created_at`` 算出的真实耗时已经走满预算。**不看阶段、不看人为标志位**：
+        准备参考图/配文/发送阶段抛出的 TimeoutError 属于内部异常，按普通失败结算。
+        """
         try:
             if scope is not None and scope.expired():
                 return True
@@ -401,21 +404,15 @@ class TaskScheduler:
         if budget <= 0:
             return True
         elapsed = max(0.0, time.monotonic() - float(task.created_at or time.monotonic()))
-        if elapsed >= budget - 0.05:
-            return True
-        # 生成阶段抛出的裸 TimeoutError：``_generate`` 出口已把节点/单次调用超时统一
-        # 包成 ``ProviderTimeout``，因此这里只可能是任务级超时（v1.4.0 兼容口径，
-        # BF-03/F11 的终态矩阵用例钉住这一条）。其余阶段（准备参考图、配文、发送）
-        # 抛出的 TimeoutError 属于**内部**异常，按普通失败结算，不冒充总超时。
-        return task.stage == TaskStage.REQUESTING_PROVIDER
+        return elapsed >= budget
 
     def _record_task_timeout(self, task: DrawTask, config) -> None:
         """TIMED_OUT 的统一结算：状态 + 非空 errors + 可诊断的余量事实（§5.4）。"""
         task.state = TaskState.TIMED_OUT
         task.runtime.setdefault("generation_success", False)
         task.runtime.setdefault("usable_output_count", 0)
-        # 供失败配文透传原因（脱敏后转述给用户）。
-        task.runtime.setdefault("last_provider_error", "任务超时")
+        # 供失败配文透传原因（脱敏后转述给用户）：总超时压过此前任何节点错误。
+        task.runtime["last_provider_error"] = "任务超时"
         budget = int(getattr(config, "generation_timeout", 0) or 0)
         elapsed = max(0.0, time.monotonic() - float(task.created_at or time.monotonic()))
         task.runtime.setdefault("timeout_kind", "task_budget")
@@ -425,12 +422,85 @@ class TaskScheduler:
         # 与 v1.4.0 兼容的稳定标记，避免同一任务被同一原因刷屏。
         if "timeout" not in task.errors:
             task.errors.append("timeout")
+        self._append_timeout_markers(task)
+
+    @staticmethod
+    def _append_timeout_markers(task: DrawTask) -> None:
+        """把已记录的节点超时以**脱敏**标记追加进 ``task.errors``（§5.4 / 验收 12）。
+
+        只写节点 id、预算和耗时，且一律过 ``redact_debug``：终态日志与 manifest 的
+        ``errors`` 因此能直接回答"哪个节点、多少秒超时"，又不带 URL/图片/凭据。
+        """
+        entries = task.runtime.get("timeouts")
+        if not isinstance(entries, list):
+            return
+        for entry in entries[-4:]:
+            if not isinstance(entry, dict):
+                continue
+            marker = redact_debug(
+                f"ProviderTimeout node={str(entry.get('node') or '')[:64]} "
+                f"timeout={entry.get('timeout')}s"
+            )[:200]
+            if marker and marker not in task.errors:
+                task.errors.append(marker)
+
+    def _record_node_timeout(
+        self,
+        task: DrawTask,
+        provider,
+        model: str,
+        exc: BaseException,
+        elapsed: float,
+        *,
+        timeout: float | None = None,
+    ) -> None:
+        """记一条**节点级**超时事实：``runtime["timeouts"]`` + 一条 attempt 诊断。
+
+        终态 ``errors``（经 :meth:`_append_timeout_markers`）、manifest 的 ``attempts``
+        和 INFO 行都读同一份数据，所以"哪个节点、多少秒超时"在三处说法一致。
+        """
+        node = str(getattr(provider, "id", "") or "")[:64] or "unknown"
+        budget = timeout
+        if budget is None:
+            budget = float(getattr(provider, "timeout", 0) or 0)
+        entry = {
+            "node": node,
+            "model": str(model or "")[:64],
+            "timeout": round(max(0.0, float(budget or 0)), 1),
+            "elapsed": round(max(0.0, float(elapsed or 0)), 1),
+        }
+        entries = task.runtime.setdefault("timeouts", [])
+        if isinstance(entries, list):
+            entries.append(entry)
+            del entries[:-6]
+        diagnostics.record(
+            task,
+            provider_id=entry["node"],
+            model=entry["model"],
+            phase=diagnostics.PHASE_UNKNOWN,
+            elapsed=entry["elapsed"],
+            up_bytes=None,
+            timeout=entry["timeout"],
+            error_type="ProviderTimeout",
+            detail=str(exc or ""),
+        )
+        # INFO 与终态 errors / manifest 的 attempts.timeouts 同一份事实（验收 12）。
+        self.info(
+            task,
+            "节点超时 node=%s model=%s timeout=%.0fs elapsed=%.1fs",
+            entry["node"],
+            entry["model"],
+            entry["timeout"],
+            entry["elapsed"],
+        )
 
     def _record_failure(self, task: DrawTask, exc: BaseException) -> None:
         """普通失败结算（异常路径的唯一入口，TIMED_OUT 不走这里）。"""
         task.errors.append(type(exc).__name__)
         # 供失败配文透传原因：脱敏 + 截断，避免上游任意文本直接进 LLM 上下文。
         task.runtime["last_provider_error"] = redact_debug(str(exc))[:200] or type(exc).__name__
+        # 节点超时是"有事实可查"的失败原因，和异常类型一起进 errors。
+        self._append_timeout_markers(task)
         if task.runtime.get("generation_success"):
             task.state = TaskState.DELIVERY_FAILED
         elif isinstance(exc, NoOutputError):
@@ -665,20 +735,18 @@ class TaskScheduler:
                 raise asyncio.CancelledError()
             remaining = deadline - time.monotonic()
             if remaining <= _TEXT_GUARD_SECONDS:
-                # 契约 §6 D2/D6：发起纯文字调用前至少要有 ``_TEXT_GUARD_SECONDS``（15s）
-                # 余量，否则这次调用几乎必然被总 deadline 打断。此处把总超时**直接**
-                # 向外传播（由 ``_execute`` 落 TIMED_OUT），不占文字调用次数、不写节点
-                # 的 outcome/reason、也不去下一个节点。注意这不是"单次 provider 超时"：
-                # 后者仍按既有规则只结束本节点。
-                # v1.4.1：这条路径确实是"任务预算不够了"，必须让 ``_execute`` 按
-                # TIMED_OUT 结算而不是普通失败（契约 §5.4）。打上事实标记后抛出。
-                task.runtime["timeout_kind"] = "text_guard"
-                task.runtime["timeout_guard_exhausted"] = True
-                raise asyncio.TimeoutError("参考图文字降级预算已用尽")
+                # 契约 §5.1：发起纯文字调用前至少要有 ``_TEXT_GUARD_SECONDS``（15s）
+                # 余量，否则这次调用几乎必然被总 deadline 打断。此处**不降级**：正常
+                # 返回空 outcome，由调用方带图继续下一个节点。总预算是否真的到期只由
+                # ``_execute`` 的真实 deadline 判定，不在这里打标志位伪造 TIMED_OUT。
+                self._fallback_skip(task, provider_id, model, "budget")
+                return _TextStageOutcome()
             # 额度在**发起前**占用：该次调用即使失败/超时也不再赠送（X3）。
             text_attempts += 1
             info["text_attempts"] = int(info.get("text_attempts", 0) or 0) + 1
             info["extra_attempts"] = int(info["text_attempts"])
+            # 顶层同口径计数：manifest 的 attempts.text_attempts 直接读这个键（验收 10）。
+            task.runtime["text_attempts"] = int(info["text_attempts"])
             text_request = replace(rejected_request, prompt=text_prompt, references=())
             self.debug(
                 task,
@@ -689,6 +757,7 @@ class TaskScheduler:
             key_index = self._key_indices.get(attempt.id, 0)
             key = attempt.api_keys[key_index % len(attempt.api_keys)] if attempt.api_keys else ""
             self._key_indices[attempt.id] = key_index + 1
+            started = time.monotonic()
             try:
                 self.debug(
                     task,
@@ -732,6 +801,12 @@ class TaskScheduler:
                 info["notice"] = (
                     FALLBACK_NOTICE_TEXT if bool(getattr(fb, "notify_user", True)) else ""
                 )
+                # 纯文字请求**没有**带任何参考图（``references=()``）：显式写空快照，
+                # 让回吐闸知道"这一轮不需要比"，而不是拿上一轮带图请求的旧快照去比。
+                task.runtime["delivered_references"] = []
+                task.runtime["delivered_reference_files"] = []
+                task.runtime["delivered_reference_digests"] = []
+                task.runtime["delivered_references_text"] = True
                 self._fallback_node(
                     task, provider_id, model,
                     outcome="succeeded", reason="succeeded",
@@ -742,6 +817,20 @@ class TaskScheduler:
                 last_error = exc
                 task.runtime.setdefault("attempt_errors", []).append(
                     f"{attempt.id}:{model}:text:{type(exc).__name__}"
+                )
+                # 文字阶段同样留一条 attempt 诊断（验收 8）：阶段归属未知就写 unknown，
+                # 只记录"花了多久、预算多少、什么错误"，不带 URL/图片/凭据。
+                diagnostics.record(
+                    task,
+                    provider_id=attempt.id,
+                    model=model,
+                    phase=diagnostics.PHASE_UNKNOWN,
+                    elapsed=max(0.0, time.monotonic() - started),
+                    up_bytes=None,
+                    timeout=min(float(attempt.timeout), max(0.0, remaining)),
+                    error_type=type(exc).__name__,
+                    status=getattr(exc, "status", None),
+                    detail=str(exc),
                 )
                 self.debug(
                     task,
@@ -781,6 +870,34 @@ class TaskScheduler:
                     type(wrapped).__name__, str(wrapped),
                 )
                 self.logger(attempt, wrapped, task)
+                # 文字阶段的网络失败同样留一份脱敏诊断（验收 8）：阶段按异常类型定，
+                # 判不出来就是 unknown；没有分片回调事实时 up_bytes 记 unknown。
+                phase = diagnostics.fallback_phase(exc)
+                elapsed = max(0.0, time.monotonic() - started)
+                budget = min(float(attempt.timeout), max(0.0, remaining))
+                diagnostics.record(
+                    task,
+                    provider_id=attempt.id,
+                    model=model,
+                    phase=phase,
+                    elapsed=elapsed,
+                    up_bytes=None,
+                    timeout=budget,
+                    error_type=type(exc).__name__,
+                    detail=str(exc),
+                )
+                self.warn(
+                    diagnostics.log_line(
+                        provider_id=attempt.id,
+                        model=model,
+                        phase=phase,
+                        elapsed=elapsed,
+                        up_bytes=None,
+                        timeout=budget,
+                        error_type=type(exc).__name__,
+                        detail=str(exc),
+                    )
+                )
                 stop_reason = "text_failed"
                 break
         self._fallback_node(
@@ -926,14 +1043,22 @@ class TaskScheduler:
                         str(image.filename or "")[:120] for image in delivered
                     ]
                     task.runtime["delivered_reference_digests"] = [
-                        __import__("hashlib").sha256(image.data or b"").hexdigest()
+                        hashlib.sha256(image.data or b"").hexdigest()
                         for image in delivered
                     ]
+                    task.runtime["delivered_references_text"] = False
+                    # 成功节点/模型：让 manifest 与 INFO 直接回答"这次是谁出的图"（验收 10）。
+                    task.runtime["succeeded"] = {
+                        "provider_id": str(attempt.id or "")[:64],
+                        "model": str(model or "")[:64],
+                    }
                     return results
                 except (ProviderError, asyncio.TimeoutError) as exc:
                     last_error = exc
                     if isinstance(exc, NoOutputError):
                         no_output_error = exc
+                    if isinstance(exc, ProviderTimeout):
+                        self._record_node_timeout(task, attempt, model, exc, trace.elapsed)
                     task.runtime.setdefault("attempt_errors", []).append(f"{attempt.id}:{model}:{type(exc).__name__}")
                     self.debug(
                         task,
@@ -974,17 +1099,24 @@ class TaskScheduler:
                             last_error = text_outcome.error
                             if isinstance(text_outcome.error, NoOutputError):
                                 no_output_error = text_outcome.error
+                            elif isinstance(text_outcome.error, ProviderTimeout):
+                                self._record_node_timeout(
+                                    task, attempt, model, text_outcome.error, trace.elapsed
+                                )
                         break
                 except _AiohttpClientError as exc:
                     phase = trace.phase(exc)
                     elapsed = trace.elapsed
+                    # 只有真的观察到请求体分片回调时才写整数；否则记 unknown，
+                    # 不拿图片大小/响应长度顶替（队长口径 CORE-05）。
+                    observed_up = trace.up_bytes if trace.chunks > 0 else None
                     diagnostics.record(
                         task,
                         provider_id=attempt.id,
                         model=model,
                         phase=phase,
                         elapsed=elapsed,
-                        up_bytes=trace.up_bytes,
+                        up_bytes=observed_up,
                         timeout=attempt.timeout,
                         error_type=type(exc).__name__,
                         detail=str(exc),
@@ -995,7 +1127,7 @@ class TaskScheduler:
                             model=model,
                             phase=phase,
                             elapsed=elapsed,
-                            up_bytes=trace.up_bytes,
+                            up_bytes=observed_up,
                             timeout=attempt.timeout,
                             error_type=type(exc).__name__,
                             detail=str(exc),
@@ -1027,6 +1159,25 @@ class TaskScheduler:
             bool(no_output_error),
             type(last_error).__name__ if last_error else "-",
         )
+        # 出口兜底：任何仍在逃的裸 TimeoutError 都不能直接落到 ``_execute`` 冒充
+        # 任务级超时（契约 §5.1）。真走到总预算的放行原异常，由 ``_execute`` 按真实
+        # deadline 结算 TIMED_OUT；其余来源（例如文字阶段存下的单次超时）包成
+        # ``ProviderTimeout``，按"节点超时"继续 fallback。
+        if (
+            isinstance(last_error, TimeoutError)
+            and not isinstance(last_error, ProviderTimeout)
+            and no_output_error is None
+            and time.monotonic() < deadline
+        ):
+            self._record_node_timeout(
+                task,
+                None,
+                "",
+                last_error,
+                time.monotonic() - float(task.created_at or time.monotonic()),
+                timeout=0.0,
+            )
+            raise ProviderTimeout("节点超时（单次调用超时，未归因到具体节点）") from last_error
         # v1.4.0：这里**不再**有任何节点外救援/末次降级调用——降级只发生在节点内。
         raise no_output_error or last_error or ProviderError("所有节点都失败")
 

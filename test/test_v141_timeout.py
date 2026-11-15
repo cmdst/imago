@@ -284,12 +284,123 @@ class DiagnosticTests(unittest.IsolatedAsyncioTestCase):
         entries = task.runtime.get("attempt_diagnostics")
         self.assertTrue(entries)
         entry = entries[-1]
-        self.assertIn(entry["phase"], {"connect", "upload", "wait_response", "read_body", "unknown"})
+        # 没有分片回调、也没有收到响应头 ⇒ 唯一诚实的答案是 unknown（CORE-05）。
+        self.assertEqual(entry["phase"], "unknown")
+        self.assertEqual(entry["up_bytes"], "unknown")
         self.assertIn("elapsed", entry)
-        self.assertIn("up_bytes", entry)
         self.assertEqual(entry["timeout"], 42)
         self.assertEqual(entry["provider_id"], "node_a")
         self.assertNotIn("http", str(entry.get("detail", "")))  # 不落完整 URL
+
+    async def test_connector_error_reports_connect_phase(self):
+        from aiohttp.client_reqrep import ConnectionKey
+
+        async def refuse(config, request):
+            raise aiohttp.ClientConnectorError(
+                ConnectionKey("example.invalid", 443, True, True, None, None, None),
+                OSError("dns"),
+            )
+
+        config = _config(providers=(_node(timeout=7),))
+        task = _task()
+        scheduler = _scheduler(config)
+        with patch.dict(ADAPTERS, {"openai_image": _adapter(refuse)}, clear=False):
+            with self.assertRaises(ProviderError):
+                await scheduler._generate(task)
+        entry = task.runtime["attempt_diagnostics"][-1]
+        # 连接失败是**可观察事实**：异常类型自己就说明了阶段。
+        self.assertEqual(entry["phase"], "connect")
+        self.assertEqual(entry["timeout"], 7)
+
+    async def test_up_bytes_is_a_plain_int_when_chunks_were_observed(self):
+        from imago_fusion.core import diagnostics
+
+        task = _task()
+        trace = diagnostics.AttemptTrace().begin()
+        trace.record_chunk(512)
+        token = diagnostics.push(trace)
+        try:
+            diagnostics.record(
+                task, provider_id="node_a", model="m1",
+                phase=diagnostics.PHASE_UNKNOWN, elapsed=0.4,
+                up_bytes=trace.up_bytes, timeout=90, error_type="ClientError",
+                detail="https://user:pass@example.invalid/secret?token=abc",
+            )
+        finally:
+            diagnostics.pop(token)
+        entry = task.runtime["attempt_diagnostics"][-1]
+        self.assertEqual(entry["up_bytes"], 512)
+        # detail 过 redact_debug + 截断：不带凭据、不带完整 URL。
+        self.assertNotIn("pass@", str(entry["detail"]))
+        self.assertLessEqual(len(str(entry["detail"])), 160)
+
+    async def test_text_stage_records_attempt_diagnostic(self):
+        from imago_fusion.core.models import ReferenceFallbackConfig
+        from imago_fusion.core.references import RejectionVerdict
+
+        async def captioner(task, config, prompt, references, *, timeout, max_chars):
+            # 识图成功 ⇒ 真的发起一次纯文字请求；请求失败也要留一条诊断（验收 8）。
+            return "一名短发女性站在窗边"
+
+        async def boom(config, request):
+            raise ProviderError("参考图被拒", status=400)
+
+        config = _config(
+            providers=(_node(timeout=30),),
+            vision_provider_id="vision",
+            reference_fallback=ReferenceFallbackConfig(enable=True, max_retries_per_node=1),
+        )
+        task = _task()
+        scheduler = _scheduler(config)
+        scheduler.captioner = captioner
+        scheduler.info = lambda *a, **k: None
+        scheduler.warn = lambda *a, **k: None
+        verdict = RejectionVerdict(
+            kind="safety", convertible=True, evidence="block:SAFETY", detail=""
+        )
+        request = GenerationRequest("draw", references=(ImageInput(PNG, "image/png"),))
+        with patch.dict(ADAPTERS, {"openai_image": _adapter(boom)}, clear=False):
+            outcome = await scheduler._text_stage(
+                task, config, _node(timeout=30), request, verdict,
+                status=400, deadline=time.monotonic() + 250, text_quota=1,
+            )
+        self.assertIsNone(outcome.results)
+        entry = task.runtime["attempt_diagnostics"][-1]
+        # 配置里没有 id=vision 的节点时，文字请求复用触发它的那个节点。
+        self.assertEqual(entry["provider_id"], "node_a")
+        self.assertEqual(entry["error_type"], "ProviderError")
+        self.assertEqual(entry["phase"], "unknown")
+        self.assertEqual(entry["up_bytes"], "unknown")
+
+    async def test_node_timeouts_are_visible_in_errors_and_runtime(self):
+        async def slow(config, request):
+            await asyncio.sleep(5)
+            return [ImageResult(data=PNG, mime_type="image/png")]
+
+        infos: list[str] = []
+        config = _config(
+            providers=(_node("node_a", timeout=0.05), _node("node_b", timeout=0.05)),
+        )
+        task = _task()
+        scheduler = _scheduler(config)
+        scheduler.info = lambda task_, message, *args: infos.append(
+            message % args if args else message
+        )
+        with patch.dict(ADAPTERS, {"openai_image": _adapter(slow)}, clear=False):
+            await scheduler._execute(task)
+        self.assertEqual(task.state, TaskState.FAILED)
+        # ① errors：两个节点各一条脱敏标记（节点 id + 预算，无 URL/图片）。
+        markers = [item for item in task.errors if item.startswith("ProviderTimeout node=")]
+        self.assertEqual(len(markers), 2)
+        self.assertTrue(any("node=node_a" in item for item in markers))
+        self.assertTrue(any("node=node_b" in item for item in markers))
+        # ② runtime：同一份事实，给 manifest / INFO 复用。
+        timeouts = task.runtime["timeouts"]
+        self.assertEqual([entry["node"] for entry in timeouts], ["node_a", "node_b"])
+        self.assertTrue(all(entry["model"] == "m1" for entry in timeouts))
+        self.assertTrue(all("elapsed" in entry for entry in timeouts))
+        # ③ INFO：节点超时本身也要有一条可读行（与 errors/manifest 同源）。
+        self.assertEqual(len([line for line in infos if "节点超时 node=" in line]), 2)
 
 
 if __name__ == "__main__":

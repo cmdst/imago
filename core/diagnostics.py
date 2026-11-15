@@ -22,6 +22,8 @@ from contextvars import ContextVar
 from dataclasses import dataclass, field
 from typing import Any, Iterator
 
+from .security import redact_debug
+
 try:  # pragma: no cover - 取决于运行环境
     import aiohttp
 except Exception:  # pragma: no cover
@@ -67,23 +69,39 @@ class AttemptTrace:
         self.last_chunk_at = time.monotonic()
 
     def phase(self, exc: BaseException | None = None) -> str:
-        """按 trace 事实判定阶段；没有事实时才看异常类型。"""
-        if self.request_started_at is None:
-            if self.requests == 0 and exc is not None and _looks_like_connect(exc):
-                return PHASE_CONNECT
-            return PHASE_UNKNOWN if self.requests == 0 else PHASE_CONNECT
+        """按**真实可观察事实**判定阶段，判不出来就是 ``unknown``。
+
+        允许使用的只有两类事实：
+
+        * 异常类型本身点明"连不上对端"（``ClientConnectorError`` 等）；
+        * 已经收到过响应（``on_response_chunk_received`` 触发过）。
+
+        "请求已发出但既没响应、也没记录到分片"这类情况无法区分是没连上、传了一半
+        还是等响应超时，一律 ``unknown``——不拿 ``requests``/``chunks`` 计数去猜。
+        """
+        if exc is not None and _looks_like_connect(exc):
+            return PHASE_CONNECT
         if self.response_started_at is not None:
             return PHASE_READ_BODY
-        if self.request_ended_at is not None:
-            return PHASE_WAIT_RESPONSE
-        if self.chunks > 0:
-            return PHASE_UPLOAD
-        return PHASE_UPLOAD if self.requests else PHASE_CONNECT
+        return PHASE_UNKNOWN
+
+
+#: 只有这些类型名才**确证**"根本没连上"：连接器/DNS/证书类异常。
+#: 注意不能宽泛匹配 ``connect``：``ServerDisconnectedError`` 也含这个词，
+#: 但它表示"连上之后被对端断开"，与 connect 阶段相反（CORE-05）。
+_CONNECT_TOKENS = (
+    "connector",
+    "clientconnectionerror",
+    "clientproxyconnectionerror",
+    "sslerror",
+    "certificateerror",
+    "gaierror",
+)
 
 
 def _looks_like_connect(exc: BaseException) -> bool:
     name = type(exc).__name__.lower()
-    return any(token in name for token in ("connector", "connect", "dns", "ssl", "certificate"))
+    return any(token in name for token in _CONNECT_TOKENS)
 
 
 def fallback_phase(exc: BaseException) -> str:
@@ -192,13 +210,16 @@ def record(
     model: str,
     phase: str,
     elapsed: float,
-    up_bytes: int,
+    up_bytes: int | None,
     timeout: float,
     error_type: str,
     status: int | None = None,
     detail: str = "",
 ) -> dict:
     """把一条脱敏诊断追加进 ``task.runtime["attempt_diagnostics"]``。
+
+    ``up_bytes`` 允许 ``None``：没有分片回调事实时序列化成 ``"unknown"``，不拿图片
+    大小或响应长度顶替（队长口径 CORE-05）。
 
     Returns:
         写入的那条记录（测试可直接断言，不必再读 runtime）。
@@ -208,11 +229,11 @@ def record(
         "model": str(model or "")[:64],
         "phase": str(phase or PHASE_UNKNOWN)[:24],
         "elapsed": round(max(0.0, float(elapsed)), 2),
-        "up_bytes": max(0, int(up_bytes)),
+        "up_bytes": "unknown" if up_bytes is None else max(0, int(up_bytes)),
         "timeout": round(max(0.0, float(timeout)), 2),
         "error_type": str(error_type or "")[:64],
         "status": status,
-        "detail": str(detail or "")[:MAX_DETAIL_CHARS],
+        "detail": _clean_detail(detail),
     }
     runtime = getattr(task, "runtime", None)
     if isinstance(runtime, dict):
@@ -229,19 +250,26 @@ def log_line(
     model: str,
     phase: str,
     elapsed: float,
-    up_bytes: int,
+    up_bytes: int | None,
     timeout: float,
     error_type: str,
     detail: str = "",
 ) -> str:
     """§5.8 要求的单行日志形态（不含 URL/图片/凭据）。"""
-    suffix = f" detail={str(detail or '')[:MAX_DETAIL_CHARS]}" if detail else ""
+    detail_text = _clean_detail(detail)
+    suffix = f" detail={detail_text}" if detail_text else ""
+    observed = "unknown" if up_bytes is None else max(0, int(up_bytes))
     return (
         f"绘图模型失败 node={str(provider_id or '')[:64]} model={str(model or '')[:64]} "
         f"phase={str(phase or PHASE_UNKNOWN)} elapsed={max(0.0, float(elapsed)):.1f}s "
-        f"up_bytes={max(0, int(up_bytes))} timeout={max(0.0, float(timeout)):.1f}s "
+        f"up_bytes={observed} timeout={max(0.0, float(timeout)):.1f}s "
         f"error_type={str(error_type or '')[:64]}{suffix}"
     )
+
+
+def _clean_detail(value: Any) -> str:
+    """诊断细节先脱敏（URL/路径/长数字/凭据）再截断。"""
+    return redact_debug(str(value or ""))[:MAX_DETAIL_CHARS]
 
 
 def as_manifest(entries: Any) -> list[dict]:

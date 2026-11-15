@@ -124,7 +124,7 @@ IMAGO·FUSION 是 **IMAGO·映相** 骨架与 **大香蕉（astrbot_plugin_big_b
 
 **结果分类**：全部被拦 → `NO_OUTPUT` + `no_change`，用户收到固定文案「这次没有生成新图，模型把参考图原样送了回来。请重试或换个节点。」；部分被拦 → `PARTIAL_SUCCESS`，只发有效图；未命中 → 照旧。**不自动重试、不额外调用节点**（零新增费用），被拦的 provider 原件保留在 `outputs/`（但不进 `task.json` 的 `outputs[]`）。
 
-**诊断**：INFO `回吐闸 检查=<n> 拦下=<m> 放行=<k>`；`task.json` 的 `echo_guard` 记 `checked / blocked / unknown / no_change` 与被拦文件的相对名（不含图片内容）。
+**诊断**：INFO `回吐闸 检查=<n> 拦下=<m> 放行=<k> 未知=<j>`（纯文字降级这种"这一轮没发参考图"的情况另打 `references_sent=0`，与"闸门没跑"区分开）；`task.json` 的 `echo_guard` 记 `checked / blocked / passed / unknown / references_sent / no_change` 与被拦文件的相对名（不含图片内容）。
 
 ## 三层超时（1.4.1 起语义分开）
 
@@ -134,7 +134,9 @@ IMAGO·FUSION 是 **IMAGO·映相** 骨架与 **大香蕉（astrbot_plugin_big_b
 | L2 任务 | `task_config.generation_timeout`（从任务创建起算） | 300 s | 任务 `TIMED_OUT`，`errors` 必有 `timeout`，`runtime.last_provider_error=任务超时`，**不退款**（额度口径不变） |
 | L3 上传窗口 | 内部常量 | ≈15 s | 只影响单张参考图上传；超出即按该节点失败处理 |
 
-L1 到期**不会**再被结算成"任务超时"（1.4.0 曾出现"单节点 117 s 超时 → 任务判 timed_out 且 errors 为空"）；反过来，L2 真到期也不会被误判成节点失败。取消（`CANCELLED`）保持原样向上传播并退款。适配器网络异常额外记录 `phase`（`connect` / `upload` / `wait_response` / `read_body` / `unknown`）、`elapsed`、`up_bytes`、`timeout`，其中 `up_bytes` 来自 aiohttp 分片回调的真实计数，**不按图片大小猜**。
+L1 到期**不会**再被结算成"任务超时"（1.4.0 曾出现"单节点 117 s 超时 → 任务判 timed_out 且 errors 为空"）；反过来，L2 真到期也不会被误判成节点失败，判断只看"外层总预算是否真的走满"，不看阶段、不接受任何人为标志。节点超时会在 `errors` 里留一条脱敏标记（`ProviderTimeout node=<id> timeout=<n>s`），`task.json` 的 `attempts.timeouts` 与 INFO 行用的是同一份事实，因此"哪个节点、多少秒"三处说法一致。文字降级只在中止时会挤占主投递预算时才**正常跳过、不降级**，绝不靠伪造超时把任务改成 `timed_out`。取消（`CANCELLED`）保持原样向上传播并退款。
+
+适配器网络异常额外记录 `phase`、`elapsed`、`up_bytes`、`timeout`。`phase` 只认两类**可观察事实**：异常类型本身确证连不上（`connect`）、或已经收到过响应（`read_body`），其余一律 `unknown`——不拿"发过 chunk""请求已发出"去猜 `upload`/`wait_response`；`up_bytes` 只在真的观察到分片回调时才是整数，否则写 `unknown`，**不按图片大小猜**。
 
 ## 图像清晰度增强（可选，**默认关闭**）
 

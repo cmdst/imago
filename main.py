@@ -1251,13 +1251,19 @@ class ImagoFusion(Star):
         判定口径见 :mod:`core.echo`：同字节，或方向归一后同尺寸且逐像素完全相等。
         无参考图 / 读不到字节 / 解码失败 ⇒ 保守放行并只记 ``unknown``。
         """
-        delivered = task.runtime.get("delivered_references") or []
-        if not delivered:
+        if "delivered_references" not in task.runtime:
+            # 没有成功 attempt 的快照（准备阶段就失败等）：不解码、不比较、不建键。
             return False
+        delivered = list(task.runtime.get("delivered_references") or [])
         state = task.runtime.get("echo_guard")
         if not isinstance(state, dict):
             state = echo_guard.new_guard_state()
             task.runtime["echo_guard"] = state
+            # 快照张数：0 表示"这一轮没发参考图"（例如文字降级），运维据此区分
+            # "不需要比"与"闸门没跑"（验收 10）。
+            state["references_sent"] = len(delivered)
+        if not delivered:
+            return False
         baseline = task.runtime.get("_echo_baseline")
         if baseline is None:
             baseline = echo_guard.EchoBaseline.of(delivered)
@@ -1586,6 +1592,14 @@ class ImagoFusion(Star):
                 task.id[:8],
                 echo_guard.summarize(echo_state),
             )
+        elif isinstance(echo_state, dict) and "references_sent" in echo_state:
+            # 闸门跑了但这一轮没发参考图（纯文字请求）：显式说明"不需要比"。
+            logger.info(
+                "%s task=%s %s references_sent=0",
+                self._log_prefix(task.runtime.get("source_event")),
+                task.id[:8],
+                echo_guard.summarize(echo_state),
+            )
         if echo_blocked:
             # ``no_change`` 是唯一新增 marker（每任务最多一条）：混合回吐靠它把终态
             # 定成 PARTIAL_SUCCESS；全拦时用它区分 no_output 的原因（契约 §4.4）。
@@ -1848,11 +1862,18 @@ class ImagoFusion(Star):
                 "failed": list(compress_stats.get("failed") or [])[:16],
             }
         echo_state = task.runtime.get("echo_guard")
-        if isinstance(echo_state, dict) and int(echo_state.get("checked", 0)) > 0:
+        if isinstance(echo_state, dict) and (
+            int(echo_state.get("checked", 0)) > 0 or "references_sent" in echo_state
+        ):
             manifest_extra["echo_guard"] = {
                 "checked": int(echo_state.get("checked", 0) or 0),
                 "blocked": int(echo_state.get("blocked", 0) or 0),
                 "unknown": int(echo_state.get("unknown", 0) or 0),
+                # passed 与 INFO 行同源：一次检查要么拦下、要么放行（unknown 也算放行）。
+                "passed": int(echo_state.get("passed", 0) or 0),
+                # references_sent=0 表示"这一轮压根没发参考图"，运维据此区分
+                # "不需要比"与"闸门没跑"（验收 10）。
+                "references_sent": int(echo_state.get("references_sent", 0) or 0),
                 "no_change": bool(echo_state.get("no_change", False)),
                 "blocked_files": list(echo_state.get("blocked_files") or [])[:12],
             }
@@ -1863,6 +1884,10 @@ class ImagoFusion(Star):
             "diagnostics": attempt_diagnostics.as_manifest(
                 task.runtime.get("attempt_diagnostics")
             ),
+            # 成功节点/模型 + 文字降级尝试次数：和 errors/timeouts 同一份口径。
+            "succeeded": dict(task.runtime.get("succeeded") or {}),
+            "text_attempts": int(task.runtime.get("text_attempts", 0) or 0),
+            "timeouts": list(task.runtime.get("timeouts") or [])[-6:],
             "timeout_kind": str(task.runtime.get("timeout_kind", "") or ""),
             "timeout_elapsed": task.runtime.get("timeout_elapsed"),
             "timeout_budget": task.runtime.get("timeout_budget"),

@@ -173,7 +173,7 @@ def _encode(image, image_format: str, quality: int) -> bytes | None:
 
 
 def _quality_ladder(start: int) -> tuple[int, ...]:
-    """质量阶梯：q、q-10、q-20，下界 ``max(40, q-30)`` 且单调不增。"""
+    """质量阶梯：``max(40, q0 - 10*i)``（i=0,1,2），去重后单调不增。"""
     values: list[int] = []
     for step in QUALITY_STEPS:
         value = max(QUALITY_FLOOR, min(95, int(start) - step))
@@ -255,18 +255,21 @@ def compress_reference(
         return _passthrough(failed=FAIL_UNDECODABLE, detail=f"{type(exc).__name__}: {exc}")
 
     long_edge = max(base.size)
-    scales = SCALE_STEPS if int(config.max_edge) > 0 else (1.0,)
+    max_edge = max(0, int(config.max_edge))
+    # 尺寸档作用在"已按 max_edge 收口后的长边"上（契约 §3.5）：先 clamp 再乘系数。
+    # 若先乘再 clamp，3000px 源图的 1.0/0.85/0.7225 三档会被 max_edge 截成同一个长边，
+    # 尺寸阶梯等于没生效。
+    base_long = min(long_edge, max_edge) if max_edge > 0 else long_edge
+    scales = SCALE_STEPS if max_edge > 0 else (1.0,)
     qualities = _quality_ladder(config.jpeg_quality) if image_format == "JPEG" else (0,)
     best: tuple[int, bytes, int, int] | None = None  # (bytes, payload, quality, edge)
     best_small: tuple[int, bytes, int, int] | None = None
     encodes = 0
     try:
         for scale in scales:
-            target_long = long_edge
-            if scale != 1.0:
-                target_long = max(1, int(round(long_edge * scale)))
-            if int(config.max_edge) > 0:
-                target_long = min(target_long, int(config.max_edge))
+            target_long = (
+                base_long if scale == 1.0 else max(1, int(round(base_long * scale)))
+            )
             target_long = min(target_long, long_edge)  # 绝不放大
             candidate, candidate_edge = _resize_to_long_edge(base, target_long)
             for quality in qualities:
@@ -274,11 +277,16 @@ def compress_reference(
                     break
                 try:
                     payload = _encode(candidate, image_format, quality)
-                except Exception:
-                    payload = None
+                except Exception as exc:  # noqa: BLE001
+                    # 任一编码异常立即回原图（CORE-04）：不保留前几轮已经产生的
+                    # 有损候选，避免"半压缩"产物带着异常静默发出去。
+                    return _passthrough(
+                        failed=FAIL_ERROR, detail=f"{type(exc).__name__}: {exc}"
+                    )
                 encodes += 1
                 if payload is None:
-                    continue
+                    # 编码器返回空载荷同样算失败，语义与抛异常一致。
+                    return _passthrough(failed=FAIL_ERROR, detail="编码结果为空")
                 size = len(payload)
                 if size <= in_bytes and (best is None or size < best[0]):
                     best = (size, payload, int(quality), candidate_edge)

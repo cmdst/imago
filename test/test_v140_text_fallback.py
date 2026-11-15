@@ -639,7 +639,7 @@ class TextFallbackTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.runtime["reference_fallback"]["reason"], "no_vision_provider")
 
     # ---------------------------------------------------------------- T-S27
-    async def test_task_deadline_inside_text_loop_raises_without_reason(self):
+    async def test_task_deadline_inside_text_loop_skips_without_degrading(self):
         clock = {"now": 1000.0}
         advancing = _Captioner(text="一名短发女性", on_call=lambda: clock.update(now=1100.0))
         # vision_timeout=5 ⇒ 进入门槛 = 5+15+20 = 40s；deadline 取 +40.5s 刚好够进。
@@ -656,25 +656,32 @@ class TextFallbackTests(unittest.IsolatedAsyncioTestCase):
         attempt = _provider()
         request = GenerationRequest("原文", references=(ImageInput(b"x", "image/png"),))
         with mock.patch.object(scheduler_module.time, "monotonic", lambda: clock["now"]):
-            with self.assertRaises(asyncio.TimeoutError):
-                await scheduler._text_stage(
-                    task, scheduler.config_getter(), attempt, request,
-                    {"kind": "safety", "evidence": "block:SAFETY"},
-                    status=200, deadline=clock["now"] + 40.5, text_quota=2,
-                )
+            outcome = await scheduler._text_stage(
+                task, scheduler.config_getter(), attempt, request,
+                {"kind": "safety", "evidence": "block:SAFETY"},
+                status=200, deadline=clock["now"] + 40.5, text_quota=2,
+            )
         info = task.runtime["reference_fallback"]
-        # 识图发过一次，但没有任何纯文字尝试，也没有 reason 记录。
+        # 识图发过一次；余量跌到 10s（< 15s 保护线）⇒ 一次纯文字都不发起。
         self.assertEqual(info["vision_calls"], 1)
         self.assertEqual(info["text_attempts"], 0)
-        self.assertEqual(info.get("nodes", []), [])
         self.assertEqual(_Adapter.calls, [])
+        # rev3 §5.1：保护余量不足时**不降级**，正常返回空 outcome 由调用方带图继续；
+        # 不抛 TimeoutError，也不打 ``timeout_guard_exhausted`` 这类人为标志位。
+        self.assertIsNone(outcome.results)
+        self.assertIsNone(outcome.error)
+        self.assertNotIn("timeout_guard_exhausted", task.runtime)
+        self.assertNotIn("timeout_kind", task.runtime)
+        self.assertNotEqual(task.state, TaskState.TIMED_OUT)
+        self.assertEqual(info["nodes"][-1]["reason"], "budget")
+        self.assertEqual(info["nodes"][-1]["outcome"], "skipped")
 
     # ---------------------------------------------------------------- T-S28
-    async def test_guard_blocks_text_call_and_task_ends_timed_out(self):
-        """t4/F2 回归：余量 ≤ ``_TEXT_GUARD_SECONDS`` 时不发起纯文字，整个任务 TIMED_OUT。
+    async def test_guard_skips_text_call_and_task_settles_as_failed(self):
+        """t14/rev3 回归：余量 ≤ ``_TEXT_GUARD_SECONDS`` 时不发起纯文字，也**不**冒充总超时。
 
-        与 T-S27 的区别：这里走**真实** ``_execute``，断言终态结算落在 TIMED_OUT，
-        而不是只在 ``_text_stage`` 层看到异常。
+        与 T-S27 的区别：这里走**真实** ``_execute``+``_generate``，断言终态落到
+        FAILED（真实 deadline 没到，按普通失败结算并退款），而不是 TIMED_OUT。
         """
         clock = {"now": 1000.0}
         advancing = _Captioner(text="一名短发女性", on_call=lambda: clock.update(now=1290.0))
@@ -703,9 +710,16 @@ class TextFallbackTests(unittest.IsolatedAsyncioTestCase):
         info = task.runtime["reference_fallback"]
         self.assertEqual(info["vision_calls"], 1)
         self.assertEqual(info["text_attempts"], 0)
-        self.assertEqual(info.get("nodes", []), [])
-        # 总预算不足直接向外传播：任务 TIMED_OUT，既不换下一个节点也不写节点 reason。
-        self.assertEqual(task.state, TaskState.TIMED_OUT)
+        self.assertEqual(info["nodes"][-1]["reason"], "budget")
+        self.assertEqual(info["nodes"][-1]["outcome"], "skipped")
+        # 真实 deadline 没到（时钟停在 1290，预算 300，从 1000 起算）⇒ 不能凭"保护余量
+        # 不足"就判 TIMED_OUT：按普通失败结算，且退款政策照旧（FAILED 退款）。
+        from imago_fusion.services.quota_store import terminal_refund_amount
+
+        self.assertEqual(task.state, TaskState.FAILED)
+        self.assertEqual(terminal_refund_amount(task.state, 1), 1)
+        self.assertNotIn("timeout_guard_exhausted", task.runtime)
+        self.assertNotIn("timeout", task.errors)
 
     # ---------------------------------------------------------------- T-S26
     async def test_non_safety_text_failure_stops_even_with_quota_left(self):
