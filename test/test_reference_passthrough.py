@@ -12,6 +12,8 @@ AstrBot core/Provider/平台/Hook 兼容性由部署端验收。
 
 import asyncio
 import base64
+import ipaddress
+import socket
 import sys
 import tempfile
 import unittest
@@ -29,6 +31,34 @@ PNG = b"\x89PNG\r\n\x1a\n" + bytes(24)
 JPEG = b"\xff\xd8\xff\xe0" + bytes(24)
 WEBP = b"RIFF" + bytes(4) + b"WEBP" + bytes(8)
 GIF = b"GIF89a" + bytes(16)
+
+_REAL_GETADDRINFO = socket.getaddrinfo
+
+
+def _stub_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    """只接受 IP 字面量的解析桩。
+
+    这些用例验的是 SSRF 判定（IP 字面量、重定向目标、私网放行），**不需要真 DNS**：
+    联网解析既让用例依赖外网可达性，也会被门禁的网络护栏拦下（非 loopback 一律拒绝）。
+    桩把 IP 字面量原样返回、其它主机名一律 ``gaierror``，判据仍走真实的
+    ``core/network.py`` 逻辑。
+    """
+
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        raise socket.gaierror(socket.EAI_NONAME, "stub resolver: 非 IP 字面量") from None
+    chosen = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+    return [(chosen, socket.SOCK_STREAM, proto or 6, "", (host, port))]
+
+
+def setUpModule() -> None:
+    socket.getaddrinfo = _stub_getaddrinfo
+
+
+def tearDownModule() -> None:
+    socket.getaddrinfo = _REAL_GETADDRINFO
+
 
 def b64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
