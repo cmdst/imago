@@ -17,6 +17,8 @@ Covered contract points (DESIGN §2):
 
 import asyncio
 import base64
+import ipaddress
+import socket
 import sys
 import types
 import unittest
@@ -115,6 +117,32 @@ class FakeJsonSession:
     def post(self, url, **kwargs):
         self.calls.append((url, kwargs))
         return FakeJsonResponse(self.payload)
+
+
+_REAL_GETADDRINFO = socket.getaddrinfo
+
+
+def _stub_getaddrinfo(host, port, family=0, type=0, proto=0, flags=0):
+    """IP 字面量的解析桩（见 ``test_reference_passthrough`` 同名桩）。
+
+    私网守卫用例只需要"字面量→它自己"，不需要真 DNS；真解析会让用例依赖外网，
+    也会被门禁网络护栏拦成"无法解析远程主机"。
+    """
+
+    try:
+        address = ipaddress.ip_address(host)
+    except ValueError:
+        raise socket.gaierror(socket.EAI_NONAME, "stub resolver: 非 IP 字面量") from None
+    chosen = socket.AF_INET6 if address.version == 6 else socket.AF_INET
+    return [(chosen, socket.SOCK_STREAM, proto or 6, "", (host, port))]
+
+
+def setUpModule() -> None:
+    socket.getaddrinfo = _stub_getaddrinfo
+
+
+def tearDownModule() -> None:
+    socket.getaddrinfo = _REAL_GETADDRINFO
 
 
 class FakeContext:
