@@ -225,10 +225,14 @@ class TestProvidersRead:
         assert by_value["xai_image"]["capabilities"]["quality"] == "undocumented"
         assert "quality" not in [field["key"] for field in by_value["xai_image"]["fields"]]
 
-    def test_catalog_groups_only_expose_reference_fallback(self, env):
+    def test_catalog_groups_only_expose_reference_policy_groups(self, env):
         groups = {group["key"]: group for group in get_state(env)["catalog"]["groups"]}
-        # v1.4.0：实验遮挡组整组删除，catalog 只剩参考图文字降级这一组。
-        assert set(groups) == {"reference_fallback_config"}
+        # v1.4.0：实验遮挡组整组删除；v1.4.1 起「参考图策略」是两组合法成员
+        # （文字降级 + 参考图压缩），压缩组自己的字段语义由 test_webui_v141.py 深检。
+        assert set(groups) == {"reference_fallback_config", "reference_compress_config"}
+        assert [group["key"] for group in get_state(env)["catalog"]["groups"]] == [
+            "reference_fallback_config", "reference_compress_config",
+        ]
         group = groups["reference_fallback_config"]
         assert [field["key"] for field in group["fields"]] == [
             "enable", "max_retries_per_node", "caption_max_chars",
@@ -1098,7 +1102,8 @@ class TestV140Contract:
 
         # 旧快照（后端已删组）里多出的键不得被当作组定义，也不得进 payload。
         assert "experimental_reference_config" not in GROUP_DEFS
-        assert set(GROUP_DEFS) == {"reference_fallback_config"}
+        assert "reference_compress_config" in GROUP_DEFS
+        assert set(GROUP_DEFS) == {"reference_fallback_config", "reference_compress_config"}
         status, payload = save(env, {"providers": [], "experimental_reference": {"enable": True}})
         assert status == 200, payload
         assert "experimental_reference" not in payload

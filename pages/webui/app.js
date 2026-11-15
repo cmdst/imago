@@ -9,7 +9,7 @@ const state={
   personas:[],current:'',providers:[],primary:'',storedPrimary:'',
   primaryChosen:false,originalIds:new Set(),originalPrimary:'',
   catalog:{version:1,api_types:[],groups:[],thinking_values:[],thinking_labels:{}},
-  referenceFallback:{},chatProviders:[],
+  groupValues:{},chatProviders:[],
   optimizerProviderId:'',visionProviderId:'',
   dirty:false,quotaDirty:false,quotas:[],quotaPolicy:{},quotaSort:{key:'user_id',direction:'asc'},
   rebuilding:false,selectedReferences:new Set(),expanded:new Set(),warnings:[]
@@ -246,7 +246,8 @@ function renderWarnings(){
 }
 
 /* ---------------------------------------------------------------- 配置组（数据驱动，字段来自 catalog.groups） */
-function groupState(payload){const values={reference_fallback:state.referenceFallback};return values[payload]||{}}
+// 组值一律按 catalog 的 payload 键存放：新增组不需要改这里，也不需要再写字段表。
+function groupState(payload){return state.groupValues[payload]||{}}
 function groupBlocked(group){
   const depends=group.depends_on;
   if(!depends)return false;
@@ -258,7 +259,7 @@ function groupCard(group){
   const blocked=groupBlocked(group);
   const fields=(group.fields||[]).map(field=>renderGroupField(group,field,values[field.key],blocked)).join('');
   const defaultOff=(group.fields||[]).some(field=>field.key==='enable'&&field.default===false);
-  const vision=group.payload==='reference_fallback'?renderFallbackVision():'';
+  const vision=group.extra_control==='vision_provider_select'?renderFallbackVision():'';
   const dependency=blocked&&group.depends_on?`<p class="group-dependency">${escapeHtml(group.depends_on.message||'依赖未满足，实验功能不会生效。')}</p>`:'';
   const body=fields||vision?`<div class="field-grid group-fields${blocked?' is-blocked':''}">${fields}${vision}</div>`:'<p class="hint">该组暂不提供控件；后端默认关闭，不会产生任何调用。</p>';
   return `<article class="card config-card${blocked?' is-blocked':''}" data-group="${attr(group.key)}" data-payload="${attr(group.payload)}">
@@ -273,7 +274,7 @@ function renderGroupField(group,field,value,blocked=false){
   const data=`data-group-field="${attr(field.key)}"`;
   const disabled=blocked?'disabled':'';
   if(field.control==='switch'||field.type==='bool'){
-    return `<label class="check-line">${label}<input type="checkbox" ${data} ${value?'checked':''} ${disabled}>${help}</label>`;
+    return `<label class="check-line">${label}<input type="checkbox" ${data} role="switch" aria-checked="${value?'true':'false'}" ${value?'checked':''} ${disabled}>${help}</label>`;
   }
   if(field.control==='textarea'){
     return `<label class="wide">${label}<textarea rows="3" ${data} ${field.max_length?`maxlength="${attr(field.max_length)}"`:''} ${disabled} placeholder="${attr(field.placeholder||'')}">${escapeHtml(value??'')}</textarea>${help}</label>`;
@@ -297,7 +298,7 @@ function renderGroups(){
   const root=$('#config-groups');
   const groups=Array.isArray(state.catalog.groups)?state.catalog.groups:[];
   if(!groups.length){root.innerHTML='';return}
-  root.innerHTML=`<div class="groups-head"><p class="eyebrow">参考图策略</p><h2>参考图文字降级</h2><p>仅在节点明确以安全/内容合规原因拒绝参考图时，才在该节点内改用文字说明重试；默认关闭，关闭时不产生任何额外请求、文件或费用。</p></div>${groups.map(groupCard).join('')}`;
+  root.innerHTML=`<div class="groups-head"><p class="eyebrow">参考图策略</p><h2>压缩与降级</h2><p>这两组只作用于「发往绘图节点的参考图」：压缩是在上传前缩小体积，降级是节点明确拒绝参考图时改用文字说明重试。都不影响本地 inputs/ 原素材与出图结果，也不是处理成品图的「增强」与「放大」；两组默认行为都在卡片里写明。</p></div>${groups.map(groupCard).join('')}`;
 }
 
 /* ---------------------------------------------------------------- 节点同步与保存 */
@@ -367,10 +368,21 @@ function syncGroupField(target){
   const field=group?(group.fields||[]).find(item=>item.key===fieldKey):null;
   let value=target.type==='checkbox'?Boolean(target.checked):target.value;
   if(field&&(field.type==='int'||field.type==='float')){
-    value=target.value===''?0:Number(target.value);
-    if(field.type==='int')value=Math.trunc(value);
+    // 清空数字框不等于“改成 0”：保留已存值并回填显示，避免把 max_edge=0 这类合法值
+    // 与“没填”混为一谈，也避免一次误删把目标体积写成 0。
+    if(target.value===''){
+      const stored=values[fieldKey];
+      const fallbackValue=stored===undefined||stored===null?(field.default??0):stored;
+      target.value=String(fallbackValue);
+      value=fallbackValue;
+    }else{
+      value=Number(target.value);
+      if(field.type==='int')value=Math.trunc(value);
+      if(!Number.isFinite(value))value=field.default??0;
+    }
   }
   values[fieldKey]=value;
+  if(target.type==='checkbox')target.setAttribute('aria-checked',String(Boolean(target.checked)));
   setDirty(true);
   if(fieldKey==='enable'||(field&&field.control==='provider_select'))renderGroups();
 }
@@ -410,15 +422,12 @@ function buildProviderPayload(){
   const deletedIds=[...originalIds].filter(id=>!currentIds.includes(id));
   if(deletedIds.length)payload.deleted_provider_ids=deletedIds;
   for(const group of (state.catalog.groups||[])){
-    const groupKey=group.key;
-    if(groupKey==='reference_fallback_config'){
-      // 后端快照在这个组里附带了只读的派生字段（识图 Provider 及其可用性），
-      // 提交时必须剥掉，否则会被当成配置值写回。
-      const values={...(groupState(group.payload)||{})};
-      delete values.vision_provider_id;
-      delete values.vision_provider_ready;
-      payload[group.payload]=values;
-    }
+    // 只提交 catalog 字段表里声明的键：后端快照附带的只读派生字段
+    // （如识图 Provider 及其可用性）不会回流成配置值，新组也不需要改这里。
+    const values={};
+    const current=groupState(group.payload)||{};
+    for(const field of (group.fields||[]))values[field.key]=current[field.key];
+    payload[group.payload]=values;
   }
   return payload;
 }
@@ -478,7 +487,11 @@ function applySnapshot(result){
   state.originalIds=new Set(state.providers.map(item=>item.id));
   state.primaryChosen=false;
   state.catalog=result.catalog||{version:1,api_types:[],groups:[],thinking_values:[],thinking_labels:{}};
-  state.referenceFallback=result.reference_fallback||{};
+  state.groupValues={};
+  for(const group of (state.catalog.groups||[])){
+    const values=result[group.payload];
+    state.groupValues[group.payload]=values&&typeof values==='object'?values:{};
+  }
   state.optimizerProviderId=result.optimizer_provider_id||'';
   state.visionProviderId=result.vision_provider_id||'';
   state.chatProviders=Array.isArray(result.chat_providers)?result.chat_providers:[];
@@ -576,7 +589,7 @@ $('#upload').addEventListener('click',async()=>{const files=[...$('#reference-fi
 window.addEventListener('beforeunload',event=>{if(!state.dirty&&!state.quotaDirty)return;event.preventDefault();event.returnValue=''});
 
 /* 测试钩子：Node vm 回归直接调用真实渲染/装配逻辑（对线上无副作用）。 */
-window.__imagoWebui={state,catalogEntry,catalogLabel,paramFields,capabilitiesOf,qualityText,thinkingCapText,referencesText,thinkingValues,thinkingLabel,normalizeProvider,renderProviders,renderGroups,buildProviderPayload,applySnapshot,syncProviderField,syncGroupField,setParamValue,clearConfirmMessage};
+window.__imagoWebui={state,catalogEntry,catalogLabel,paramFields,capabilitiesOf,qualityText,thinkingCapText,referencesText,thinkingValues,thinkingLabel,normalizeProvider,renderProviders,renderGroups,groupState,buildProviderPayload,applySnapshot,syncProviderField,syncGroupField,setParamValue,clearConfirmMessage};
 
 (async()=>{
   try{

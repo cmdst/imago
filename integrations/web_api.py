@@ -72,6 +72,7 @@ GROUP_DEFS: dict[str, dict[str, Any]] = {
     "reference_fallback_config": {
         "payload": "reference_fallback",
         "label": "参考图文字降级",
+        "extra_control": "vision_provider_select",
         "description": (
             "仅当节点**明确**以安全/内容合规原因拒绝参考图时，在该节点内改用参考图的文字说明重试"
             "（每节点至多识图一次，最多 max_retries_per_node 次纯文字生成）；"
@@ -130,6 +131,92 @@ GROUP_DEFS: dict[str, dict[str, Any]] = {
                 "type": "bool",
                 "default": True,
                 "help": "默认告知，避免用户误以为参考图仍然生效。",
+            },
+        ],
+    },
+    # v1.4.1 参考图压缩组：只压缩「发往绘图节点的那一份副本」，
+    # 本地 inputs/ 原素材与出图结果都不受影响；与下面的百度增强 / 放大是两条独立链路。
+    "reference_compress_config": {
+        "payload": "reference_compress",
+        "label": "参考图压缩",
+        "description": (
+            "发往绘图节点的参考图副本会先按最长边与目标体积压缩（显式参考图、引用消息、"
+            "URL/base64/data 与 Persona 参考图一视同仁）。只改这一份副本：本地的 inputs/ 原素材、"
+            "任务记录与出图结果都不受影响；与「增强」「放大」是两回事，那两个开关只处理成品图。"
+            "关闭时零解码、零新增文件、零新增日志。"
+        ),
+        "fields": [
+            {
+                "key": "enable",
+                "label": "启用参考图压缩",
+                "control": "switch",
+                "type": "bool",
+                "default": True,
+                "help": (
+                    "开启后每张参考图在上传前压缩一次；关闭时按原字节发送，"
+                    "不产生任何压缩文件、不写诊断、不记日志。"
+                ),
+            },
+            {
+                "key": "max_edge",
+                "label": "最长边上限（像素）",
+                "control": "number",
+                "type": "int",
+                "default": 1536,
+                "min": 0,
+                "max": 4096,
+                "help": "范围 0-4096。只缩小、不放大；0 = 完全不缩放（跳过尺寸档）。",
+            },
+            {
+                "key": "jpeg_quality",
+                "label": "JPEG 起始质量",
+                "control": "number",
+                "type": "int",
+                "default": 85,
+                "min": 40,
+                "max": 95,
+                "help": "范围 40-95。未达标时按 10 递减重试，最低不低于 40。",
+            },
+            {
+                "key": "target_kb",
+                "label": "目标体积（KB）",
+                "control": "number",
+                "type": "int",
+                "default": 128,
+                "min": 32,
+                "max": 2048,
+                "help": (
+                    "范围 32-2048，按 1 KB = 1024 字节计算。这是软目标，不是硬限制："
+                    "达不到就发最小候选并标注 target_unmet，不会为了达标把图压坏。"
+                ),
+            },
+            {
+                "key": "min_bytes",
+                "label": "压缩起点（字节）",
+                "control": "number",
+                "type": "int",
+                "default": 32768,
+                "min": 0,
+                "max": 1048576,
+                "help": "小于该字节数的参考图原样发送（零解码）；0 = 所有参考图都参与压缩。",
+            },
+            {
+                "key": "keep_alpha",
+                "label": "保留透明通道（输出 PNG）",
+                "control": "switch",
+                "type": "bool",
+                "default": False,
+                "help": "关闭时按白底 JPEG 压缩（体积更小）；开启时保留 alpha 输出 PNG。",
+            },
+            {
+                "key": "max_pixels",
+                "label": "像素总数上限（像素）",
+                "control": "number",
+                "type": "int",
+                "default": 40000000,
+                "min": 1000000,
+                "max": 100000000,
+                "help": "范围 1000000-100000000。像素总数超过该值的参考图不参与压缩。",
             },
         ],
     },
@@ -253,6 +340,10 @@ def _groups_meta() -> list[dict[str, Any]]:
         }
         if definition.get("depends_on"):
             meta["depends_on"] = dict(definition["depends_on"])
+        # 非字段型附加控件（如参考图文字降级的识图 Provider 下拉）由描述表声明，
+        # 前端按 extra_control 渲染 —— 避免前端硬编码组名。
+        if definition.get("extra_control"):
+            meta["extra_control"] = definition["extra_control"]
         groups.append(meta)
     return groups
 
@@ -536,16 +627,19 @@ class PageAPI:
         optimizer = self.plugin.raw_config.get("optimizer_config", {}) or {}
         vision_provider_id = str(optimizer.get("vision_provider_id", "")).strip()
         chat_ids = {item["id"] for item in chat_providers}
-        fallback = _group_values_from(
-            self.plugin.raw_config.get("reference_fallback_config"),
-            GROUP_DEFS["reference_fallback_config"],
-        )
+        # v1.4.1：组快照由 GROUP_DEFS 驱动（组名 = payload 键）。新增组时这里不需要再改：
+        # 描述表加一项就同时得到 catalog、快照与保存回路。
+        group_snapshots: dict[str, dict[str, Any]] = {
+            definition["payload"]: _group_values_from(self.plugin.raw_config.get(name), definition)
+            for name, definition in GROUP_DEFS.items()
+        }
+        fallback = group_snapshots["reference_fallback"]
         fallback["vision_provider_id"] = vision_provider_id
         fallback["vision_provider_ready"] = bool(vision_provider_id and vision_provider_id in chat_ids)
         return {
             "providers": configured,
             "catalog": _catalog(),
-            "reference_fallback": fallback,
+            **group_snapshots,
             "primary_provider_id": effective,
             "stored_primary_provider_id": stored_primary,
             "chat_providers": chat_providers,

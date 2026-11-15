@@ -84,7 +84,9 @@ pre{white-space:pre-wrap;overflow-wrap:anywhere;max-height:360px;overflow:auto;b
 .field-grid{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:13px;min-width:0}
 .node-fields label,.group-fields label{display:grid;gap:6px;font-size:13px;font-weight:700;min-width:0}
 .node-fields .hint,.group-fields .hint,.config-card .hint{font-weight:400;color:var(--muted);font-size:12px;line-height:1.55}
-.check-line{display:flex!important;align-items:center;gap:8px;grid-template-columns:none}
+.check-line{display:flex!important;flex-wrap:wrap;align-items:center;gap:6px 8px;grid-template-columns:none}
+/* 开关类字段的长说明单独占一行，避免说明文字挤在勾选框右侧呈锯齿状换行 */
+.check-line .hint{flex:0 0 100%;margin:0}
 .check-line input{width:16px;height:16px;accent-color:var(--primary);flex:none}
 .node-advanced{border:1px solid var(--line);border-radius:11px;padding:12px;background:var(--surface-2);min-width:0}
 .node-advanced summary{cursor:pointer;font-weight:800;font-size:13px;color:var(--text)}
