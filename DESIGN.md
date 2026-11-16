@@ -634,13 +634,13 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST -d '{}' \
   http://127.0.0.1:8317/v1beta/models/gemini-3.1-flash-image:generateContent
 ```
 
-## 9. v1.4.1 实现决策：参考图压缩 / 回吐守卫 / 三层超时
+## 9. v1.4.1 实现决策：参考图压缩 / 回吐守卫 / 超时语义（节点与任务两层）
 
 ### 9.1 为什么压缩放在 `main._prepare()` 的单一入口
 
 七类参考图来源（消息链 `Image`、`data:`、`base64://`、`http(s)` 链接、引用消息 deferred、后台 deferred、Persona 磁盘素材）最终都收敛成两份列表：`task.request.references`（显式）与 `task.runtime["persona_references"]`（Persona 池）。在两者就绪之后、`_request_for_attempt()` 第一次被调用之前压一次，等价于"所有入口都过同一个 ingest"，同时天然满足"每任务只压一次、重试不重复有损"。
 
-替代方案及其问题：①在 `core/references.py` 的 `ReferencePlanner` 里压——只覆盖事件阶段能拿到的图，Persona 与 deferred 漏掉；②在 `scheduler._request_for_attempt()` 里压——会被每个节点 × 每个模型重复调用，同一张图反复有损；③在 `providers/openai_image.py` 的 multipart 里压——只覆盖一种协议，且会把"成品图下载"（`materialize_result` 共用 `fetch_reference`）卷进来。
+替代方案及其问题：①在 `core/references.py` 的 `ReferencePlanner` 里压——只覆盖事件阶段能拿到的图，Persona 与 deferred 漏掉；②在 `scheduler._request_for_attempt()` 里压——会被每个节点 × 每个模型重复调用，同一张图反复有损；③在 `providers/openai_image.py` 的 multipart 里压——只覆盖一种协议（native 与其它直连协议都会漏），而且压缩失败只能就地回退，异常点与"请求体已经组装/发出"的边界缠在一起，很难保证「压缩出错绝不改变发送结果」。真正需要绕开的是 `fetch_reference` 这个**全局网络入口**：`materialize_result()` 下载成品图也走它，把压缩挂上去等于连成品图下载一起改道，所以压缩不放在那一层。
 
 ### 9.2 为什么原素材与运行期副本分离
 
@@ -672,6 +672,8 @@ curl -s -o /dev/null -w '%{http_code}\n' -X POST -d '{}' \
    L2 任务预算到期 ⇒ TIMED_OUT + errors=timeout（不退款）
 ```
 
-### 9.5 三层超时的判定依据
+### 9.5 超时判定：只认真实 deadline（两层）
 
-任务级超时只认 `created_at + generation_timeout` 这一个 deadline：外层 `asyncio.timeout(remaining)` 到期时 `scope.expired()` 为真；节点级超时在 `_generate` 的每次尝试出口被包成 `ProviderTimeout`（`code=provider_timeout`），因此不会再从 `_execute` 逃逸。唯一的例外是"生成阶段抛出的裸 `TimeoutError`"（历史兼容口径，BF-03/F11 的终态矩阵用例钉住），准备 / 配文 / 发送阶段的 `TimeoutError` 按普通失败结算。
+任务级超时只认 `created_at + generation_timeout` 这一个真实 deadline：外层 `asyncio.timeout(remaining)` 到期时 `scope.expired()`（或剩余预算 `<= 0`、`elapsed >= budget`）为真才判 `TIMED_OUT` 并写 `errors` 里的 `timeout`。节点级超时在 `_generate` 的每次尝试出口被包成 `ProviderTimeout`（`code=provider_timeout`），因此不会再从 `_execute` 逃逸成任务级结算。
+
+**没有「裸 `TimeoutError` 兼容例外」**：生成阶段仍有裸 `TimeoutError` 逃到出口时，`_generate` 的出口兜底会把它包成 `ProviderTimeout`、按节点超时继续 fallback（而不是判任务超时）；准备参考图 / 配文 / 发送阶段的 `TimeoutError` 同样按普通失败结算。取消（`CANCELLED`）照原样向上传播并退款。

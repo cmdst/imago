@@ -1,15 +1,15 @@
 # 更新日志
 
-## 1.4.1 — 2026-11-15
+## 1.4.1（未发布开发候选）
 
 **一句话**：把三处已证实的链路缺陷（参考图不压缩 → 上传慢且易踩超时、节点超时被误判成任务总超时、模型把参考图原样回吐当成品）一并修掉，并把"为什么失败"写进脱敏、有界、可诊断的记录；配置面只新增一组（7 键，默认开启）。
 
 ### 新增
 
 - **参考图压缩**（配置组 `reference_compress_config`，7 键，默认开启）：显式参考图、引用消息图片、`data:` / `base64://` / `http(s)` 链接、后台 deferred、Persona 参考图**共用同一个入口**，在"参考图全部就绪之后、第一次请求节点之前"压缩一次；`inputs/` 原素材与出图/增强/放大产物完全不参与。只缩不放、EXIF 方向归一、透明按需白底、质量档带 40 下限、最多 9 次编码、最终只接受"比原图更小"的候选（否则 `no_gain`）；达不到 `target_kb` 时保留最小候选并标 `target_unmet`。Pillow 缺失或任何异常一律回退原图，**不写 `task.errors`**、不新增任务失败。`enable=false` 时零解码、零新增文件、零新增日志，发送字节与 1.4.0 逐字节一致。
-- **回吐守卫**：在"成品图已落盘、尚未增强/放大"的位置，把成品与**本次成功尝试实际发出的参考图**（含压缩副本与采样到的 Persona 图）比对；命中判据只有两条——**字节完全相同**，或 **EXIF 方向归一后同尺寸且 RGBA 逐像素完全相等**。全部命中 → `NO_OUTPUT` + `no_change` + 固定文案「这次没有生成新图，模型把参考图原样送了回来。请重试或换个节点。」；部分命中 → `PARTIAL_SUCCESS` 且只发有效图。不解码/超限/无快照一律放行（`unknown`），不做感知哈希、不自动重试、不额外调用节点；被拦的 provider 原件保留在 `outputs/`，但不进 `task.json` 的 `outputs[]`。
-- **三层超时分离**：L1 节点超时（`providers[].timeout`，默认 180 s）在 `_generate` 出口统一包成 `ProviderTimeout` 并继续 fallback；L2 任务预算（`task_config.generation_timeout`，从 `created_at` 起算）到期才判 `TIMED_OUT`；L3 单张上传窗口维持内部常量。`TIMED_OUT` 现在**必然**带 `errors` 里的 `timeout` 与 `runtime.last_provider_error=任务超时`；准备参考图、配文、发送等阶段的内部 `TimeoutError` 按普通失败结算，不冒充总超时。
-- **可观测（脱敏、有界）**：适配器网络异常开始记录 `phase`（connect/upload/wait_response/read_body/unknown）、`elapsed`、`up_bytes`（来自 aiohttp 分片回调真实计数）、`timeout`；`task.json` 新增 `reference_compress` / `echo_guard` / `attempts` 三块摘要，运行期另有 `attempt_diagnostics`（≤12 条）。日志新增 `参考图压缩 …`、`回吐闸 检查=… 拦下=… 放行=…`、`绘图模型失败 node=… model=… phase=… …` 三类行，均不含图片内容、完整 URL 或凭据。
+- **回吐守卫**：在"成品图已落盘、尚未增强/放大"的位置，把成品与**本次成功尝试实际发出的参考图**（含压缩副本与采样到的 Persona 图）比对；命中判据只有两条——**字节完全相同**，或 **EXIF 方向归一后同尺寸且 RGBA 逐像素完全相等**。全部命中 → `NO_OUTPUT` + `no_change` + 固定文案「这次没有生成新图，模型把参考图原样送了回来。请重试或换个节点。」；部分命中 → `PARTIAL_SUCCESS` 且只发有效图。不解码/超限/无快照一律放行（`unknown`），不做感知哈希、不自动重试、不额外调用节点；被拦的 provider 原件保留在 `outputs/`，但不进 `task.json` 的 `outputs[]`。全部命中时**不发起后置配文**（冻结文案也不会被配文覆盖）；若开了 `task_config.llm_caption_pregen`，预生成配文可能在参考图准备阶段就已发起、随后被取消——**取消不等于没花过**，所以这里只承诺「闸门不新增调用」，不承诺「整个任务零配文费用」。
+- **超时语义分两层**：L1 节点超时（`providers[].timeout`，默认 180 s、最小 10 s）在 `_generate` 出口统一包成 `ProviderTimeout` 并继续 fallback；L2 任务预算（`task_config.generation_timeout`，从 `created_at` 起算，默认 300 s、最小 30 s）真实到期才判 `TIMED_OUT`。**没有第三个「上传窗口」定时器**：1.4.1 开发期间文档里出现过的「≈15 s 上传窗口」是早期链路观测值，不是代码里的阈值；`aiohttp.ClientTimeout(total=None, connect=15)` 只限制连接建立。`TIMED_OUT` 现在**必然**带 `errors` 里的 `timeout` 与 `runtime.last_provider_error=任务超时`；准备参考图、配文、发送等阶段的内部 `TimeoutError` 按普通失败结算，不冒充总超时。
+- **可观测（脱敏、有界）**：适配器网络异常开始记录 `phase`（保守三值 **connect / read_body / unknown**——只有明确的连接类异常才记 `connect`，其余一律 `unknown`，不按异常名推断阶段）、`elapsed`、`up_bytes`（**客户端分片回调发出的字节**，不是对端接收计数；没有回调就写 `unknown`，不补零）、`timeout`；`task.json` 新增 `reference_compress` / `echo_guard` / `attempts` 三块摘要，运行期另有 `attempt_diagnostics`（≤12 条）。日志新增 `参考图压缩 …`、`回吐闸 检查=… 拦下=… 放行=…`、`绘图模型失败 node=… model=… phase=… …` 三类行，均不含图片内容、完整 URL 或凭据。
 
 ### 变更
 
@@ -20,11 +20,11 @@
 ### 修复
 
 - 1.4.0 出现的"任务 `timed_out` 且 `errors=-`"（本地任务 `1299a517…`，单节点 117 s 后任务被判超时）：根因是节点级超时直接从 `_execute` 逃逸成任务级结算。现在节点超时被包装并继续 fallback，任务级超时则必然带原因。
-- 参考图不经压缩直接上传（单张数百 KB～数 MB 的原图）导致的准备阶段耗时与上传窗口超时。
+- 参考图不经压缩直接上传（单张数百 KB～数 MB 的原图）导致的准备阶段耗时与上传阶段超时。
 
 ### 未验证（留 fix 侧真实链路）
 
-- 真实 `295454` 字节样本的压缩后体积、真实网络下 ≤7 s 的单张上传窗口、以及真实模型回吐的复现：本站只用合成夹具验证判定器与管道本身，**不作为真实链路已验证**。
+- 真实 `295454` 字节样本的压缩后体积、真实网络下单张参考图 ≤7 s 的上传耗时（**观测目标，不是插件里的阈值**）、以及真实模型回吐的复现：本站只用合成夹具验证判定器与管道本身，**不作为真实链路已验证**，也不代表已上线或已过真实模型验收。
 - 增强 / 放大两级与压缩的叠加顺序只做离线断言，未打真实百度接口。
 
 ## 1.4.0 — 2026-11-15
