@@ -90,12 +90,18 @@ class AttemptTrace:
 #: 注意不能宽泛匹配 ``connect``：``ServerDisconnectedError`` 也含这个词，
 #: 但它表示"连上之后被对端断开"，与 connect 阶段相反（CORE-05）。
 _CONNECT_TOKENS = (
-    "connector",
-    "clientconnectionerror",
+    # 具体到"连接建立失败"的子类：ClientConnectorError 及其 DNS 变体、
+    # 代理连接器、OS 级拒绝、DNS 解析、TLS/证书。**不收** ClientConnectionError
+    # 这个宽泛基类（它同时覆盖断连/超时等"已连上"的情形）。
+    "clientconnectorerror",
+    "clientconnectordnserror",
     "clientproxyconnectionerror",
-    "sslerror",
-    "certificateerror",
+    "connectionrefusederror",
+    "connectorerror",
     "gaierror",
+    "sslerror",
+    "sslcertverificationerror",
+    "certificateerror",
 )
 
 
@@ -105,14 +111,19 @@ def _looks_like_connect(exc: BaseException) -> bool:
 
 
 def fallback_phase(exc: BaseException) -> str:
-    """无 trace 事实时的保守归类：类型名→阶段，未知就 ``unknown``。"""
-    name = type(exc).__name__.lower()
-    if any(token in name for token in ("connector", "connect", "dns", "ssl", "certificate")):
+    """无 trace 事实时的保守归类（契约 §5.8 / 评审 R3-02）。
+
+    只有**能确证"根本没连上"**的异常才记 ``connect``；其余一律 ``unknown``：
+
+    * ``ServerDisconnectedError`` / ``ClientConnectionError`` / ``TimeoutError`` 等
+      既可能"连上后中断"也可能"根本没连上"，没有 trace 时无法判定 ⇒ ``unknown``；
+    * 绝不按 ``disconnect``/``reset``/``payload`` 之类子串推断 ``read_body``——
+      这些词不能证明响应体已经开始读取。
+
+    与 :meth:`AttemptTrace.phase` 共用同一份 :data:`_CONNECT_TOKENS`，避免两处口径漂移。
+    """
+    if _looks_like_connect(exc):
         return PHASE_CONNECT
-    if "timeout" in name:
-        return PHASE_WAIT_RESPONSE
-    if any(token in name for token in ("payload", "disconnect", "reset", "response", "protocol")):
-        return PHASE_READ_BODY
     return PHASE_UNKNOWN
 
 

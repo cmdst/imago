@@ -17,6 +17,7 @@ import random
 import unittest
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from unittest.mock import patch
 
 from PIL import Image
 
@@ -134,6 +135,47 @@ class ClassifyTests(unittest.TestCase):
         self.assertIn("未知=1", summary)
 
 
+class DecodeBudgetTests(unittest.TestCase):
+    """R3-04：读头后、解码前就判 ``width*height*4`` 预算（超限 ⇒ unknown）。"""
+
+    def _oversized_png(self, value: int) -> bytes:
+        from PIL import Image as PILImage
+
+        buffer = io.BytesIO()
+        PILImage.new("L", (5000, 4000), value).save(buffer, format="PNG")
+        return buffer.getvalue()
+
+    def _decode_calls(self, payload: bytes) -> list[tuple[int, int]]:
+        """记录 ``exif_transpose`` 的调用（= 走过了"读头之后的解码路径"）。
+
+        注意不能用 ``side_effect=AssertionError``：``normalized_pixels`` 对所有异常都
+        返回 ``None``，异常会被吞掉，测不出"到底解没解码"。
+        """
+        calls: list[tuple[int, int]] = []
+        original = echo_guard.ImageOps.exif_transpose
+
+        def spy(image, *args, **kwargs):
+            calls.append(tuple(int(v) for v in image.size))
+            return original(image, *args, **kwargs)
+
+        with patch.object(echo_guard.ImageOps, "exif_transpose", side_effect=spy):
+            self.assertIsNone(echo_guard.normalized_pixels(payload))
+        return calls
+
+    def test_oversized_rgba_budget_returns_unknown_without_decoding(self):
+        payload = self._oversized_png(0)
+        self.assertGreater(5000 * 4000 * 4, echo_guard.MAX_COMPARE_BYTES)
+        self.assertEqual(self._decode_calls(payload), [])
+
+    def test_oversized_candidate_is_unknown_not_blocked(self):
+        payload = self._oversized_png(0)
+        other = self._oversized_png(1)
+        baseline = echo_guard.EchoBaseline.of([ImageInput(payload, PNG_MIME, "ref.png")])
+        with patch.object(echo_guard.ImageOps, "exif_transpose", side_effect=AssertionError("decode")):
+            # classify 对异常一律按 unknown 放行（不会被"拦截"）。
+            self.assertEqual(echo_guard.classify(other, baseline), echo_guard.VERDICT_UNKNOWN)
+
+
 class _Scheduler:
     def __init__(self):
         self.accepting = True
@@ -228,6 +270,62 @@ class FinishTaskTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("这次没有生成新图", plugin.sender.chain[0].text)
         # provider 原件仍留在 outputs/，但一条也没进 output_paths。
         self.assertEqual(len(kept), 2)
+
+    def _plugin_with_caption(self, directory, *, delivered):
+        plugin = self._plugin(directory, delivered=delivered)
+        plugin.raw_config = {"task_config": {"llm_caption": True}}
+        calls = []
+
+        async def build_caption(task, success, usable):
+            calls.append((success, usable))
+            return "CAPTION_CANARY_R301"
+
+        plugin._build_caption = build_caption
+        return plugin, calls
+
+    async def test_full_echo_skips_llm_caption_and_keeps_frozen_text(self):
+        """R3-01：全回吐是终态结论，不能再生一次配文（零付费）也不得覆盖正文。"""
+
+        payload = png_bytes()
+        with TemporaryDirectory() as directory:
+            plugin, calls = self._plugin_with_caption(
+                directory, delivered=[ImageInput(payload, PNG_MIME, "ref.png")]
+            )
+            task = self._task(plugin, references=[ImageInput(payload, PNG_MIME, "ref.png")])
+            outcome = await plugin._finish_task(
+                task,
+                [ImageResult(data=payload, mime_type=PNG_MIME)],
+            )
+            texts = [str(getattr(item, "text", "")) for item in plugin.sender.chain]
+        self.assertEqual(calls, [])
+        self.assertEqual(texts[-1], echo_guard.ECHO_BLOCKED_TEXT)
+        self.assertNotIn("CAPTION_CANARY_R301", " ".join(texts))
+        self.assertEqual(task.errors, ["no_change"])
+        self.assertFalse(outcome.generation_success)
+        self.assertEqual(outcome.usable_output_count, 0)
+        self.assertTrue(task.runtime["echo_guard"]["no_change"])
+        self.assertNotIn("caption_applied", task.runtime)
+
+    async def test_caption_still_applies_when_nothing_is_echoed(self):
+        """R3-01 反向：没被回吐闸拦下时，配文行为保持 v1.4.0 原样。"""
+
+        payload = png_bytes()
+        different = png_bytes(seed=7)
+        with TemporaryDirectory() as directory:
+            plugin, calls = self._plugin_with_caption(
+                directory, delivered=[ImageInput(payload, PNG_MIME, "ref.png")]
+            )
+            task = self._task(plugin, references=[ImageInput(payload, PNG_MIME, "ref.png")])
+            outcome = await plugin._finish_task(
+                task,
+                [ImageResult(data=different, mime_type=PNG_MIME)],
+            )
+            texts = [str(getattr(item, "text", "")) for item in plugin.sender.chain]
+        self.assertTrue(outcome.generation_success)
+        self.assertEqual(calls, [(True, 1)])
+        self.assertIn("CAPTION_CANARY_R301", " ".join(texts))
+        self.assertTrue(task.runtime.get("caption_applied"))
+        self.assertNotIn("no_change", task.errors)
 
     async def test_mixed_echo_delivers_only_valid_images(self):
         payload = png_bytes()

@@ -1629,15 +1629,25 @@ class ImagoFusion(Star):
         head: list = []
         if cfg.at_trigger_user and task.owner_user_id and ":GroupMessage:" in str(task.umo):
             head.append(At(qq=task.owner_user_id))
+        echo_all_blocked = bool(
+            echo_blocked and echo_guard.blocked_all(echo_state, len(results))
+        )
         if not generation_success:
-            if echo_blocked and echo_guard.blocked_all(echo_state, len(results)):
+            if echo_all_blocked:
                 # 全部成品图都是回吐：给冻结文案，不要误导成"绘制失败"（§4.7）。
                 chain.append(Plain(echo_guard.ECHO_BLOCKED_TEXT))
             else:
                 chain.append(Plain("绘制超时，请稍后再试。" if task.state == TaskState.TIMED_OUT else "绘制失败，请稍后再试。"))
         elif task.errors:
             chain.append(Plain("部分图片绘制失败。"))
-        if cfg.llm_caption:
+        if echo_all_blocked:
+            # R3-01（契约 §4.7）：全回吐是"模型把参考图原样送回"的终态结论，
+            # 不是"缺一句说明"。这里既不调用 LLM 配文（零付费），也不让配文覆盖
+            # 冻结正文；预生成任务若还在跑就取消，避免留下悬挂协程。
+            pregen_pending = task.runtime.get("caption_pregen_task")
+            if pregen_pending is not None and not pregen_pending.done():
+                pregen_pending.cancel()
+        elif cfg.llm_caption:
             caption = ""
             pregen_task = task.runtime.get("caption_pregen_task")
             if generation_success and cfg.llm_caption_pregen and pregen_task is not None:

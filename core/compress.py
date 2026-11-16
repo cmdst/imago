@@ -29,6 +29,7 @@ from dataclasses import dataclass
 from typing import Any, Callable
 
 from .models import ImageInput, ReferenceCompressConfig
+from .security import redact_debug
 
 try:  # pragma: no cover - 取决于运行环境是否带 Pillow
     from PIL import Image, ImageOps
@@ -69,6 +70,16 @@ _DEFAULT_STEM = "reference"
 _JPEG_SUFFIX = ".jpg"
 _PNG_SUFFIX = ".png"
 _MAX_DETAIL_CHARS = 120
+
+
+def _bounded_detail(value: object) -> str:
+    """压缩失败 detail 的统一出口：**先脱敏、后截断**（契约 §3.8）。
+
+    顺序不能反：先截断再脱敏时，落在 120 字符内的短 URL/token 会原样进
+    WARNING；``redact_debug`` 会把整条 URL 换成 ``<url>`` 并掩码 ``token=``，
+    之后再截断不会把已经脱敏的片段切回来。
+    """
+    return redact_debug(value)[:_MAX_DETAIL_CHARS]
 
 _missing_pillow_warned = False
 
@@ -197,7 +208,7 @@ def compress_reference(
             in_bytes=in_bytes,
             out_bytes=in_bytes,
             elapsed_ms=int((now() - started) * 1000),
-            detail=detail[:_MAX_DETAIL_CHARS],
+            detail=_bounded_detail(detail),
         )
 
     if not data:

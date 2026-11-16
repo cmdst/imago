@@ -372,6 +372,70 @@ class DiagnosticTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(entry["phase"], "unknown")
         self.assertEqual(entry["up_bytes"], "unknown")
 
+    def test_fallback_phase_only_claims_connect_when_provable(self):
+        """R3-02：无 trace 时只有"确证没连上"的类型才记 connect，其余 unknown。"""
+
+        from aiohttp.client_reqrep import ConnectionKey
+
+        from imago_fusion.core import diagnostics as diag
+
+        refused = aiohttp.ClientConnectorError(
+            ConnectionKey("example.invalid", 443, True, True, None, None, None),
+            OSError("refused"),
+        )
+        # 可证连接建立失败 ⇒ connect。
+        self.assertEqual(diag.fallback_phase(refused), diag.PHASE_CONNECT)
+        self.assertEqual(diag.fallback_phase(ConnectionRefusedError()), diag.PHASE_CONNECT)
+        # 断连 / 宽泛连接错误 / 超时都**不能**证明连没连上 ⇒ unknown。
+        for ambiguous in (
+            aiohttp.ServerDisconnectedError(),
+            aiohttp.ClientConnectionError("boom"),
+            asyncio.TimeoutError(),
+            ConnectionResetError(),
+        ):
+            self.assertEqual(
+                diag.fallback_phase(ambiguous), diag.PHASE_UNKNOWN,
+                type(ambiguous).__name__,
+            )
+        # 无 trace 的遍历不得按 disconnect/reset/payload 子串猜 read_body。
+        self.assertEqual(diag.fallback_phase(aiohttp.ClientPayloadError()), diag.PHASE_UNKNOWN)
+
+    async def test_text_stage_disconnect_stays_unknown_and_keeps_errors_clean(self):
+        """R3-02：文字阶段真实异常链与诊断分类一致，且成功流程不被失败污染。"""
+
+        from imago_fusion.core.models import ReferenceFallbackConfig
+        from imago_fusion.core.references import RejectionVerdict
+
+        async def captioner(task, config, prompt, references, *, timeout, max_chars):
+            return "一名短发女性站在窗边"
+
+        async def disconnect(config, request):
+            raise aiohttp.ServerDisconnectedError()
+
+        config = _config(
+            providers=(_node(timeout=30),),
+            vision_provider_id="vision",
+            reference_fallback=ReferenceFallbackConfig(enable=True, max_retries_per_node=1),
+        )
+        task = _task()
+        scheduler = _scheduler(config)
+        scheduler.captioner = captioner
+        scheduler.info = lambda *a, **k: None
+        scheduler.warn = lambda *a, **k: None
+        verdict = RejectionVerdict(kind="safety", convertible=True, evidence="block:SAFETY", detail="")
+        request = GenerationRequest("draw", references=(ImageInput(PNG, "image/png"),))
+        with patch.dict(ADAPTERS, {"openai_image": _adapter(disconnect)}, clear=False):
+            outcome = await scheduler._text_stage(
+                task, config, _node(timeout=30), request, verdict,
+                status=400, deadline=time.monotonic() + 250, text_quota=1,
+            )
+        self.assertIsNone(outcome.results)
+        entry = task.runtime["attempt_diagnostics"][-1]
+        self.assertEqual(entry["phase"], "unknown")
+        self.assertEqual(entry["up_bytes"], "unknown")
+        self.assertEqual(entry["error_type"], "ServerDisconnectedError")
+        self.assertEqual(task.errors, [])
+
     async def test_node_timeouts_are_visible_in_errors_and_runtime(self):
         async def slow(config, request):
             await asyncio.sleep(5)

@@ -685,6 +685,41 @@ class EncodeFailureTests(unittest.TestCase):
         self.assertLessEqual(len(outcome.detail), 120)
         self.assertNotIn("pass@", outcome.detail)
 
+    def test_short_credentials_at_message_start_are_redacted_before_truncation(self):
+        """R3-03：短消息（<120 字符）里的 URL/token 也必须先脱敏。
+
+        既有 ``test_encode_error_detail_is_truncated_and_redacted`` 用的是 500 字符
+        长消息，截断本身就把凭据切掉了，覆盖不到"短消息原样进 WARNING"这条真实
+        路径（url 与 token 都在开头）。
+        """
+
+        source = noise_png(600, 400, seed=24)
+        image = ImageInput(source, "image/png", "short.png")
+        canary = "SYNTHETIC_CANARY_R303"
+        message = (
+            f"https://user:pass@example.invalid/ref.png?token={canary} "
+            f"token={canary} boom"
+        )
+        self.assertLess(len(message), 120)
+        records = {"warn": []}
+        with patch.object(logic, "_encode", side_effect=RuntimeError(message)):
+            outgoing, stats = logic.compress_all(
+                [image],
+                config(max_edge=512),
+                info=lambda *a, **k: None,
+                debug=lambda *a, **k: None,
+                warn=records["warn"].append,
+            )
+        self.assertIs(outgoing[0], image)
+        self.assertEqual(outgoing[0].mime_type, "image/png")
+        self.assertEqual(outgoing[0].filename, "short.png")
+        self.assertEqual(stats["failed"], [{"index": 1, "reason": logic.FAIL_ERROR}])
+        self.assertEqual(len(records["warn"]), 1)
+        warning = records["warn"][0]
+        self.assertIn("回退原图", warning)
+        for secret in (canary, "example.invalid", "https://", "user:pass"):
+            self.assertNotIn(secret, warning)
+
     def test_no_gain_is_not_a_failure(self):
         from PIL import Image
 
@@ -797,6 +832,13 @@ class Image:
         if self._converter is None:
             raise ValueError("no converter")
         return await self._converter()
+
+
+class Text:
+    """轻量文字组件替身：``core/references.py`` 从 ``.text`` 里抽 http(s) 来源。"""
+
+    def __init__(self, text=""):
+        self.text = text
 
 
 class _EditServer:
@@ -1008,6 +1050,34 @@ class EntryE2ETests(unittest.IsolatedAsyncioTestCase):
             (plugin.store.task_dir(task.id) / "inputs" / records[0]["file"]).read_bytes(),
             payload,
         )
+
+    async def test_deferred_text_url_entry_is_compressed_and_sent(self):
+        """R3-05：引用/文字里带的 http(s) 来源走 deferred 路径，仍过唯一压缩点。
+
+        这是"带内容"的 deferred 执行用例：``plan()`` 只把 URL 记成 deferred，
+        ``_prepare`` 里 ``_resolve_deferred_references`` 真去 loopback 拉图，随后
+        同一个压缩单点产物进 ``send_references``，最终 multipart 逐字节相等。
+        """
+
+        payload = photo_like_png(1400, 1000)
+        async with _EditServer(ref_payload=payload) as server:
+            async with _netguard_allow(server.port):
+                plugin = self._plugin(server.port, max_edge=768)
+                url = f"http://127.0.0.1:{server.port}/ref.png"
+                task, results = await self._run_entry(plugin, [Text(f"画一只猫 {url}")])
+                sent = task.runtime.get("send_references") or []
+                stats = task.runtime.get("reference_compress") or {}
+                parts = list(server.parts)
+                ref_hits = server.ref_hits
+                records = list(task.runtime.get("input_records") or [])
+        self.assertEqual(ref_hits, 1)
+        self.assertEqual(len(sent), 1)
+        self.assertEqual(stats.get("compressed"), 1)
+        self.assertEqual(len(parts), 1)
+        self.assertEqual(parts[0][2], sent[0].data)
+        self.assertLess(len(sent[0].data), len(payload))
+        self.assertEqual(records[0]["size"], len(payload))
+        self.assertEqual(results, [results[0]])
 
     async def test_every_source_entry_converges_to_the_same_sent_bytes(self):
         payload = photo_like_png(1200, 900)

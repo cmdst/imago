@@ -74,7 +74,13 @@ def normalized_pixels(data: bytes) -> tuple[int, int, bytes] | None:
         with Image.open(io.BytesIO(data)) as opened:
             if int(getattr(opened, "n_frames", 1) or 1) > 1:
                 opened.seek(0)
-            if int(opened.size[0]) * int(opened.size[1]) > MAX_COMPARE_PIXELS:
+            width, height = int(opened.size[0]), int(opened.size[1])
+            if width * height > MAX_COMPARE_PIXELS:
+                return None
+            if width * height * 4 > MAX_COMPARE_BYTES:
+                # R3-04：读头后、load/转置/完整解码**之前**判解码预算。
+                # 20 Mpx 图解码成 RGBA 是 80 000 000 B，两侧同时比较瞬时 >160 MB；
+                # 这里不花这份内存，直接按"不确定"放行（unknown），交给后续流程。
                 return None
             normalized = ImageOps.exif_transpose(opened)
             rgba = normalized if normalized.mode == "RGBA" else normalized.convert("RGBA")
