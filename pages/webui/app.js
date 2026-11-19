@@ -42,15 +42,31 @@ function referencesText(value){return ({edits:'images/edits 或 JSON 图像字�
 function reasonLabel(reason){return ({invalid_key:'键名不合法',reserved_key:'保留键，已跳过',invalid_value:'取值无效',duplicate_key:'重复键（首个生效）',unknown_for_type:'当前接口不支持（会保留）',invalid_line:'无法解析的行',parse_failed:'解析失败'})[reason]||reason}
 
 /* ---------------------------------------------------------------- Persona（保持 v1.2.0 行为） */
+let personaRequestSeq=0;
 function filteredPersonas(){const q=$('#persona-search').value.trim().toLowerCase();return state.personas.filter(id=>id.toLowerCase().includes(q))}
 function renderPersonaOptions(){const items=filteredPersonas();$('#persona-select').innerHTML=items.map(id=>`<option value="${attr(id)}"${id===state.current?' selected':''}>${escapeHtml(id)}</option>`).join('')}
 async function loadPersonas(){const result=await apiGet('personas');if(!result.success){state.personas=[];renderPersonaOptions();notify(result.message||'读取 Persona 列表失败',true);return}state.personas=(result.personas||[]).map(item=>item.id);renderPersonaOptions();if(state.personas.length){state.current=state.personas[0];renderPersonaOptions();await loadPersonaDetail()}}
-async function loadPersonaDetail(){
-  if(!state.current)return;
+/* 详情/图库刷新的"请求代次"（t11 R1-07）。
+   每个刷新自增一次；任何 await 之后、写 DOM 之前都必须回验"我还是最新那一代、
+   而且 state.current 仍是我发请求时的那个人格"。旧响应因此只能被丢弃，不能把
+   A 的 prompt/摘要/图卡贴到已经切到 B 的界面上；preview 也用同一份目标 ID，
+   不会在 await 前后读到两个不同的 state.current。 */
+function beginPersonaRequest(personaId){
+  personaRequestSeq+=1;
+  return {personaId,seq:personaRequestSeq};
+}
+function personaRequestCurrent(request){
+  return Boolean(request)&&request.seq===personaRequestSeq&&state.current===request.personaId;
+}
+async function loadPersonaDetail(options){
+  const personaId=String((options&&options.personaId)||state.current||'');
+  if(!personaId)return;
+  const request=beginPersonaRequest(personaId);
   notify('正在读取 Persona……');
-  const result=await apiGet('detail',{persona_id:state.current});
+  const result=await apiGet('detail',{persona_id:personaId});
+  if(!personaRequestCurrent(request))return;
   if(!result.success)throw new Error(result.message||'读取失败');
-  $('#persona-title').textContent=state.current;
+  $('#persona-title').textContent=personaId;
   $('#persona-prompt').textContent=result.prompt||'空 prompt';
   $('#persona-summary').value=result.summary||'';
   updateSummaryCount();
@@ -58,22 +74,38 @@ async function loadPersonaDetail(){
   $('#rebuild').disabled=state.rebuilding;
   $('#upload').disabled=false;
   $('#save-summary').disabled=false;
-  await renderGallery(result.references||[]);
+  state.personaDetail={personaId,seq:request.seq};
+  await renderGallery(result.references||[],request);
+  if(!personaRequestCurrent(request))return;
   notify('');
 }
-async function renderGallery(refs){
+async function renderGallery(refs,request){
   const gallery=$('#gallery');
-  state.selectedReferences.clear();
-  if(!refs.length){gallery.innerHTML='<p class="empty">尚无参考图</p>';return}
+  const generation=request||beginPersonaRequest(state.current);
+  if(!personaRequestCurrent(generation))return;
+  if(!refs.length){
+    state.selectedReferences.clear();
+    gallery.innerHTML='<p class="empty">尚无参考图</p>';
+    return;
+  }
   const cards=[];
   for(const ref of refs){
+    let preview=null;
     try{
-      const preview=await apiGet('preview',{persona_id:state.current,filename:ref.name});
-      cards.push(`<div class="image-card"><label class="reference-select"><input type="checkbox" data-reference="${attr(ref.name)}"><span>用于本次识图</span></label>${preview.success?`<img src="${attr(preview.data_url||`data:${preview.mime_type};base64,${preview.base64_data}`)}" alt="Persona 参考图">`:`<div class="preview-error">${escapeHtml(preview.message||'预览失败')}</div>`}<button type="button" data-delete="${attr(ref.name)}">删除这张图</button></div>`);
+      preview=await apiGet('preview',{persona_id:generation.personaId,filename:ref.name});
     }catch(error){
-      cards.push(`<div class="image-card"><label class="reference-select"><input type="checkbox" data-reference="${attr(ref.name)}"><span>用于本次识图</span></label><div class="preview-error">预览请求失败</div><button type="button" data-delete="${attr(ref.name)}">删除这张图</button></div>`);
+      preview=null;
     }
+    // 每张图 await 之后都回验：代次变了就整段放弃，绝不把 A 的图卡写进 B 的库。
+    if(!personaRequestCurrent(generation))return;
+    const label=`<label class="reference-select"><input type="checkbox" data-reference="${attr(ref.name)}"><span>用于本次识图</span></label>`;
+    const image=preview&&preview.success
+      ? `<img src="${attr(preview.data_url||`data:${preview.mime_type};base64,${preview.base64_data}`)}" alt="Persona 参考图">`
+      : `<div class="preview-error">${escapeHtml((preview&&preview.message)||'预览请求失败')}</div>`;
+    cards.push(`<div class="image-card">${label}${image}<button type="button" data-delete="${attr(ref.name)}">删除这张图</button></div>`);
   }
+  if(!personaRequestCurrent(generation))return;
+  state.selectedReferences.clear();
   gallery.innerHTML=cards.join('');
 }
 function readFile(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=reject;reader.readAsDataURL(file)})}
@@ -565,7 +597,7 @@ document.addEventListener('click',async event=>{
   const expand=event.target.closest('[data-expand]');
   if(expand){const index=Number(expand.dataset.expand);if(state.expanded.has(index))state.expanded.delete(index);else state.expanded.add(index);expand.closest('.provider-node').classList.toggle('expanded');return}
   const deleteButton=event.target.closest('[data-delete]');
-  if(deleteButton){deleteButton.disabled=true;const r=await apiPost('delete',{persona_id:state.current,filename:deleteButton.dataset.delete});notify(r.message,!r.success);if(r.success)await loadPersonaDetail();else deleteButton.disabled=false}
+  if(deleteButton){deleteButton.disabled=true;const personaId=state.current;const r=await apiPost('delete',{persona_id:personaId,filename:deleteButton.dataset.delete});notify(r.message,!r.success);if(!r.success)deleteButton.disabled=false;else if(state.current===personaId)await loadPersonaDetail()}
 });
 $('#provider-list').addEventListener('input',event=>{
   if(event.target.dataset.param){syncParam(event.target);return}
@@ -614,7 +646,7 @@ $('#upload').addEventListener('click',()=>{uploadReferences().catch(error=>notif
 window.addEventListener('beforeunload',event=>{if(!state.dirty&&!state.quotaDirty)return;event.preventDefault();event.returnValue=''});
 
 /* 测试钩子：Node vm 回归直接调用真实渲染/装配逻辑（对线上无副作用）。 */
-window.__imagoWebui={state,catalogEntry,catalogLabel,paramFields,capabilitiesOf,qualityText,thinkingCapText,referencesText,thinkingValues,thinkingLabel,normalizeProvider,renderProviders,renderGroups,groupState,buildProviderPayload,applySnapshot,syncProviderField,syncGroupField,setParamValue,clearConfirmMessage,loadPersonaDetail,renderGallery,readFile,uploadReferences,sameFiles};
+window.__imagoWebui={state,catalogEntry,catalogLabel,paramFields,capabilitiesOf,qualityText,thinkingCapText,referencesText,thinkingValues,thinkingLabel,normalizeProvider,renderProviders,renderGroups,groupState,buildProviderPayload,applySnapshot,syncProviderField,syncGroupField,setParamValue,clearConfirmMessage,loadPersonaDetail,renderGallery,readFile,uploadReferences,sameFiles,beginPersonaRequest,personaRequestCurrent,personaRequestSeq:()=>personaRequestSeq};
 
 (async()=>{
   try{

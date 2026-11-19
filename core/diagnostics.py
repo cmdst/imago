@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import hashlib
+import hmac
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -325,29 +326,62 @@ PERSONA_LIBRARY_STATES = (
 )
 
 #: 别名域前缀：换前缀即等于换一整套别名（旧日志不再能和新日志关联）。
-_PERSONA_ALIAS_SALT = "imago-fusion/persona-alias/v1"
+_PERSONA_ALIAS_DOMAIN = "imago-fusion/persona-alias/v1"
 _PERSONA_ALIAS_HEX = 12
+#: 本地密钥最短长度；短于它就当"没有密钥"，绝不用弱口令当 HMAC key。
+_PERSONA_ALIAS_KEY_MIN_BYTES = 16
+#: 拿不到本地密钥时的占位别名：不可关联、不可枚举、也不泄露原 ID。
+PERSONA_ALIAS_UNKEYED = "persona-unkeyed"
 #: 外部标签（节点 id / 模型名）的投影上限，防止异常长的配置值撑爆日志与 task.json。
 MAX_LABEL_CHARS = 48
 
 
-def persona_alias(persona_id: Any) -> str:
+def _alias_key(secret: Any) -> bytes:
+    """把调用方给的本地密钥规范成 HMAC key；不合格就返回空（=不推导别名）。"""
+    if isinstance(secret, str):
+        secret = secret.encode("utf-8")
+    if not isinstance(secret, (bytes, bytearray)):
+        return b""
+    data = bytes(secret).strip()
+    if len(data) < _PERSONA_ALIAS_KEY_MIN_BYTES:
+        return b""
+    return data
+
+
+def persona_alias(persona_id: Any, *, secret: Any = None) -> str:
     """把 Persona 原始 ID 投影成**稳定、不可逆、不可枚举**的观测别名。
 
     稳定 ⇒ 同一 ID 跨任务/跨重启得到同一别名，日志可关联；不可逆 ⇒ 只暴露
-    ``sha256(域前缀 ‖ ID)`` 的前 48 bit，不留可还原片段；不可枚举 ⇒ 空值单独成
-    ``persona-none``，且**禁止**用图库目录名（可逆编码）冒充别名（验收 t3）。
+    ``HMAC-SHA256(本地随机密钥, 域前缀 ‖ ID)`` 的前 48 bit，不留可还原片段；
+    不可枚举 ⇒ 密钥**不在仓库/日志/清单里**（每台部署本地生成，见
+    :meth:`services.persona_store.PersonaStore.alias_secret`），因此拿公开常量或
+    共享日志做小字典反查都命不中；空值单独成 ``persona-none``，且**禁止**用图库
+    目录名（可逆编码）冒充别名（t3 验收）。
+
+    v1.4.2 rev3.2（t11 R1-11）：历史实现用的是**写死在源码里的公共盐**
+    ``sha256(固定字面盐 ‖ ID)`` —— 任何人拿到两个 ID 就能算一次字典反查 12-hex
+    别名，"不可直接解哈希"并不等于"不可枚举"。现在改为本地随机密钥 HMAC；密钥
+    由调用方从插件数据目录注入（不入 schema、不入库、不落日志）。
 
     Args:
         persona_id: 宿主解析出来的 Persona 标识；空/None 视为"无"。
+        secret: 本机随机密钥（≥16 字节）。缺失/过短时**不推导**，返回
+            :data:`PERSONA_ALIAS_UNKEYED`，宁可不关联也不给可枚举别名。
 
     Returns:
-        形如 ``persona-1a2b3c4d5e6f`` 的短别名。
+        形如 ``persona-1a2b3c4d5e6f`` 的短别名，或 ``persona-unkeyed``。
     """
     text = str(persona_id or "")
     if not text:
         return "persona-none"
-    digest = hashlib.sha256(f"{_PERSONA_ALIAS_SALT}:{text}".encode("utf-8")).hexdigest()
+    key = _alias_key(secret)
+    if not key:
+        return PERSONA_ALIAS_UNKEYED
+    digest = hmac.new(
+        key,
+        f"{_PERSONA_ALIAS_DOMAIN}:{text}".encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
     return f"persona-{digest[:_PERSONA_ALIAS_HEX]}"
 
 
@@ -381,5 +415,14 @@ def as_reference_plans(entries: Any, *, limit: int = MAX_DIAGNOSTIC_ENTRIES) -> 
             "persona_budget": max(0, int(entry.get("persona_budget", 0) or 0)),
             "library": str(entry.get("library") or "")[:16],
             "reason": str(entry.get("reason") or "")[:32],
+            # rev3.2（t11 R1-12）：任务级单调腿序 + 调度位置。清单裁切到最近 N 条时
+            # 序号仍是**原始全局腿序**，配合 ``reference_plan_range`` 的 dropped /
+            # first_seq 就能还原顺序，不会被误读成"这是第 1 条腿"。
+            "seq": max(0, int(entry.get("seq", 0) or 0)),
+            "route": str(entry.get("route") or "")[:16],
+            "node_index": max(0, int(entry.get("node_index", 0) or 0)),
+            "node_count": max(0, int(entry.get("node_count", 0) or 0)),
+            "model_index": max(0, int(entry.get("model_index", 0) or 0)),
+            "model_attempts": max(0, int(entry.get("model_attempts", 0) or 0)),
         })
     return cleaned

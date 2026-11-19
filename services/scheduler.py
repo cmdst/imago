@@ -709,22 +709,52 @@ class TaskScheduler:
 
     @staticmethod
     def _record_reference_plan(
-        task: DrawTask, plan: ReferencePlan, *, node: str, model: str, kind: str = "normal",
-    ) -> None:
-        """逐腿记录"这一腿实际发了什么参考图"（有界、脱敏）。
+        task: DrawTask,
+        plan: ReferencePlan,
+        *,
+        node: str,
+        model: str,
+        kind: str = "normal",
+        route: dict | None = None,
+    ) -> dict:
+        """逐腿记录"这一腿实际发了什么参考图"（有界、脱敏、可还原全局腿序）。
 
         记录的是**插件交给 adapter 的入参事实**，不是远端收件、也不是可用池大小。
         ``persona_library_status`` 一起带上，便于把"没有图"和"有图没发"分开看。
+
+        v1.4.2 rev3.2（t11 R1-12）：**只在真正要调用 ``adapter.generate`` 之前**记录。
+        适配器构造失败、门禁提前返回、被取消的腿都不产生记录 —— 逐腿清单不得把
+        "没进 generate 的腿"冒充实发。每条记录带``seq``（任务级单调，从 1 起）与
+        调度位置（主/后备、节点/模型序号），裁切到最近 ``REFERENCE_PLAN_ENTRIES``
+        条时把丢弃条数累计到 ``reference_plans_dropped``，因此 ``seq`` 仍是原始全局
+        腿序、首条 ``seq`` 恒等于 ``dropped+1``，范围可读且不歧义。
         """
-        records = task.runtime.setdefault("reference_plans", [])
+        records = task.runtime.get("reference_plans")
         if not isinstance(records, list):
             records = task.runtime["reference_plans"] = []
+        seq = int(task.runtime.get("reference_plan_seq", 0) or 0) + 1
+        task.runtime["reference_plan_seq"] = seq
         record = plan.as_record(node=node, model=model, kind=kind)
+        record["seq"] = seq
         record["library"] = str(
             plan.library_status or task.runtime.get("persona_library_status", "") or ""
         )
+        if isinstance(route, dict):
+            # 调度位置事实（主/后备、第几个节点/模型）由调用方现算后传进来，
+            # 不在这里按事后配置重猜。缺省时留空，读侧用 ``.get`` 兼容。
+            record["route"] = str(route.get("route", "") or "")
+            record["node_index"] = int(route.get("node_index", 0) or 0)
+            record["node_count"] = int(route.get("node_count", 0) or 0)
+            record["model_index"] = int(route.get("model_index", 0) or 0)
+            record["model_attempts"] = int(route.get("model_attempts", 0) or 0)
         records.append(record)
-        del records[:-REFERENCE_PLAN_ENTRIES]
+        overflow = len(records) - REFERENCE_PLAN_ENTRIES
+        if overflow > 0:
+            del records[:overflow]
+            task.runtime["reference_plans_dropped"] = (
+                int(task.runtime.get("reference_plans_dropped", 0) or 0) + overflow
+            )
+        return record
 
     def _record_rejection(self, task: DrawTask, verdict, attempt, *, status=None) -> None:
         """记录首个非 ``unknown`` 的拒绝事件（只做排障留痕）。
@@ -969,9 +999,6 @@ class TaskScheduler:
                 reason=REFERENCE_REASON_TEXT_FALLBACK,
                 library_status=str(task.runtime.get("persona_library_status", "") or ""),
             )
-            self._record_reference_plan(
-                task, text_plan, node=attempt.id, model=model, kind="text_fallback"
-            )
             self.debug(
                 task,
                 "task=%s 参考图文字降级 尝试 node=%s model=%s attempt=%d/%d prompt_len=%d",
@@ -992,6 +1019,12 @@ class TaskScheduler:
                     text_request.count, len(text_request.references),
                     text_plan.persona_count, text_plan.explicit_count,
                     text_plan.persona_pool, text_plan.reference_limit, text_plan.reason,
+                )
+                # rev3.2（t11 R1-12）：纯文字腿同样只在真正进入 generate 前记账。
+                # 该腿 references 恒为空，实发计数严格 0/0，不沿用带图腿的旧值。
+                self._record_reference_plan(
+                    task, text_plan, node=attempt.id, model=model,
+                    kind="text_fallback", route=route,
                 )
                 try:
                     try:
@@ -1212,9 +1245,8 @@ class TaskScheduler:
                 attempt_request = plan.request
                 task.runtime["current_provider_id"] = attempt.id
                 task.runtime["current_model"] = model
-                # v1.4.2 C-PERSONA：逐腿记录**实发**张数与原因（不可变计划 → 有界
-                # 记录），manifest 由 finalizer 投影；绝不把可用池当实发。
-                self._record_reference_plan(task, plan, node=attempt.id, model=model)
+                # rev3.2（t11 R1-12）：逐腿记录必须发生在**真正进入 generate 之前**，
+                # 所以这里不再 append —— 记录点下移到 ``await adapter.generate`` 前。
                 # rev3.1 §7.2：``attempt_meta`` 每次尝试覆盖写，只存元数据。
                 # 计数与角色**只认本腿计划**：历史实现用 ``task.request.references``
                 # （全量池）当 explicit_count，纯文字/被裁减的腿都会虚报。
@@ -1261,6 +1293,11 @@ class TaskScheduler:
                         attempt_request.count, len(attempt_request.references),
                         plan.persona_count, plan.explicit_count, plan.persona_pool,
                         plan.reference_limit, plan.reason,
+                    )
+                    # 真实调用边界：只有走到这里（适配器已构造、密钥已选好）才把这条腿
+                    # 记进逐腿清单，构造/门禁失败不会留下"已实发"的假记录。
+                    self._record_reference_plan(
+                        task, plan, node=attempt.id, model=model, route=route
                     )
                     try:
                         try:

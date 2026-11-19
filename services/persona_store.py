@@ -4,7 +4,9 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shutil
+import stat as stat_module
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -14,6 +16,15 @@ from ..core.errors import DuplicateImage
 from ..core.security import ensure_child, safe_component
 
 ALLOWED_MIME = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
+
+#: 本机别名密钥：文件名、长度（字节）、权限。密钥只用于把 Persona 原始 ID
+#: 投影成不可枚举的观测别名（见 ``core.diagnostics.persona_alias``）。
+#: **不入库、不进配置/schema、不进日志、不进 task.json**；部署/重载只换代码，
+#: 数据目录不动 ⇒ 同一部署内别名跨重启保持一致，换机器则自然重生成（旧别名
+#: 不再可关联，这是有意的：没有密钥的别名本来就不该跨部署解码）。
+ALIAS_SECRET_FILENAME = "persona_alias.key"
+ALIAS_SECRET_BYTES = 32
+ALIAS_SECRET_MODE = 0o600
 
 #: 图库三态 + 故障态。值域与 ``core.diagnostics.PERSONA_LIBRARY_*`` 逐字相同；
 #: 这里只留字符串常量，避免 ``services`` 反向依赖 ``core.diagnostics``。
@@ -64,6 +75,7 @@ class PersonaStore:
         self.references = root / "persona_references"
         self.task_cache = root / "task_cache"
         self._max_upload_bytes = max_upload_bytes
+        self._alias_secret: bytes | None = None
         self.references.mkdir(parents=True, exist_ok=True)
         self.task_cache.mkdir(parents=True, exist_ok=True)
 
@@ -268,15 +280,61 @@ class PersonaStore:
         entries: list[dict] = []
         skipped = 0
         for path in children:
+            # ``Path.is_file()``/``is_symlink()`` 会把 OSError 吞成 ``False``：用它
+            # 判"是不是普通文件"，一次 stat 被拒（EACCES/EIO/ESTALE）就会被读成
+            # "这一条不算数"，整库于是**伪空**，任务照常请求 adapter（t11 R1-09）。
+            # 这里改成显式探测：链接/非普通文件是**故意排除**（计入 skipped），
+            # 真正的 lstat/stat 故障一律上抛成 ``error``，不再伪装成空库。
             try:
-                if path.is_symlink() or not path.is_file():
+                info = path.lstat()
+                if stat_module.S_ISLNK(info.st_mode) or not stat_module.S_ISREG(info.st_mode):
                     skipped += 1
                     continue
-                entries.append({"name": path.name, "size": int(path.stat().st_size)})
-            except OSError:
-                skipped += 1
+                size = int(path.stat().st_size)
+            except OSError as error:
+                return ReferenceScan(
+                    REFERENCE_STATUS_ERROR,
+                    tuple(entries),
+                    skipped,
+                    reason=f"stat_failed:{type(error).__name__}",
+                )
+            entries.append({"name": path.name, "size": size})
         status = REFERENCE_STATUS_OK if entries else REFERENCE_STATUS_EMPTY
         return ReferenceScan(status, tuple(entries), skipped)
+
+    def alias_secret(self) -> bytes:
+        """读取（首次则生成）本机别名密钥；任何 IO 问题都退化为"没有密钥"。
+
+        权限最小化：新文件建出来就是 ``0600``，再补一次 ``chmod`` 兜住 umask
+        差异；文件内容只在内存里用，永不写日志、manifest 或异常消息。失败
+        （只读盘、权限不对）时返回 ``b""``，调用方据此退化成
+        ``persona-unkeyed`` —— 宁可不给可关联别名，也不退回可枚举的公共盐。
+        """
+        if self._alias_secret is not None:
+            return self._alias_secret
+        path = self.root / ALIAS_SECRET_FILENAME
+        try:
+            # 首次调用时文件还不存在：读失败（FileNotFoundError 也是 OSError）
+            # 只能说明"该生成一把"，不能直接退化成没有密钥。
+            existing = path.read_bytes().strip() if path.is_file() else b""
+            if len(existing) >= 16:
+                self._alias_secret = existing
+                return existing
+            secret = secrets.token_bytes(ALIAS_SECRET_BYTES)
+            handle = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, ALIAS_SECRET_MODE)
+            try:
+                os.write(handle, secret)
+            finally:
+                os.close(handle)
+            try:
+                os.chmod(path, ALIAS_SECRET_MODE)
+            except OSError:
+                pass
+            self._alias_secret = secret
+            return secret
+        except OSError:
+            self._alias_secret = b""
+            return b""
 
     def read_reference(self, persona_id: str, filename: str) -> bytes:
         """读取一张参考图字节；任何 IO/路径问题统一转 :class:`PersonaReferenceError`。"""

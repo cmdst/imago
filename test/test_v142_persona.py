@@ -19,9 +19,12 @@
 
 from __future__ import annotations
 
+import hashlib
 import io
 import json
+import stat
 import random
+import re
 import subprocess
 import unittest
 from pathlib import Path
@@ -41,6 +44,7 @@ from imago_fusion.core.models import (
     ProviderConfig,
     ReferenceFallbackConfig,
     RuntimeConfig,
+    TaskStage,
     TaskState,
 )
 from imago_fusion.services import persona_store
@@ -52,6 +56,17 @@ REPO_ROOT = Path(__file__).resolve().parent.parent
 JS_TEST = REPO_ROOT / "test" / "test_webui_v142.js"
 BASELINE_COMMIT = "a1056441da3f1c921f93559689987bd4dc387faa"
 PNG_MIME = "image/png"
+
+
+def _no_identity(case, text, persona_id):
+    """断言 ``persona_id`` 没有作为**独立标识**出现在 text 里。
+
+    别名是 ``persona-`` + 12 位十六进制，字面上可能以 ID 的开头字符续写
+    （``persona-a`` + ``a2caa…``）；这不等于泄漏，所以按"整词"匹配而不是子串。
+    """
+
+    pattern = r"(?<![\w-])" + re.escape(str(persona_id)) + r"(?![\w-])"
+    case.assertNotRegex(text, pattern)
 
 
 def _plugin_class():
@@ -259,22 +274,60 @@ class StoreScanTests(unittest.TestCase):
 # 2. 稳定脱敏观测投影
 # ======================================================================
 class PersonaAliasTests(unittest.TestCase):
+    SECRET = b"k" * 32
+
     def test_alias_is_stable_and_reveals_nothing(self):
         persona_id = "8642135790"
-        first = attempt_diagnostics.persona_alias(persona_id)
-        second = attempt_diagnostics.persona_alias(persona_id)
-        self.assertEqual(first, second, "同一 Persona 的别名必须稳定（可跨日志追溯）")
+        first = attempt_diagnostics.persona_alias(persona_id, secret=self.SECRET)
+        second = attempt_diagnostics.persona_alias(persona_id, secret=self.SECRET)
+        self.assertEqual(first, second, "同一部署内同一 Persona 的别名必须稳定（可跨日志追溯）")
         self.assertTrue(first.startswith("persona-"))
         self.assertEqual(len(first), len("persona-") + 12)
         self.assertNotIn(persona_id, first)
-        self.assertNotEqual(first, attempt_diagnostics.persona_alias("8642135791"))
-        # 不可枚举：别名是 48 bit 的哈希前缀，不是可逆编码或序号。
+        self.assertNotEqual(
+            first, attempt_diagnostics.persona_alias("8642135791", secret=self.SECRET)
+        )
+        # 不可枚举：别名是 48 bit 的 HMAC 前缀，不是可逆编码或序号。
         self.assertNotRegex(first, r"^\d+$")
 
+    def test_no_key_never_falls_back_to_a_derivable_alias(self):
+        """t11 R1-11：拿不到本机密钥时宁可"不可关联"，也不退回可枚举的公共盐。"""
+
+        self.assertEqual(
+            attempt_diagnostics.persona_alias("8642135790"),
+            attempt_diagnostics.PERSONA_ALIAS_UNKEYED,
+        )
+        self.assertEqual(
+            attempt_diagnostics.persona_alias("8642135790", secret=b"too-short"),
+            attempt_diagnostics.PERSONA_ALIAS_UNKEYED,
+            "短于 16 字节的口令不得当 HMAC key",
+        )
+        self.assertEqual(
+            attempt_diagnostics.persona_alias("8642135790", secret=None),
+            attempt_diagnostics.PERSONA_ALIAS_UNKEYED,
+        )
+
+    def test_public_constant_dictionary_cannot_recover_the_alias(self):
+        """反证"给两个假 ID 算一次字典就能反查 12-hex 别名"这条攻击。"""
+
+        target = attempt_diagnostics.persona_alias("哈基米", secret=self.SECRET)
+        self.assertNotEqual(target, attempt_diagnostics.PERSONA_ALIAS_UNKEYED)
+        # 攻击者可用的全部公开常量（含旧版字面盐）都命不中。
+        for salt in ("imago-fusion/persona-alias/v1", "", "imago", "imago-fusion"):
+            guess = "persona-" + hashlib.sha256(f"{salt}:哈基米".encode("utf-8")).hexdigest()[:12]
+            self.assertNotEqual(guess, target, f"公开盐 {salt!r} 不得复现别名")
+        # 换一把部署密钥 ⇒ 同一 ID 的别名完全不同（跨部署不可关联）。
+        self.assertNotEqual(
+            attempt_diagnostics.persona_alias("哈基米", secret=b"j" * 32), target
+        )
+
     def test_empty_and_non_string_ids_are_handled(self):
-        self.assertEqual(attempt_diagnostics.persona_alias(""), "persona-none")
-        self.assertEqual(attempt_diagnostics.persona_alias(None), "persona-none")
-        self.assertEqual(attempt_diagnostics.persona_alias(12345), attempt_diagnostics.persona_alias("12345"))
+        self.assertEqual(attempt_diagnostics.persona_alias("", secret=self.SECRET), "persona-none")
+        self.assertEqual(attempt_diagnostics.persona_alias(None, secret=self.SECRET), "persona-none")
+        self.assertEqual(
+            attempt_diagnostics.persona_alias(12345, secret=self.SECRET),
+            attempt_diagnostics.persona_alias("12345", secret=self.SECRET),
+        )
 
     def test_safe_label_bounds_and_redacts(self):
         self.assertEqual(attempt_diagnostics.safe_label("node-a"), "node-a")
@@ -311,6 +364,7 @@ class PersonaAliasTests(unittest.TestCase):
             {
                 "node", "model", "kind", "reference_limit", "explicit_sent",
                 "persona_sent", "persona_pool", "persona_budget", "library", "reason",
+                "seq", "route", "node_index", "node_count", "model_index", "model_attempts",
             },
         )
         self.assertNotIn("leak-me", json.dumps(plans, ensure_ascii=False))
@@ -476,16 +530,24 @@ class ResolvePersonaSourceTests(unittest.IsolatedAsyncioTestCase):
             await plugin._resolve_persona_detail(_MessageEvent(UMO))
         self.assertIn("不支持", str(raised.exception))
 
-    async def test_legacy_two_tuple_entry_point_still_works(self):
-        """``_resolve_persona`` 保持 2 元组：6 个既有调用点不受影响。"""
+    async def test_detail_alias_matches_the_real_entry_point(self):
+        """``_resolve_persona`` 是权威三元组入口；``_resolve_persona_detail`` 只是别名。
+
+        t11 R1-08：出镜命令必须整条拿走三元组，不能经二元组退化 unknown。
+        """
 
         resolver = _HostResolver(
             PERSONAS,
             {UMO: {"session_service_config": {"persona_id": "persona-umo"}}},
         )
         plugin = self._plugin(resolver=resolver)
-        persona_id, prompt = await plugin._resolve_persona(_MessageEvent(UMO))
-        self.assertEqual((persona_id, prompt), ("persona-umo", "UMO 强制的人设"))
+        resolved = await plugin._resolve_persona(_MessageEvent(UMO))
+        self.assertEqual(resolved, ("persona-umo", "UMO 强制的人设", attempt_diagnostics.PERSONA_SOURCE_UMO))
+        self.assertEqual(
+            await plugin._resolve_persona_detail(_MessageEvent(UMO)),
+            resolved,
+            "两个名字必须给出完全相同的三元组（同一次解析、同一份来源）",
+        )
 
     def test_source_helper_domain_is_closed_and_unknown_is_never_guessed(self):
         source = _plugin_class()._persona_source
@@ -552,8 +614,9 @@ class PreparePersonaLibraryTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("pool=0", line)
         self.assertIn("source=umo_forced", line)
         # 日志里只有稳定别名，绝不出现原始 Persona ID。
-        self.assertIn(attempt_diagnostics.persona_alias("persona-a"), line)
-        self.assertNotIn("persona-a", line)
+        secret = plugin.store.alias_secret()
+        self.assertIn(attempt_diagnostics.persona_alias("persona-a", secret=secret), line)
+        _no_identity(self, line, "persona-a")
 
     async def test_empty_library_is_distinguishable_from_missing(self):
         plugin = self._plugin()
@@ -646,6 +709,77 @@ class PreparePersonaLibraryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(plan.reference_limit, 2)
         self.assertEqual(plan.reason, "limit_exhausted_by_explicit")
         self.assertEqual(list(plan.request.references), explicit, "显式图不能被限额截断")
+
+
+    async def test_single_file_stat_failure_fails_safely_before_any_provider_call(self):
+        """t11 R1-09：单个文件 stat 被拒**不得**把整库读成"空库"（基线会把 adapter 照调）。"""
+
+        plugin = self._plugin()
+        plugin.store.add_reference("persona-a", png_bytes(seed=21), PNG_MIME)
+        name = plugin.store.scan_references("persona-a").entries[0]["name"]
+        real_stat = Path.stat
+
+        def failing_stat(self, *args, **kwargs):
+            if self.name == name:
+                raise PermissionError("denied")
+            return real_stat(self, *args, **kwargs)
+
+        with patch.object(Path, "stat", failing_stat):
+            scan = plugin.store.scan_references("persona-a")
+            self.assertEqual(scan.status, persona_store.REFERENCE_STATUS_ERROR)
+            self.assertEqual(scan.reason, "stat_failed:PermissionError")
+            self.assertEqual(scan.pool, 0, "没读出来的条目不能算可读池")
+            task = self._task()
+            with patch("imago_fusion.main.logger", self.logger):
+                with self.assertRaises(PersonaReferenceError) as raised:
+                    await plugin._prepare(task)
+        self.assertEqual(raised.exception.status, persona_store.REFERENCE_STATUS_ERROR)
+        # 失败快照与日志同源：同一份 status/pool/reason，且 0 次 adapter。
+        self.assertEqual(task.runtime["persona_library_status"], persona_store.REFERENCE_STATUS_ERROR)
+        self.assertEqual(task.runtime["persona_reference_pool"], 0)
+        self.assertEqual(task.runtime["persona_library_reason"], "stat_failed:PermissionError")
+        self.assertNotIn(TaskStage.REQUESTING_PROVIDER, plugin.scheduler.stages)
+        warnings = [item for item in self.logger.lines if "人格图库" in item]
+        self.assertEqual(len(warnings), 1, self.logger.lines)
+        self.assertIn("status=error", warnings[0])
+        self.assertIn("reason=stat_failed:PermissionError", warnings[0])
+        # 日志不落私密路径 / 原始 ID / 文件名。
+        self.assertNotIn(str(self.root), warnings[0])
+        _no_identity(self, warnings[0], "persona-a")
+        case_no_name = warnings[0]
+        self.assertNotIn(name, case_no_name)
+
+    async def test_read_failure_reports_only_the_images_it_actually_read(self):
+        """读取在途中失败：池只报**已真正读到的**张数，不拿枚举数冒充实发。"""
+
+        plugin = self._plugin()
+        for seed in (31, 32, 33):
+            plugin.store.add_reference("persona-a", png_bytes(seed=seed), PNG_MIME)
+        names = [entry["name"] for entry in plugin.store.scan_references("persona-a").entries]
+        broken = names[1]
+        real_read = plugin.store.read_reference
+        calls = {"count": 0}
+
+        def flaky_read(persona_id, filename):
+            calls["count"] += 1
+            if filename == broken:
+                raise PersonaReferenceError("read_failed:PermissionError")
+            return real_read(persona_id, filename)
+
+        task = self._task()
+        with patch.object(plugin.store, "read_reference", flaky_read):
+            with patch("imago_fusion.main.logger", self.logger):
+                with self.assertRaises(PersonaReferenceError) as raised:
+                    await plugin._prepare(task)
+        self.assertEqual(raised.exception.reason, "read_failed:PermissionError")
+        self.assertEqual(task.runtime["persona_library_status"], persona_store.REFERENCE_STATUS_ERROR)
+        self.assertEqual(task.runtime["persona_reference_pool"], 1, "只有 1 张真的读进内存")
+        self.assertEqual(task.runtime["persona_library_reason"], "read_failed:PermissionError")
+        self.assertEqual(calls["count"], 2, "读到坏文件就停，不再往下读")
+        self.assertNotIn(TaskStage.REQUESTING_PROVIDER, plugin.scheduler.stages)
+        warnings = [item for item in self.logger.lines if "人格图库" in item]
+        self.assertIn("pool=1", warnings[0])
+        self.assertIn("reason=read_failed:PermissionError", warnings[0])
 
 
 # ======================================================================
@@ -782,7 +916,7 @@ class ReferencePlanTests(unittest.TestCase):
         self.assertEqual(record["persona_sent"], plan.persona_count)
         self.assertEqual(record["explicit_sent"], plan.explicit_count)
         self.assertEqual(record["library"], "ok")
-        self.assertNotIn("persona-a", json.dumps(record, ensure_ascii=False))
+        _no_identity(self, json.dumps(record, ensure_ascii=False), "persona-a")
 
 
 class AttemptMetaTests(unittest.IsolatedAsyncioTestCase):
@@ -1087,8 +1221,10 @@ class ManifestPersonaTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(persona["library"], "ok")
         self.assertEqual(persona["pool"], 3)
         self.assertEqual(persona["skipped"], 1)
-        self.assertEqual(persona["alias"], attempt_diagnostics.persona_alias("persona-a"))
-        self.assertNotIn("persona-a", json.dumps(manifest["persona"], ensure_ascii=False))
+        secret = PersonaStore(self.root, lambda: 20 * 1024 * 1024).alias_secret()
+        self.assertEqual(persona["alias"], attempt_diagnostics.persona_alias("persona-a", secret=secret))
+        self.assertNotEqual(persona["alias"], attempt_diagnostics.PERSONA_ALIAS_UNKEYED)
+        _no_identity(self, json.dumps(manifest["persona"], ensure_ascii=False), "persona-a")
         self.assertEqual(len(manifest["reference_plans"]), 1)
         plan = manifest["reference_plans"][0]
         self.assertEqual((plan["explicit_sent"], plan["persona_sent"]), (1, 0))
@@ -1096,11 +1232,297 @@ class ManifestPersonaTests(unittest.IsolatedAsyncioTestCase):
         # 被限额挤占必须留一条可检索的 WARNING，且不含 Persona 身份。
         squeeze = [item for item in self.logger.lines if "限额挤占" in item]
         self.assertTrue(squeeze)
-        self.assertNotIn("persona-a", squeeze[0])
+        _no_identity(self, squeeze[0], "persona-a")
+
+    async def test_manifest_reports_library_error_and_bounded_plan_range(self):
+        """失败快照与 manifest 同源；逐腿范围可还原全局腿序（t11 R1-09/R1-12）。"""
+
+        task = self._task("8" * 32)
+        task.runtime["persona_library_status"] = persona_store.REFERENCE_STATUS_ERROR
+        task.runtime["persona_library_reason"] = "stat_failed:PermissionError"
+        task.runtime["persona_reference_pool"] = 0
+        task.runtime["reference_plans_dropped"] = 3
+        task.runtime["reference_plans"] = [
+            {
+                "node": "node-a", "model": "model-1", "kind": "normal",
+                "reference_limit": 1, "explicit_sent": 1, "persona_sent": 0,
+                "persona_pool": 0, "persona_budget": 0,
+                "library": persona_store.REFERENCE_STATUS_ERROR,
+                "reason": "limit_exhausted_by_explicit",
+                "seq": 4, "route": "primary", "node_index": 1, "node_count": 2,
+                "model_index": 1, "model_attempts": 1,
+            },
+            {
+                "node": "node-b", "model": "model-2", "kind": "normal",
+                "reference_limit": 2, "explicit_sent": 1, "persona_sent": 1,
+                "persona_pool": 1, "persona_budget": 1,
+                "library": persona_store.REFERENCE_STATUS_ERROR,
+                "reason": "limit_covers_pool",
+                "seq": 5, "route": "fallback", "node_index": 2, "node_count": 2,
+                "model_index": 1, "model_attempts": 1,
+            },
+        ]
+        manifest = await self._finalize(task)
+        persona = manifest["persona"]
+        self.assertEqual(persona["library"], persona_store.REFERENCE_STATUS_ERROR)
+        self.assertEqual(persona["pool"], 0)
+        self.assertEqual(persona["reason"], "stat_failed:PermissionError")
+        self.assertEqual(
+            manifest["reference_plan_range"],
+            {"limit": 16, "kept": 2, "dropped": 3, "first_seq": 4, "last_seq": 5},
+        )
+        self.assertEqual([item["seq"] for item in manifest["reference_plans"]], [4, 5])
+        _no_identity(self, json.dumps(manifest["reference_plans"], ensure_ascii=False), "persona-a")
 
     async def test_manifest_without_persona_has_no_persona_block(self):
         manifest = await self._finalize(self._task("7" * 32, persona_id=None))
         self.assertNotIn("persona", manifest)
+
+
+# ======================================================================
+# 7.5 部署密钥：别名可追溯但不可被公开常量反查（t11 R1-11）
+# ======================================================================
+class StoreAliasSecretTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = TemporaryDirectory()
+        self.root = Path(self._tmp.name)
+
+    def tearDown(self):
+        self._tmp.cleanup()
+
+    def test_secret_is_created_owner_only_and_survives_restart(self):
+        store = PersonaStore(self.root, lambda: 20 * 1024 * 1024)
+        secret = store.alias_secret()
+        self.assertEqual(len(secret), persona_store.ALIAS_SECRET_BYTES)
+        path = self.root / persona_store.ALIAS_SECRET_FILENAME
+        self.assertTrue(path.is_file())
+        self.assertEqual(stat.S_IMODE(path.stat().st_mode), 0o600, "密钥文件必须仅属主可读")
+        # 重启（新实例）复用同一把：否则日志里的别名跨重启就失去可追溯性。
+        again = PersonaStore(self.root, lambda: 20 * 1024 * 1024).alias_secret()
+        self.assertEqual(again, secret)
+        # 别名稳定且不是"公开常量 + ID"的可枚举映射。
+        self.assertEqual(
+            attempt_diagnostics.persona_alias("persona-a", secret=secret),
+            attempt_diagnostics.persona_alias("persona-a", secret=again),
+        )
+
+    def test_unwritable_root_degrades_to_unkeyed_instead_of_raising(self):
+        store = PersonaStore(self.root, lambda: 20 * 1024 * 1024)
+        with patch.object(persona_store.os, "open", side_effect=PermissionError("denied")):
+            self.assertEqual(store.alias_secret(), b"")
+        # 已经失败过就别每次请求都重试磁盘。
+        with patch.object(persona_store.os, "open", side_effect=AssertionError("不该再试")):
+            self.assertEqual(store.alias_secret(), b"")
+        self.assertEqual(
+            attempt_diagnostics.persona_alias("persona-a", secret=store.alias_secret()),
+            attempt_diagnostics.PERSONA_ALIAS_UNKEYED,
+        )
+
+
+# ======================================================================
+# 7.6 逐腿记账：真实调用边界 + 有界单调序号（t11 R1-12）
+# ======================================================================
+class ReferencePlanOrderTests(unittest.IsolatedAsyncioTestCase):
+    def _scheduler(self, runtime):
+        return TaskScheduler(
+            lambda: runtime,
+            None,
+            lambda *_: True,
+            lambda *_: None,
+            lambda *_a: None,
+        )
+
+    def _task(self, *, explicit=1, persona=1):
+        task = DrawTask(
+            "9" * 32,
+            UMO,
+            GenerationRequest("画一只猫", references=tuple(_image(seed=seed) for seed in range(1, explicit + 1))),
+        )
+        task.runtime["persona_references"] = [_persona_image(seed=100 + seed) for seed in range(persona)]
+        task.runtime["persona_library_status"] = "ok"
+        task.runtime["persona_reference_pool"] = persona
+        return task
+
+    async def test_adapter_construction_failure_records_no_leg(self):
+        """构造就抛错的腿**没有**真正调用 adapter，不得冒充实发。"""
+
+        task = self._task()
+
+        def explode(config):
+            raise RuntimeError("boom")
+
+        original = scheduler_module.ADAPTERS.get("custom_endpoint")
+        scheduler_module.ADAPTERS["custom_endpoint"] = explode
+        try:
+            scheduler = self._scheduler(RuntimeConfig(providers=(_provider(limit=2),)))
+            try:
+                with self.assertRaises(RuntimeError):
+                    await scheduler._generate(task)
+            finally:
+                await scheduler.close()
+        finally:
+            if original is None:
+                scheduler_module.ADAPTERS.pop("custom_endpoint", None)
+            else:
+                scheduler_module.ADAPTERS["custom_endpoint"] = original
+        self.assertFalse(task.runtime.get("reference_plans"), task.runtime.get("reference_plans"))
+        self.assertFalse(task.runtime.get("reference_plan_seq"))
+
+    async def test_each_real_call_gets_a_monotonic_seq_and_route(self):
+        calls = []
+
+        class _Adapter:
+            def __init__(self, config):
+                self.config = config
+
+            async def generate(self, session, request, key):
+                calls.append({"node": self.config.id, "model": self.config.model})
+                return [ImageResult(data=b"image")]
+
+        original = scheduler_module.ADAPTERS.get("custom_endpoint")
+        scheduler_module.ADAPTERS["custom_endpoint"] = _Adapter
+        try:
+            providers = (
+                _provider("node-a", limit=1, models=("m1", "m2")),
+                _provider("node-b", limit=2, models=("m3",)),
+            )
+            task = self._task()
+            scheduler = self._scheduler(RuntimeConfig(providers=providers))
+            try:
+                await scheduler._generate(task)
+            finally:
+                await scheduler.close()
+        finally:
+            if original is None:
+                scheduler_module.ADAPTERS.pop("custom_endpoint", None)
+            else:
+                scheduler_module.ADAPTERS["custom_endpoint"] = original
+        plans = task.runtime["reference_plans"]
+        # 第一节点第一模型就成功 ⇒ 只有 1 条真实腿。
+        self.assertEqual(len(plans), len(calls))
+        self.assertEqual([item["seq"] for item in plans], [1])
+        self.assertEqual(plans[0]["route"], "primary")
+        self.assertEqual(plans[0]["node_index"], 1)
+        self.assertEqual(plans[0]["node_count"], 2)
+        self.assertEqual(plans[0]["model_index"], 1)
+        self.assertEqual(plans[0]["model_attempts"], 2)
+
+    def test_truncation_keeps_the_tail_and_a_countable_dropped_prefix(self):
+        task = self._task()
+        plan = TaskScheduler._plan_attempt_request(task, _provider(limit=2), RuntimeConfig(providers=()))
+        for index in range(20):
+            TaskScheduler._record_reference_plan(task, plan, node="node-%d" % index, model="m1")
+        plans = task.runtime["reference_plans"]
+        self.assertEqual(len(plans), 16, "有界：最多留 16 条")
+        self.assertEqual(task.runtime["reference_plans_dropped"], 4)
+        self.assertEqual([item["seq"] for item in plans], list(range(5, 21)), "保留原序、序号不重编")
+        self.assertEqual(plans[0]["node"], "node-4", "截断掉的是最早那几条")
+
+
+# ======================================================================
+# 7.7 挤占提示：无身份、按胜出腿、尊重纯图策略（t11 R1-13）
+# ======================================================================
+class PersonaTrimNoticeTests(unittest.IsolatedAsyncioTestCase):
+    def _task(self, *, mode="normal", node="node-a", model="m1"):
+        task = DrawTask("a" * 32, UMO, GenerationRequest("draw", count=1))
+        task.created_at = __import__("time").monotonic()
+        task.runtime["succeeded"] = {"provider_id": node, "model": model, "mode": mode}
+        return task
+
+    def _plan(self, reason, *, node="node-a", model="m1", kind="normal"):
+        return {
+            "node": node, "model": model, "kind": kind, "reference_limit": 1,
+            "explicit_sent": 1, "persona_sent": 0, "persona_pool": 1, "persona_budget": 0,
+            "library": "ok", "reason": reason, "seq": 1, "route": "primary",
+            "node_index": 1, "node_count": 1, "model_index": 1, "model_attempts": 1,
+        }
+
+    def test_notice_is_chosen_from_the_winning_leg_only(self):
+        plugin = _plugin_class()
+        exhausted = self._task()
+        exhausted.runtime["reference_plans"] = [self._plan("limit_exhausted_by_explicit")]
+        self.assertEqual(plugin._persona_trim_notice(exhausted), plugin.PERSONA_TRIM_NOTICE_EXHAUSTED)
+        trimmed = self._task()
+        trimmed.runtime["reference_plans"] = [self._plan("limit_trimmed")]
+        self.assertEqual(plugin._persona_trim_notice(trimmed), plugin.PERSONA_TRIM_NOTICE_TRIMMED)
+
+    def test_failed_leg_trim_never_mislabels_the_winning_leg(self):
+        plugin = _plugin_class()
+        task = self._task(node="node-b", model="m2")
+        task.runtime["reference_plans"] = [
+            self._plan("limit_exhausted_by_explicit", node="node-a", model="m1"),
+            self._plan("limit_covers_pool", node="node-b", model="m2"),
+        ]
+        self.assertEqual(plugin._persona_trim_notice(task), "", "胜出腿没被挤占就不该提示")
+
+    def test_text_fallback_winner_is_matched_by_its_own_kind(self):
+        plugin = _plugin_class()
+        task = self._task(mode="text_fallback")
+        task.runtime["reference_plans"] = [
+            self._plan("limit_exhausted_by_explicit", kind="normal"),
+            self._plan("text_fallback", kind="text_fallback"),
+        ]
+        self.assertEqual(plugin._persona_trim_notice(task), "", "文字腿 0/0 不是「挤占」")
+
+    def test_pure_image_only_strategy_is_respected(self):
+        from imago_fusion.core.route_identity import RouteIdentity
+
+        plugin = _plugin_class()
+        group = RouteIdentity(message_type="GroupMessage", platform_name="aiocqhttp")
+        silent = RouteIdentity(
+            message_type="GroupMessage", platform_name="aiocqhttp", sender_user_id="10001"
+        )
+        friend = RouteIdentity(
+            message_type="FriendMessage", platform_name="aiocqhttp", sender_user_id="10001"
+        )
+        cfg = SimpleNamespace(at_trigger_user=True)
+        self.assertTrue(
+            plugin._pure_image_only_reply(cfg=cfg, identity=group, generation_success=True),
+            "群聊开启 @ 但没有可信目标 ⇒ 只能纯图，提示必须让位",
+        )
+        self.assertFalse(
+            plugin._pure_image_only_reply(cfg=cfg, identity=silent, generation_success=True)
+        )
+        self.assertFalse(
+            plugin._pure_image_only_reply(cfg=cfg, identity=friend, generation_success=True)
+        )
+        self.assertFalse(
+            plugin._pure_image_only_reply(
+                cfg=SimpleNamespace(at_trigger_user=False), identity=group, generation_success=True
+            )
+        )
+
+    async def test_trim_notice_reaches_the_chain_but_never_the_bare_image_branch(self):
+        from imago_fusion.core.route_identity import RouteIdentity
+
+        for sender, expected in (("10001", True), ("", False)):
+            with TemporaryDirectory() as directory:
+                logger = _Logger()
+                plugin = object.__new__(_plugin_class())
+                plugin.raw_config = {}
+                plugin.session = None
+                plugin.store = PersonaStore(Path(directory), lambda: 20 * 1024 * 1024)
+                plugin.scheduler = _SchedulerStub()
+                plugin.enhancer = _Counter()
+                plugin.upscaler = _Counter()
+                plugin.sender = _Sender()
+                plugin.quota_store = None
+                task = DrawTask("b" * 32, UMO, GenerationRequest("draw", count=1))
+                task.created_at = __import__("time").monotonic()
+                task.runtime["source_event"] = _Event()
+                task.runtime["original_user_prompt"] = "draw"
+                task.runtime["route_identity"] = RouteIdentity(
+                    message_type="GroupMessage", platform_name="aiocqhttp", sender_user_id=sender
+                )
+                task.runtime["succeeded"] = {"provider_id": "node-a", "model": "m1", "mode": "normal"}
+                task.runtime["reference_plans"] = [self._plan("limit_exhausted_by_explicit")]
+                with patch("imago_fusion.main.logger", logger):
+                    await plugin._finish_task(task, [ImageResult(data=b"image", mime_type=PNG_MIME)])
+                chain = plugin.sender.chain or []
+                texts = [getattr(item, "text", "") for item in chain]
+                self.assertEqual(any("人格参考图" in text for text in texts), expected, texts)
+                if expected:
+                    self.assertTrue(task.runtime.get("persona_trim_notified"))
 
 
 # ======================================================================

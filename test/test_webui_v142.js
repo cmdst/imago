@@ -129,6 +129,29 @@ const document = {
 const PERSONAS = ['persona-a', 'persona-b'];
 const posted = [];
 const detailCalls = [];
+/* t11 R1-07 的竞态夹具：把某一次 detail/preview 响应扣住，让"更晚发起的请求"
+   先落 UI，再放行旧响应。detail 的代号在**请求发起时**分配，这样迟到的响应
+   仍带着自己的旧代号（否则测试无法区分"新响应"与"旧响应"）。 */
+const holds = [];
+const detailRefs = {};
+let detailGeneration = 0;
+
+function holdNext(match) {
+  let release;
+  const promise = new Promise(resolve => { release = resolve; });
+  const entry = Object.assign({ promise }, match);
+  entry.release = () => release();
+  holds.push(entry);
+  return entry;
+}
+
+function takeHold(endpoint, query) {
+  const index = holds.findIndex(entry => entry.endpoint === endpoint
+    && (!entry.personaId || entry.personaId === query.persona_id)
+    && (!entry.filename || entry.filename === query.filename));
+  if (index < 0) return null;
+  return holds.splice(index, 1)[0];
+}
 
 const window = {
   addEventListener() {},
@@ -143,16 +166,23 @@ const window = {
       }
       if (endpoint === 'detail') {
         detailCalls.push(query.persona_id);
+        detailGeneration += 1;
+        const seq = detailGeneration;
+        const holder = takeHold('detail', query);
+        if (holder) await holder.promise;
         return {
           success: true,
           persona_id: query.persona_id,
           prompt: 'prompt of ' + query.persona_id,
-          summary: '',
+          // 代号只在响应体里体现，用来分辨"这条是第几代请求"。
+          summary: 'gen-' + seq,
           summary_manual: false,
-          references: []
+          references: detailRefs[query.persona_id] || []
         };
       }
       if (endpoint === 'preview') {
+        const holder = takeHold('preview', query);
+        if (holder) await holder.promise;
         return { success: true, mime_type: 'image/png', base64_data: 'AA==' };
       }
       // 节点与额度不是本专题的关注点：返回失败让初始化提前收尾，不制造假配置。
@@ -254,6 +284,8 @@ function reset() {
   ui.state.current = 'persona-a';
   const leftover = readers.filter(reader => reader.armed);
   assert.strictEqual(leftover.length, 0, '上一轮有未放行的 FileReader，用例自身不干净');
+  holds.length = 0;
+  for (const key of Object.keys(detailRefs)) delete detailRefs[key];
 }
 
 async function switchTo(personaId) {
@@ -410,8 +442,64 @@ async function runRace({ round, fileForA = 'a.png', fileForB = null }) {
     }
   });
 
+  check('详情迟到：A 的 detail 在途时切到 B，A 的响应不得覆盖 B 的界面', async () => {
+    reset();
+    // 先把 A 的详情扣住（这正是"上传 POST 已回、A 的刷新还在路上"的现场）。
+    const held = holdNext({ endpoint: 'detail', personaId: 'persona-a' });
+    const pending = ui.loadPersonaDetail().catch(() => {});
+    await waitFor(() => detailCalls.includes('persona-a'), 'A 的详情请求已发出');
+    await switchTo('persona-b');
+    assert.strictEqual(elements['persona-title'].textContent, 'persona-b', 'B 应已渲染');
+    held.release();
+    await pending;
+    await flush(24);
+    assert.strictEqual(elements['persona-title'].textContent, 'persona-b',
+      '迟到的 A 详情绝不能把标题改回 A');
+    assert.strictEqual(elements['persona-prompt'].textContent, 'prompt of persona-b',
+      '迟到的 A 详情绝不能把 prompt 换成 A 的');
+    assert.notStrictEqual(elements['persona-summary'].value, 'gen-' + 1,
+      'A 那一代的摘要不得写进 B 的表单');
+    assert.strictEqual(detailCalls[detailCalls.length - 1], 'persona-b',
+      '最后一次详情请求必须属于 B');
+  });
+
+  check('预览迟到：A 的图卡预览在途时切到 B，旧图卡不得写进 B 的图库', async () => {
+    reset();
+    detailRefs['persona-a'] = [{ name: 'a-1.png' }];
+    const held = holdNext({ endpoint: 'preview', personaId: 'persona-a', filename: 'a-1.png' });
+    const pending = ui.loadPersonaDetail().catch(() => {});
+    await waitFor(() => holds.length === 0 || true, 'A 的预览请求已发出');
+    await switchTo('persona-b');
+    const galleryAfterB = elements['gallery'].innerHTML;
+    held.release();
+    await pending;
+    await flush(24);
+    assert.strictEqual(elements['gallery'].innerHTML, galleryAfterB,
+      '迟到的 A 图卡不得改写 B 的图库');
+    assert.ok(!elements['gallery'].innerHTML.includes('a-1.png'),
+      'B 的图库里不得出现 A 的图');
+  });
+
+  check('A→B→A：第一代 A 的迟到详情不得覆盖第三代 A 的界面', async () => {
+    reset();
+    const held = holdNext({ endpoint: 'detail', personaId: 'persona-a' });
+    const pending = ui.loadPersonaDetail().catch(() => {});
+    await waitFor(() => detailCalls.includes('persona-a'), '第一代 A 详情已发出');
+    const staleSeq = detailGeneration;
+    await switchTo('persona-b');
+    await switchTo('persona-a');
+    const freshSeq = detailGeneration;
+    assert.ok(freshSeq > staleSeq, '需要真正发起过更新的一代请求');
+    held.release();
+    await pending;
+    await flush(24);
+    assert.strictEqual(elements['persona-summary'].value, 'gen-' + freshSeq,
+      '界面必须停留在最新一代，旧一代的响应只能被丢弃');
+    assert.strictEqual(elements['persona-title'].textContent, 'persona-a');
+  });
+
   check('测试钩子导出上报路径（供 Node 回归直接调用）', () => {
-    for (const name of ['uploadReferences', 'sameFiles', 'readFile', 'loadPersonaDetail']) {
+    for (const name of ['uploadReferences', 'sameFiles', 'readFile', 'loadPersonaDetail', 'beginPersonaRequest', 'personaRequestCurrent', 'renderGallery']) {
       assert.strictEqual(typeof ui[name], 'function', '缺少导出：' + name);
     }
   });
@@ -421,6 +509,18 @@ async function runRace({ round, fileForA = 'a.png', fileForB = null }) {
     assert.ok(!/apiPost\(\s*'upload'\s*,\s*\{\s*persona_id\s*:\s*state\.current/.test(source),
       'upload 载荷必须用点击时锁定的快照，不能把 live state.current 直接塞进 payload');
     assert.ok(/persona_id\s*:\s*personaId/.test(source), 'upload 载荷应使用锁定的 personaId');
+  });
+
+  check('静态守卫：详情/预览必须按请求代次判定，不得直读活值', () => {
+    const source = fs.readFileSync(APP, 'utf8');
+    assert.ok(/function personaRequestCurrent\(/.test(source), '缺少"这一代请求是否仍最新"的判定');
+    assert.ok(/seq===personaRequestSeq/.test(source), '代次比较必须包含请求序号');
+    assert.ok(!/apiGet\(\s*'preview'\s*,\s*\{\s*persona_id\s*:\s*state\.current/.test(source),
+      'preview 必须用本次请求捕获的 Persona，不能读活值 state.current');
+    const detail = source.slice(source.indexOf('async function loadPersonaDetail'));
+    const body = detail.slice(0, detail.indexOf('async function renderGallery'));
+    assert.ok(/if\(!personaRequestCurrent\(request\)\)return/.test(body),
+      '详情在 await 之后必须先回验代次再写 DOM');
   });
 
   check('静态守卫：迟到回调只在目标未变时才清空/重载', () => {
