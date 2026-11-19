@@ -13,6 +13,8 @@ from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.star.star_handler import EventType, star_handlers_registry
 
+from ..core.route_identity import freeze_route_identity, sanitize_chain
+
 
 @dataclass(frozen=True)
 class SendOutcome:
@@ -38,10 +40,13 @@ class _ProactiveMessageEvent(AstrMessageEvent):
         platform_meta: Any,
         session_id: str,
         before_send=None,
+        mention_target: str = "",
     ) -> None:
         self._context = context
         self._outbound_session = outbound_session
         self._before_send = before_send
+        # 冻结后的唯一合法单人 @ 目标（空 = 本次不允许任何 At 出站）。
+        self._mention_target = mention_target
         self._send_stage_started = False
         self._side_send_started = False
         self._side_send_error = ""
@@ -60,17 +65,27 @@ class _ProactiveMessageEvent(AstrMessageEvent):
             self._before_send()
 
     async def send(self, message: MessageChain) -> None:
+        # 装饰器/hook 的 ``event.send()`` 旁发与主发共用同一套提及策略：
+        # 只允许冻结触发者本人、最多一个；注入的人、广播与重复提及都在这里拦掉。
         self.begin_send_stage()
         self._side_send_started = True
+        sanitized = sanitize_chain(
+            list(getattr(message, "chain", None) or []), target=self._mention_target
+        )
+        if not sanitized:
+            # 整条旁发只剩非法提及：没有任何可安全投递的内容，不得静默算成功。
+            self._side_send_error = "NoSendableComponents"
+            raise RuntimeError(self._side_send_error)
+        outbound = MessageChain(chain=sanitized)
         try:
-            sent = await self._context.send_message(self._outbound_session, message)
+            sent = await self._context.send_message(self._outbound_session, outbound)
         except Exception as exc:
             self._side_send_error = type(exc).__name__
             raise
         if not sent:
             self._side_send_error = "PlatformNotFound"
             raise RuntimeError(self._side_send_error)
-        await super().send(message)
+        await super().send(outbound)
 
     @property
     def side_send_started(self) -> bool:
@@ -79,6 +94,10 @@ class _ProactiveMessageEvent(AstrMessageEvent):
     @property
     def side_send_error(self) -> str:
         return self._side_send_error
+
+    @property
+    def mention_target(self) -> str:
+        return self._mention_target
 
 
 class ProactiveSender:
@@ -106,30 +125,40 @@ class ProactiveSender:
         )
 
     def build_event(
-        self, umo: str, source, chain: list, before_send=None
+        self,
+        umo: str,
+        source,
+        chain: list,
+        before_send=None,
+        identity=None,
+        mention_target: str = "",
     ) -> _ProactiveMessageEvent:
         session = MessageSession.from_str(umo)
         platform = self._platform(session)
         if platform is None:
             raise RuntimeError("找不到会话对应的平台实例")
-
-        source_message = getattr(source, "message_obj", None)
-        sender = getattr(source_message, "sender", None)
+        # 组装主动事件时**不再**读活事件的 sender：任务创建时冻结的路由身份才是
+        # 唯一来源（钩子/后续事件改写 source.message_obj.sender 不会串人）。
+        if identity is None:
+            identity = freeze_route_identity(source)
+        message_type = session.message_type
+        if identity.message_type:
+            try:
+                message_type = MessageType(identity.message_type)
+            except ValueError:
+                message_type = session.message_type
         message = AstrBotMessage()
-        message.type = session.message_type
+        message.type = message_type
         message.session_id = session.session_id
         message.message_id = ""
-        message.self_id = str(getattr(source_message, "self_id", "") or "bot")
+        message.self_id = identity.self_id or "bot"
         message.sender = MessageMember(
-            user_id=str(
-                getattr(sender, "user_id", "")
-                or getattr(source, "get_sender_id", lambda: "")()
-            ),
-            nickname=getattr(sender, "nickname", None),
+            user_id=identity.sender_user_id,
+            nickname=identity.sender_nickname or None,
         )
         message.group = (
-            Group(group_id=session.session_id)
-            if session.message_type == MessageType.GROUP_MESSAGE
+            Group(group_id=identity.group_id or session.session_id)
+            if message_type == MessageType.GROUP_MESSAGE
             else None
         )
         message.message = []
@@ -143,6 +172,7 @@ class ProactiveSender:
             platform_meta=platform.meta(),
             session_id=session.session_id,
             before_send=before_send,
+            mention_target=mention_target,
         )
         event.plugins_name = getattr(source, "plugins_name", None)
         result = MessageEventResult(chain=list(chain))
@@ -177,25 +207,46 @@ class ProactiveSender:
                 self.logger(f"Hook 执行异常 event={event_type.name}", exc)
 
     async def send(
-        self, umo: str, source, chain: list, before_send=None
+        self,
+        umo: str,
+        source,
+        chain: list,
+        before_send=None,
+        identity=None,
+        mention_target: str = "",
     ) -> SendOutcome:
-        """主动发送适配：装饰链 → 发送 → after 钩子。"""
+        """主动发送适配：装饰链 → 提及守门 → 发送 → after 钩子。"""
         try:
-            event = self.build_event(umo, source, chain, before_send=before_send)
+            event = self.build_event(
+                umo,
+                source,
+                chain,
+                before_send=before_send,
+                identity=identity,
+                mention_target=mention_target,
+            )
         except Exception as exc:
             return SendOutcome(False, type(exc).__name__, False)
 
         await self._run_hooks(event, EventType.OnDecoratingResultEvent)
         if event.is_stopped():
+            # 钩子显式 stop：只有真的发生过旁发（且旁发成功）才算送达。没有任何
+            # 实际派发时不得记成功——调度器会据此判 DELIVERY_FAILED，而不是伪造
+            # SUCCEEDED 或据此误重发。
+            side_dispatched = bool(event.side_send_started and not event.side_send_error)
             return SendOutcome(
-                not bool(event.side_send_error),
-                event.side_send_error,
+                side_dispatched,
+                event.side_send_error or ("" if side_dispatched else "StoppedWithoutSend"),
                 side_effects_started=True,
                 side_send_started=event.side_send_started,
                 side_send_error=event.side_send_error,
             )
         result = event.get_result()
-        processed = list(getattr(result, "chain", None) or [])
+        # 装饰链与主发共用同一套提及策略：只保留冻结触发者的一个 At，别的 At
+        # （注入/篡改/广播/重复）在这里统一拦掉；钩子删掉的提及不会被补回。
+        processed = sanitize_chain(
+            list(getattr(result, "chain", None) or []), target=event.mention_target
+        )
         self.debug(
             "[ImagoFusion] 主动发送装饰完成 components=%d stopped=%s",
             len(processed),

@@ -49,6 +49,7 @@ from .core import diagnostics as attempt_diagnostics
 from .core import echo as echo_guard
 from .core.network import fetch_reference, materialize_result
 from .core.references import ReferencePlanner, quoted_reply_missing_images
+from .core.route_identity import RouteIdentity, freeze_route_identity
 
 from .core import runtime
 from .core.prompting import (
@@ -294,8 +295,8 @@ class ImagoFusion(Star):
     def _quota_policy(self):
         return load_config(self.raw_config).quota
 
-    def _quota_access(self, event: AstrMessageEvent, amount: int = 1):
-        user_id = self._event_user_id(event)
+    def _quota_access(self, identity: RouteIdentity, amount: int = 1):
+        user_id = identity.sender_user_id
         policy = self._quota_policy()
         if not user_id:
             if policy.enabled:
@@ -308,7 +309,7 @@ class ImagoFusion(Star):
 
     def _remove_unavailable_generation_tools(self, event: AstrMessageEvent, req: ProviderRequest) -> None:
         try:
-            decision = self._quota_access(event)
+            decision = self._quota_access(freeze_route_identity(event))
         except QuotaError:
             pass
         else:
@@ -362,10 +363,15 @@ class ImagoFusion(Star):
         # 前缀）；同样只允许常量与错误码，绝不放 key / token / URL / 代理地址。
         logger.warning("[ImagoFusion] " + message, *args)
 
-    def _log_prefix(self, event=None):
-        if load_config(self.raw_config).log_with_bot_id and event is not None:
+    def _log_prefix(self, source=None):
+        """日志前缀：可传事件，也可传已冻结的 ``RouteIdentity``。"""
+        if load_config(self.raw_config).log_with_bot_id and source is not None:
             try:
-                return f"[ImagoFusion][platform:{event.get_platform_id()}]"
+                platform_id = getattr(source, "platform_id", "")
+                if not platform_id and hasattr(source, "get_platform_id"):
+                    platform_id = source.get_platform_id()
+                if platform_id:
+                    return f"[ImagoFusion][platform:{platform_id}]"
             except Exception:
                 pass
         return "[ImagoFusion]"
@@ -388,19 +394,23 @@ class ImagoFusion(Star):
         """只向用户和主 LLM 返回任务创建阶段的可公开原因（逻辑在 core/errors.py）。"""
         return safe_creation_error_message(exc)
 
-    def _tasks_for_event(self, event):
+    def _tasks_for_event(self, event, identity: RouteIdentity | None = None):
+        """按**冻结**身份查任务（不再读活事件；status 等只读入口就地冻结）。"""
+        return self._tasks_for_identity(identity or freeze_route_identity(event))
+
+    def _tasks_for_identity(self, identity: RouteIdentity):
         if not self.scheduler:
             return []
         try:
             return self.scheduler.query(
-                umo=str(event.unified_msg_origin or ""),
-                owner_user_id=str(event.get_sender_id() or ""),
-                bot_instance_id=str(event.get_platform_id() or ""),
+                umo=identity.umo,
+                owner_user_id=identity.sender_user_id,
+                bot_instance_id=identity.platform_id,
             )
         except Exception:
             return []
 
-    def _is_duplicate_submission(self, event, fingerprint: str, trigger_message_id: str) -> bool:
+    def _is_duplicate_submission(self, identity: RouteIdentity, fingerprint: str, trigger_message_id: str) -> bool:
         """本条用户消息是否已创建过绘图任务（或缺少消息 ID 时的同内容在途/刚结束任务）。"""
         records = [
             {
@@ -409,7 +419,7 @@ class ImagoFusion(Star):
                 "created_at": task.created_at,
                 "pending": not task.state.is_terminal,
             }
-            for task in self._tasks_for_event(event)
+            for task in self._tasks_for_identity(identity)
         ]
         return is_duplicate_request(
             records,
@@ -523,11 +533,15 @@ class ImagoFusion(Star):
         summary = await self._generate_summary(persona_id, prompt, reference_names=names)
         return self.store.set_summary(persona_id, prompt, summary, manual=False, reference_names=names)["summary"]
 
-    async def _resolve_persona(self, event):
+    async def _resolve_persona(self, event, identity: RouteIdentity | None = None):
         manager = getattr(self.context, "persona_manager", None)
         resolver = getattr(manager, "resolve_selected_persona", None)
         if not callable(resolver): raise ValueError("当前 AstrBot 不支持 Persona 正式解析")
-        umo = event.unified_msg_origin
+        # Persona 选择以**入口冻结**的 UMO/平台为准：这条链路里的 await 之后事件
+        # 可能已被改写（WebUI 上传/切换、后续事件），不能拿活值重新解析。
+        if identity is None:
+            identity = freeze_route_identity(event)
+        umo = identity.umo
         conversation_persona_id = None
         try:
             conversation_manager = self.context.conversation_manager
@@ -553,7 +567,7 @@ class ImagoFusion(Star):
         persona_id, persona, _, _ = await resolver(
             umo=umo,
             conversation_persona_id=conversation_persona_id,
-            platform_name=event.get_platform_name(),
+            platform_name=identity.platform_name or event.get_platform_name(),
             provider_settings=provider_settings,
         )
         persona_id = str(persona_id or "")
@@ -564,7 +578,7 @@ class ImagoFusion(Star):
         if not persona_id or not prompt: raise ValueError("Persona 不存在或 prompt 为空")
         return persona_id, prompt
 
-    async def _submit(self, event, prompt: str, *, persona=False, resolved_persona=None, count=1, aspect_ratio="", size="", extra_params="", style="", plain_draw_tool=False):
+    async def _submit(self, event, prompt: str, *, persona=False, resolved_persona=None, count=1, aspect_ratio="", size="", extra_params="", style="", plain_draw_tool=False, identity: RouteIdentity | None = None):
         """创建后台绘图/Persona 图片任务。
 
         引用消息在事件阶段前台解析（extractor 依赖事件生命周期内的平台能力，
@@ -577,6 +591,9 @@ class ImagoFusion(Star):
         配置处理，不需要该标记）。两者最终是否生效由 `_prepare` 里的
         `resolve_style` 与配置裁决，`/f画` 指令两者都不传。
         """
+        # P0：入口在首次 await 之前冻结的路由身份；_submit 自己也是「最早入口」的
+        # 兜底冻结点（同步执行，不会先 await 再读）。
+        identity = identity or freeze_route_identity(event)
         if not prompt.strip(): raise ValueError("提示词不能为空")
         count = max(1, min(4, int(count)))
         cfg = load_config(self.raw_config)
@@ -597,10 +614,8 @@ class ImagoFusion(Star):
             extra_params,
             requested_style,
         )
-        trigger_message_id = str(
-            getattr(getattr(event, "message_obj", None), "message_id", "") or ""
-        )
-        if self._is_duplicate_submission(event, fingerprint, trigger_message_id):
+        trigger_message_id = identity.message_id
+        if self._is_duplicate_submission(identity, fingerprint, trigger_message_id):
             # 用户可感知事件（「第二张图没出现」）：INFO 留痕便于线上排查，不写消息 ID。
             logger.info(
                 "%s 忽略重复绘图请求 kind=%s（同一条用户消息或同内容任务已在处理中）",
@@ -608,7 +623,7 @@ class ImagoFusion(Star):
                 "persona" if persona else "draw",
             )
             raise DuplicateRequest()
-        access = self._quota_access(event, count)
+        access = self._quota_access(identity, count)
         if access is not None and not access.allowed:
             raise QuotaError(access.reason)
         # 参考图在事件阶段完成本地化接管与去重：明确 Image 组件读入内存、
@@ -634,16 +649,18 @@ class ImagoFusion(Star):
         started_at = time.monotonic()
         task = DrawTask(
             id=uuid.uuid4().hex,
-            umo=event.unified_msg_origin,
+            umo=identity.umo,
             request=GenerationRequest(prompt=prompt, count=count, aspect_ratio=aspect_ratio, size=size, extra_params=parsed_extra),
-            owner_user_id=str(event.get_sender_id() or ""),
-            bot_instance_id=str(event.get_platform_id() or ""),
+            owner_user_id=identity.sender_user_id,
+            bot_instance_id=identity.platform_id,
             kind="persona" if persona else "draw",
             created_at=started_at,
             updated_at=started_at,
         )
         task.request.references.extend(references)
         task.runtime["source_event"] = event
+        # 唯一身份来源：任务归属、群聊判定、出站 @ 与主动发送事件都从这里取。
+        task.runtime["route_identity"] = identity
         task.runtime["prepare"] = self._prepare
         task.runtime["finalize"] = self._finalize_task
         task.runtime["primary_provider_id"] = self.store.get_primary_provider_id()
@@ -654,7 +671,7 @@ class ImagoFusion(Star):
         task.runtime["plain_draw_tool"] = bool(plain_draw_tool)
         if persona:
             if resolved_persona is None:
-                resolved_persona = await self._resolve_persona(event)
+                resolved_persona = await self._resolve_persona(event, identity=identity)
             task.persona_id, task.persona_prompt = resolved_persona
         charged = 0
         if task.owner_user_id:
@@ -1625,10 +1642,25 @@ class ImagoFusion(Star):
                 delivery_kind=delivery_kind,
             )
         cfg = load_config(self.raw_config)
-        # 主动发送的链首：群聊 @ 触发者（私聊不加；取不到触发者 ID 就不加）。
+        # 主动发送的链首：群聊 @ **入口冻结的触发者**。群类型只看冻结的结构化
+        # 会话类型（不拿 UMO 子串猜群，也不拿活事件/引用作者补身份）；取不到
+        # 合法目标时宁可不加 @，绝不发广播或错误的人。
+        identity = task.runtime.get("route_identity")
+        if not isinstance(identity, RouteIdentity):
+            identity = RouteIdentity(
+                umo=str(task.umo or ""),
+                platform_id=str(task.bot_instance_id or ""),
+                sender_user_id=str(task.owner_user_id or ""),
+            )
+        mention_target, mention_reason = identity.mention_decision(
+            enabled=bool(cfg.at_trigger_user)
+        )
         head: list = []
-        if cfg.at_trigger_user and task.owner_user_id and ":GroupMessage:" in str(task.umo):
-            head.append(At(qq=task.owner_user_id))
+        if mention_target:
+            head.append(At(qq=mention_target))
+        task.runtime["mention_target"] = mention_target
+        task.runtime["mention_target_present"] = bool(mention_target)
+        task.runtime["mention_reason"] = mention_reason
         echo_all_blocked = bool(
             echo_blocked and echo_guard.blocked_all(echo_state, len(results))
         )
@@ -1705,6 +1737,8 @@ class ImagoFusion(Star):
             event,
             chain,
             before_send=lambda: self.scheduler.set_stage(task, TaskStage.SENDING),
+            identity=identity,
+            mention_target=mention_target,
         )
         # 主发送流程已结束（无论成败）：超时补发通知以此为准，避免平台实际
         # 已收到主消息后又被终态通知重复打扰。
@@ -2061,7 +2095,7 @@ class ImagoFusion(Star):
 
     @imago_fusion_group.command("status")
     async def status_command(self, event: AstrMessageEvent):
-        tasks = self._tasks_for_event(event)
+        tasks = self._tasks_for_event(event, freeze_route_identity(event))
         if not tasks:
             yield event.plain_result("当前没有正在处理或刚刚结束的 IMAGO·FUSION 任务。")
             return
@@ -2070,8 +2104,11 @@ class ImagoFusion(Star):
 
     @imago_fusion_group.command("draw")
     async def draw_command(self, event: AstrMessageEvent, prompt: GreedyStr):
+        # 首次 await 之前冻结发起人/会话/平台：这条命令后续的参考图下载、
+        # Persona 解析都可能挂起，期间事件被改写也不能改变任务归属。
+        identity = freeze_route_identity(event)
         try:
-            await self._submit(event, prompt)
+            await self._submit(event, prompt, identity=identity)
             yield event.plain_result(PENDING_DRAW)
         except Exception as exc:
             yield event.plain_result(f"无法创建任务：{self._safe_creation_error(exc)}")
@@ -2079,8 +2116,17 @@ class ImagoFusion(Star):
     @imago_fusion_group.command("photo")
     async def photo_command(self, event: AstrMessageEvent, action: GreedyStr):
         try:
-            resolved_persona = await self._resolve_persona(event)
-            await self._submit(event, action, persona=True, resolved_persona=resolved_persona)
+            # 身份必须在 Persona 解析（首个 await）之前冻结：t1 已证这段 await
+            # 期间替换事件会让任务归属落到后一个人身上。
+            identity = freeze_route_identity(event)
+            resolved_persona = await self._resolve_persona(event, identity=identity)
+            await self._submit(
+                event,
+                action,
+                persona=True,
+                resolved_persona=resolved_persona,
+                identity=identity,
+            )
             yield event.plain_result(PENDING_PHOTO.format(persona=resolved_persona[0]))
         except Exception as exc:
             yield event.plain_result(f"无法创建任务：{self._safe_creation_error(exc)}")
@@ -2168,7 +2214,8 @@ class ImagoFusion(Star):
             style(string): 仅在能明显判断成图由什么材质构成时填写：realistic(真人实拍)、real3d(照片级三维渲染：产品商品/静物/手办潮玩/模型/数字人等)、cg3d(风格化三维渲染：三维动画、游戏 CG)、illustration(手绘插画)、pixel(像素阵列)、logo(LOGO 设计：扁平矢量标志/标识)；无法明显判断时传 auto 或留空，不要猜。学派（日系/美漫/厚涂/水墨）、题材（赛博朋克/国风等）、效果（朦胧/胶片/黑白等）、形态（商品展示/分镜/贴纸，以及聊天记录/报纸/海报这类载体画面）不要塞进本参数，直接写进 prompt。
         """
         try:
-            await self._submit(event, prompt, count=count, aspect_ratio=aspect_ratio, size=size, extra_params=extra_params, style=style, plain_draw_tool=True)
+            identity = freeze_route_identity(event)
+            await self._submit(event, prompt, count=count, aspect_ratio=aspect_ratio, size=size, extra_params=extra_params, style=style, plain_draw_tool=True, identity=identity)
             return ("后台绘图任务已创建并在处理中，图片完成后插件会另行发送，"
                     "你无需等待结果。同一条用户消息只会创建一个绘图任务：再次调用本工具"
                     "会被直接忽略（不会重复生成或扣费）。"
@@ -2208,7 +2255,8 @@ class ImagoFusion(Star):
         """
         action = merge_camera_request(action, camera)
         try:
-            await self._submit(event, action, persona=True, count=count, aspect_ratio=aspect_ratio, size=size, extra_params=extra_params, style=style)
+            identity = freeze_route_identity(event)
+            await self._submit(event, action, persona=True, count=count, aspect_ratio=aspect_ratio, size=size, extra_params=extra_params, style=style, identity=identity)
             return ("后台 Persona 图片任务已创建并在处理中，图片完成后插件会另行发送，"
                     "你无需等待结果。同一条用户消息只会创建一个绘图任务：再次调用本工具"
                     "会被直接忽略（不会重复生成或扣费）。"
