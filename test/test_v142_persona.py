@@ -569,6 +569,27 @@ class ResolvePersonaSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(len(resolver.calls), 1)
         self.assertEqual(resolver.calls[0]["umo"], UMO)
 
+    async def test_true_force_wins_even_when_the_conversation_names_the_same_persona(self):
+        """宿主真的强制了：即使会话覆盖同名，来源也只能是 ``umo_forced``。
+
+        「同名」是最容易被反推成 ``conversation`` 的形状 —— 胜出者相同不等于
+        来源相同，判定必须看是哪一层给出的信号。
+        """
+
+        for conversation_id, expected_persona in (("persona-umo", "persona-umo"), ("persona-conv", "persona-umo")):
+            resolver = _HostResolver(
+                PERSONAS,
+                {UMO: {"session_service_config": {"persona_id": "persona-umo"}}},
+            )
+            plugin = self._plugin(
+                resolver=resolver, conversation_personas={UMO: conversation_id}
+            )
+            persona_id, _prompt, source = await plugin._resolve_persona_detail(_MessageEvent(UMO))
+            self.assertEqual(persona_id, expected_persona, conversation_id)
+            self.assertEqual(
+                source, attempt_diagnostics.PERSONA_SOURCE_UMO, conversation_id
+            )
+
     async def test_disabled_persona_never_falls_back_to_runner_config(self):
         """``[%None]``（禁用）必须安全失败，不能悄悄落到 runner 配置的人设。"""
 
@@ -1387,7 +1408,7 @@ class ManifestPersonaTests(unittest.IsolatedAsyncioTestCase):
     async def asyncTearDown(self):
         self._tmp.cleanup()
 
-    async def _finalize(self, task):
+    def _plugin(self):
         plugin = object.__new__(_plugin_class())
         plugin.raw_config = {}
         plugin.session = None
@@ -1397,11 +1418,15 @@ class ManifestPersonaTests(unittest.IsolatedAsyncioTestCase):
         plugin.upscaler = _Counter()
         plugin.sender = _Sender()
         plugin.quota_store = None
+        return plugin
+
+    async def _finalize(self, task):
+        plugin = self._plugin()
         with patch("imago_fusion.main.logger", self.logger):
             await plugin._finalize_task(task)
         return json.loads((plugin.store.task_dir(task.id) / "task.json").read_text("utf-8"))
 
-    def _task(self, task_id, *, persona_id="persona-a"):
+    def _task(self, task_id, *, persona_id="persona-a", persona_source=attempt_diagnostics.PERSONA_SOURCE_UMO):
         task = DrawTask(task_id, UMO, GenerationRequest("draw", count=1))
         task.created_at = __import__("time").monotonic()
         task.runtime["source_event"] = _Event()
@@ -1410,7 +1435,7 @@ class ManifestPersonaTests(unittest.IsolatedAsyncioTestCase):
         if persona_id:
             task.persona_id = persona_id
             task.persona_prompt = "人设"
-            task.runtime["persona_source"] = attempt_diagnostics.PERSONA_SOURCE_UMO
+            task.runtime["persona_source"] = persona_source
             task.runtime["persona_library_status"] = "ok"
             task.runtime["persona_reference_pool"] = 3
             task.runtime["persona_reference_skipped"] = 1
@@ -1448,6 +1473,27 @@ class ManifestPersonaTests(unittest.IsolatedAsyncioTestCase):
         squeeze = [item for item in self.logger.lines if "限额挤占" in item]
         self.assertTrue(squeeze)
         _no_identity(self, squeeze[0], "persona-a")
+
+    async def test_manifest_and_library_log_project_the_same_source_value(self):
+        """manifest 的 persona.source 与「人格图库」日志同取 runtime 判定值，不二次猜测。"""
+
+        cases = (
+            (attempt_diagnostics.PERSONA_SOURCE_CONVERSATION, "6" * 32),
+            (attempt_diagnostics.PERSONA_SOURCE_RUNNER, "7" * 32),
+            ("", "9" * 32),
+        )
+        for value, task_id in cases:
+            task = self._task(task_id, persona_source=value)
+            manifest = await self._finalize(task)
+            expected = value or attempt_diagnostics.PERSONA_SOURCE_UNKNOWN
+            self.assertEqual(manifest["persona"]["source"], expected, value)
+            _no_identity(self, json.dumps(manifest["persona"], ensure_ascii=False), "persona-a")
+
+            with patch("imago_fusion.main.logger", self.logger):
+                self._plugin()._log_persona_library(task)
+            line = [item for item in self.logger.lines if "人格图库" in item][-1]
+            self.assertIn(f"source={expected}", line, value)
+            _no_identity(self, line, "persona-a")
 
     async def test_manifest_reports_library_error_and_bounded_plan_range(self):
         """失败快照与 manifest 同源；逐腿范围可还原全局腿序（t11 R1-09/R1-12）。"""
