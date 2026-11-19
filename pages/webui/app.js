@@ -13,7 +13,7 @@ const state={
   optimizerProviderId:'',visionProviderId:'',
   dirty:false,quotaDirty:false,quotas:[],quotaPolicy:{},quotaSort:{key:'user_id',direction:'asc'},
   rebuilding:false,selectedReferences:new Set(),expanded:new Set(),warnings:[],
-  personaDetail:null
+  personaDetail:null,galleryPersona:''
 };
 
 /* ---------------------------------------------------------------- 基础工具 */
@@ -74,6 +74,23 @@ function renderedPersonaTarget(action){
   notify(`正在读取 Persona 详情，本次${action}已取消，请稍后重试`,true);
   return '';
 }
+/* 作用在**图库内容**上的写操作的"已渲染目标"（v1.4.2 定向收尾）。
+   上一条只管到"详情属于谁"：切 A→B 时 B 的 detail 可能先回来（标题/摘要已是 B），
+   而 `renderGallery` 还卡在 preview 的 await 上——DOM 里仍是 A 的图卡、选集里仍是 A 的
+   文件名。此时按 detail 提交，就会拿 B 当目标删掉 A 的图（同名图尤其危险）、或用 A 的
+   选集去重建 B 的摘要：目标对了，内容却是别人的，filename 不能当归属证明。
+   所以图库的归属必须单独登记（`state.galleryPersona`，只在 renderGallery 真正提交
+   DOM 的那一刻更新），写操作要求"详情代次"与"图库归属"同时对得上本次目标；
+   窗口期内的删除/选用/重建一律安全拒绝并提示重试，等 B 的图库落地后自然恢复。 */
+function renderedGalleryTarget(action){
+  const personaId=renderedPersonaTarget(action);
+  if(!personaId)return '';
+  if(state.galleryPersona!==personaId){
+    notify(`图库还在刷新，本次${action}已取消，请稍后重试`,true);
+    return '';
+  }
+  return personaId;
+}
 async function loadPersonaDetail(options){
   const personaId=String((options&&options.personaId)||state.current||'');
   if(!personaId)return;
@@ -102,6 +119,8 @@ async function renderGallery(refs,request){
   if(!refs.length){
     state.selectedReferences.clear();
     gallery.innerHTML='<p class="empty">尚无参考图</p>';
+    // 空库也是一次真实的图库提交：从这一刻起，"界面上这批卡片属于谁"就是它了。
+    state.galleryPersona=generation.personaId;
     return;
   }
   const cards=[];
@@ -123,6 +142,8 @@ async function renderGallery(refs,request){
   if(!personaRequestCurrent(generation))return;
   state.selectedReferences.clear();
   gallery.innerHTML=cards.join('');
+  // 卡片与选集同时生效的那一刻才登记图库归属（唯一的成功提交点）。
+  state.galleryPersona=generation.personaId;
 }
 function readFile(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=reject;reader.readAsDataURL(file)})}
 function sameFiles(current,expected){
@@ -613,7 +634,7 @@ document.addEventListener('click',async event=>{
   const expand=event.target.closest('[data-expand]');
   if(expand){const index=Number(expand.dataset.expand);if(state.expanded.has(index))state.expanded.delete(index);else state.expanded.add(index);expand.closest('.provider-node').classList.toggle('expanded');return}
   const deleteButton=event.target.closest('[data-delete]');
-  if(deleteButton){deleteButton.disabled=true;const personaId=renderedPersonaTarget('删除参考图');if(!personaId){deleteButton.disabled=false;return}const r=await apiPost('delete',{persona_id:personaId,filename:deleteButton.dataset.delete});notify(r.message,!r.success);if(!r.success)deleteButton.disabled=false;else if(state.current===personaId)await loadPersonaDetail()}
+  if(deleteButton){deleteButton.disabled=true;const personaId=renderedGalleryTarget('删除参考图');if(!personaId){deleteButton.disabled=false;return}const r=await apiPost('delete',{persona_id:personaId,filename:deleteButton.dataset.delete});notify(r.message,!r.success);if(!r.success)deleteButton.disabled=false;else if(state.current===personaId)await loadPersonaDetail()}
 });
 $('#provider-list').addEventListener('input',event=>{
   if(event.target.dataset.param){syncParam(event.target);return}
@@ -650,19 +671,19 @@ $('#quota-list').addEventListener('input',event=>{if(event.target.dataset.quotaF
 $('#quota-list').addEventListener('change',event=>{if(event.target.dataset.quotaField)syncQuotaField(event.target)});
 $('#add-quota-row').addEventListener('click',()=>{const index=state.quotas.length;state.quotas.push({user_id:'',quota:0,blocked:false,unlimited:false,last_refresh_date:'',last_checkin_date:'',isNew:true});renderQuotas();setQuotaDirty(true);const input=document.querySelector(`[data-quota-index="${index}"] [data-quota-field="user_id"]`);if(input)input.focus()});
 $('#save-quotas').addEventListener('click',()=>saveQuotas().catch(e=>notify(e.message,true)));
-$('#gallery').addEventListener('change',event=>{const name=event.target.dataset.reference;if(!name)return;if(event.target.checked)state.selectedReferences.add(name);else state.selectedReferences.delete(name)});
+$('#gallery').addEventListener('change',event=>{const name=event.target.dataset.reference;if(!name)return;if(!renderedGalleryTarget('选用参考图')){event.target.checked=!event.target.checked;return}if(event.target.checked)state.selectedReferences.add(name);else state.selectedReferences.delete(name)});
 $('#optimizer-provider').addEventListener('change',event=>{state.optimizerProviderId=event.target.value;setDirty(true)});
 $('#vision-provider').addEventListener('change',event=>{state.visionProviderId=event.target.value;setDirty(true);renderGroups()});
 $('#persona-search').addEventListener('input',renderPersonaOptions);
 $('#persona-select').addEventListener('change',async event=>{state.current=event.target.value;await loadPersonaDetail().catch(e=>notify(e.message,true))});
-$('#rebuild').addEventListener('click',async()=>{if(state.rebuilding)return;const personaId=renderedPersonaTarget('重建外观摘要');if(!personaId)return;setRebuildLoading(true);try{const r=await apiPost('rebuild',{persona_id:personaId,reference_names:[...state.selectedReferences]});if(!r.success){notify(r.message||'重建失败',true);return}if(state.current===personaId)await loadPersonaDetail();notify(r.message||'外观摘要已重建')}catch(error){notify(error.message||'重建失败',true)}finally{setRebuildLoading(false)}});
+$('#rebuild').addEventListener('click',async()=>{if(state.rebuilding)return;const personaId=renderedGalleryTarget('重建外观摘要');if(!personaId)return;setRebuildLoading(true);try{const r=await apiPost('rebuild',{persona_id:personaId,reference_names:[...state.selectedReferences]});if(!r.success){notify(r.message||'重建失败',true);return}if(state.current===personaId)await loadPersonaDetail();notify(r.message||'外观摘要已重建')}catch(error){notify(error.message||'重建失败',true)}finally{setRebuildLoading(false)}});
 $('#persona-summary').addEventListener('input',updateSummaryCount);
 $('#save-summary').addEventListener('click',async()=>{const summary=$('#persona-summary').value.trim();if(!summary){notify('外观摘要不能为空',true);return}const personaId=renderedPersonaTarget('保存外观摘要');if(!personaId)return;const r=await apiPost('summary',{persona_id:personaId,summary});notify(r.message,!r.success);if(r.success&&state.current===personaId)await loadPersonaDetail()});
 $('#upload').addEventListener('click',()=>{uploadReferences().catch(error=>notify(error&&error.message?error.message:'上传失败',true))});
 window.addEventListener('beforeunload',event=>{if(!state.dirty&&!state.quotaDirty)return;event.preventDefault();event.returnValue=''});
 
 /* 测试钩子：Node vm 回归直接调用真实渲染/装配逻辑（对线上无副作用）。 */
-window.__imagoWebui={state,catalogEntry,catalogLabel,paramFields,capabilitiesOf,qualityText,thinkingCapText,referencesText,thinkingValues,thinkingLabel,normalizeProvider,renderProviders,renderGroups,groupState,buildProviderPayload,applySnapshot,syncProviderField,syncGroupField,setParamValue,clearConfirmMessage,loadPersonaDetail,renderGallery,readFile,uploadReferences,sameFiles,beginPersonaRequest,personaRequestCurrent,personaRequestSeq:()=>personaRequestSeq,renderedPersonaTarget};
+window.__imagoWebui={state,catalogEntry,catalogLabel,paramFields,capabilitiesOf,qualityText,thinkingCapText,referencesText,thinkingValues,thinkingLabel,normalizeProvider,renderProviders,renderGroups,groupState,buildProviderPayload,applySnapshot,syncProviderField,syncGroupField,setParamValue,clearConfirmMessage,loadPersonaDetail,renderGallery,readFile,uploadReferences,sameFiles,beginPersonaRequest,personaRequestCurrent,personaRequestSeq:()=>personaRequestSeq,renderedPersonaTarget,renderedGalleryTarget};
 
 (async()=>{
   try{
