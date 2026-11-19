@@ -2002,6 +2002,10 @@ class ImagoFusion(Star):
         task.runtime[f"{delivery_prefix}_side_effects_started"] = send_outcome.side_effects_started
         task.runtime[f"{delivery_prefix}_side_send_started"] = send_outcome.side_send_started
         task.runtime[f"{delivery_prefix}_side_send_error"] = send_outcome.side_send_error
+        # 为让「发起人的唯一 @ 与成品同帧」而局部降级掉的分帧装饰数（t21）。
+        task.runtime[f"{delivery_prefix}_dropped_split_components"] = int(
+            getattr(send_outcome, "dropped_split_components", 0) or 0
+        )
         if not delivery_success:
             logger.error(
                 "%s task=%s generation_success=%s delivery=%s 主动发送失败 type=%s",
@@ -2021,6 +2025,9 @@ class ImagoFusion(Star):
             usable_output_count=usable_output_count,
             delivery_kind=delivery_kind,
             dispatched_image_count=dispatched_images,
+            dropped_split_components=int(
+                getattr(send_outcome, "dropped_split_components", 0) or 0
+            ),
         )
 
     def _settle_task_quota(self, task: DrawTask) -> None:

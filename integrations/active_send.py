@@ -37,6 +37,9 @@ class SendOutcome:
     # 主链被装饰链清空/过滤为空（但没有旁发成功）：作为独立观察保留，不用它
     # 冒充"零投递"，也不据此误重发。
     main_suppressed: bool = False
+    # 为让「发起人的唯一 At 与成品落在同一条群消息」而局部降级的"分帧"装饰数
+    # （OneBot 遇 Node/Nodes/File 会逐组件派发，t21）。有界计数，不含内容。
+    dropped_split_components: int = 0
 
 
 class _ProactiveMessageEvent(AstrMessageEvent):
@@ -72,6 +75,9 @@ class _ProactiveMessageEvent(AstrMessageEvent):
         # 旁发上下文：只有带图片的旁发才允许归一化提及（纯文本 hook 不得被补成
         # 一条独立的 @ 提醒，t13 R2-02）。
         self._mention_needs_image = True
+        # 过滤期观察（有界计数，不含内容）：本次为保持"提及与成品同帧"而局部
+        # 降级掉的 Node/Nodes/File 装饰数（t21）。
+        self._filter_observations: dict = {}
         super().__init__(
             message_str="",
             message_obj=message_obj,
@@ -97,6 +103,7 @@ class _ProactiveMessageEvent(AstrMessageEvent):
             image_only=self._image_only,
             image_allowlist=self._image_allowlist,
             mention_without_image=not self._mention_needs_image,
+            observations=self._filter_observations,
         )
         if not sanitized:
             if self._image_only:
@@ -151,6 +158,10 @@ class _ProactiveMessageEvent(AstrMessageEvent):
     @property
     def side_image_count(self) -> int:
         return self._side_image_count
+
+    @property
+    def dropped_split_components(self) -> int:
+        return int(self._filter_observations.get("dropped_split_components", 0) or 0)
 
     @property
     def side_image_attempted(self) -> int:
@@ -313,25 +324,31 @@ class ProactiveSender:
             # 钩子显式 stop：只有真的发生过旁发（且旁发成功）才算送达。没有任何
             # 实际派发时不得记成功——调度器会据此判 DELIVERY_FAILED，而不是伪造
             # SUCCEEDED 或据此误重发。
-            side_dispatched = bool(event.side_send_started and not event.side_send_error)
+            # 「已提交」只看适配器是否真的接受过一次旁发：之后因为平台实例
+            # 消失等原因被拒，不能把先前已经发出去的成品图改判成零投递（t21）。
+            side_dispatched = bool(event.side_send_started)
             return SendOutcome(
                 side_dispatched,
                 event.side_send_error or ("" if side_dispatched else "StoppedWithoutSend"),
                 side_effects_started=True,
                 side_send_started=event.side_send_started,
                 side_send_error=event.side_send_error,
+                attempted_image_count=event.side_image_attempted,
                 dispatched_image_count=event.side_image_count,
+                dropped_split_components=event.dropped_split_components,
             )
         result = event.get_result()
         # 装饰链与主发共用同一套提及策略：只保留冻结触发者的一个 At，别的 At
         # （注入/篡改/广播/重复）在这里统一拦掉；钩子删掉的提及不会被补回。
         event.mention_needs_image = bool(mention_needs_image)
+        main_observations: dict = {}
         processed = sanitize_chain(
             list(getattr(result, "chain", None) or []),
             target=event.mention_target,
             image_only=event.image_only,
             image_allowlist=event.image_allowlist,
             mention_without_image=not event.mention_needs_image,
+            observations=main_observations,
         )
         self.debug(
             "[ImagoFusion] 主动发送装饰完成 components=%d stopped=%s",
@@ -360,7 +377,7 @@ class ProactiveSender:
             main_suppressed = True
             error = "EmptyAfterFilter" if event.image_only else "DecoratorSuppressed"
         await self._run_hooks(event, EventType.OnAfterMessageSentEvent)
-        side_committed = bool(event.side_send_started and not event.side_send_error)
+        side_committed = bool(event.side_send_started)
         if event.side_send_error:
             error = f"{error};SideSend:{event.side_send_error}" if error else f"SideSend:{event.side_send_error}"
         # 已提交 = 主链适配器接受，或旁发真的发出去过。真正"全路无发"才算失败：
@@ -377,4 +394,8 @@ class ProactiveSender:
             attempted_image_count=main_attempted + event.side_image_attempted,
             dispatched_image_count=dispatched,
             main_suppressed=main_suppressed,
+            dropped_split_components=(
+                int(main_observations.get("dropped_split_components", 0) or 0)
+                + event.dropped_split_components
+            ),
         )

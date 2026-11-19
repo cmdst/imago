@@ -24,6 +24,11 @@ except ImportError:  # pragma: no cover - 仅在精简替身中出现
     Node = None  # type: ignore[assignment]
     Nodes = None  # type: ignore[assignment]
 
+try:  # 文件段与合并转发一样会触发 OneBot 适配器的"逐组件派发"。
+    from astrbot.api.message_components import File
+except ImportError:  # pragma: no cover - 仅在精简替身中出现
+    File = None  # type: ignore[assignment]
+
 GROUP_MESSAGE = "GroupMessage"
 FRIEND_MESSAGE = "FriendMessage"
 
@@ -233,6 +238,20 @@ def _is_node(component) -> bool:
     return bool(_NODE_CLASSES) and isinstance(component, _NODE_CLASSES)
 
 
+# OneBot 适配器（``aiocqhttp_message_event.py`` 的 ``send_message``）只要在链上
+# 看到合并转发或文件段，就改成**逐组件派发**：``At`` 会因此被拆成单独一条群消息、
+# 成品帧反倒没有 @。这里只做插件出口的最保守兼容，不碰宿主与第三方适配器。
+_SPLIT_CLASSES = tuple(
+    item for item in (*(_NODE_CLASSES or ()), File) if item is not None
+)
+
+
+def _forces_per_component_send(component) -> bool:
+    """该组件是否会让 OneBot 适配器把整条链拆成多条消息。"""
+    return bool(_SPLIT_CLASSES) and isinstance(component, _SPLIT_CLASSES)
+
+
+
 
 def _iter_children(component):
     """容器组件的内容组件（``Node``/``Nodes``）；非容器返回空序列。"""
@@ -364,6 +383,7 @@ def sanitize_chain(
     image_only: bool = False,
     image_allowlist=None,
     mention_without_image: bool = True,
+    observations: dict | None = None,
 ) -> list:
     """按冻结身份过滤出站组件（主发、旁发与 after 钩子共用）。
 
@@ -383,7 +403,12 @@ def sanitize_chain(
       （``mention_without_image=True``，主发路径）时才归一化提及：钩子经
       ``event.send`` 旁发的一条纯文本不会被补成独立的 @ 提醒（t13 R2-02）；
     - ``Node``/``Nodes`` 容器安全复制后递归清理嵌套提及，无法安全重建的容器
-      直接拦下，不涉提及的正常内容保持原样。
+      直接拦下，不涉提及的正常内容保持原样；
+    - **宿主分帧**（t21）：OneBot 适配器遇到 ``Node``/``Nodes``/``File`` 会逐组件
+      派发，把 ``At`` 拆成单独一条群消息。本次要带成品与提及、且丢掉这些"分帧"
+      组件后仍有顶层成品时，丢掉无法同帧送达的附加装饰（局部降级，不补发、不
+      重复出图）；成品只存在于转发封套里时保持原链，不吞成品。降级条数写入
+      ``observations["dropped_split_components"]``（有界诊断，不含内容）。
     """
     state = {"had_mention": False}
     if image_only:
@@ -400,6 +425,18 @@ def sanitize_chain(
         value = _scrub(component, target=target, state=state)
         if value is not None:
             result.append(value)
+    # 宿主分帧兼容（t21）：OneBot 适配器看到 ``Node``/``Nodes``/``File`` 就逐组件
+    # 派发，``At`` 会被甩成单独一条群消息、成品帧反而没有 @。这里只做**最保守的
+    # 出口降级**——本次确实要带成品与提及、且丢掉这些"分帧"组件后**仍有顶层成品**
+    # 可同帧送达时，才丢掉无法共存的附加装饰（不补发、不重复出图、不改宿主）；
+    # 若成品只存在于转发封套里，宁可保持原链（至少把图送到）也不吞掉成品。
+    if target and state["had_mention"] and _SPLIT_CLASSES:
+        if any(_forces_per_component_send(item) for item in result):
+            kept = [item for item in result if not _forces_per_component_send(item)]
+            if count_images(kept) > 0:
+                if observations is not None:
+                    observations["dropped_split_components"] = len(result) - len(kept)
+                result = kept
     if not result or not target or not state["had_mention"]:
         return result
     if count_images(result) <= 0 and not mention_without_image:
