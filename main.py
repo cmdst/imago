@@ -2131,18 +2131,15 @@ class ImagoFusion(Star):
     def _pure_image_only_reply(*, cfg, identity, generation_success: bool) -> bool:
         """群聊 @ 开启但无合法目标时的严格纯图分支（只发本任务成品图）。
 
-        v1.4.2 rev3.2 **临时内联** ``core.route_identity.image_only_reply``（t12 分支
-        才有该函数）：语义完全一致 —— 生成成功 且 开启 @ 且 群聊 且 无合法提及目标。
-        待 t12 整合时替换为对该谓词的调用，本文件的提示逻辑与调用位置不变。
+        语义由 ``core.route_identity.image_only_reply`` 单点定义（生成成功 且 开启 @
+        且 群聊 且 无合法提及目标）。本方法只是按 finalizer 的入参形状做一层薄适配，
+        不复制判据：出站链与人格提示必须共用同一个谓词，否则两处会再次分叉。
         """
-        if not generation_success:
-            return False
-        if not bool(getattr(cfg, "at_trigger_user", False)):
-            return False
-        if not getattr(identity, "is_group", False):
-            return False
-        target, _reason = identity.mention_decision(enabled=True)
-        return target == ""
+        return image_only_reply(
+            identity=identity,
+            at_trigger_user=bool(getattr(cfg, "at_trigger_user", False)),
+            generation_success=bool(generation_success),
+        )
 
     async def _finalize_task(self, task: DrawTask) -> None:
         # 兜底清理：任务未走到配文等待分支（超时/取消等）时取消仍可能运行的预生成
