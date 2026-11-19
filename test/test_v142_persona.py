@@ -381,9 +381,13 @@ class _HostResolver:
     ``[%None]`` 是"禁用"标记：宿主原样返回，不会落到 runner 配置。
     """
 
-    def __init__(self, personas, configs, *, system_default="persona-system", webchat=False):
+    def __init__(self, personas, configs, *, system_default="persona-system", webchat=False, sp=None):
         self.personas = dict(personas)
         self.configs = dict(configs)
+        # 会话偏好（SP）是宿主判定"强制人格"的**唯一**权威来源；``sp`` 一旦给出，
+        # 就与配置文件里的 ``session_service_config`` 解耦 —— 后者可能只是旧版本
+        # 残留的值（t5 现场：SP 无 force、旧配置仍写着 persona_id、会话人格胜出）。
+        self.sp = None if sp is None else dict(sp)
         self.system_default = system_default
         self.webchat = webchat
         self.calls = []
@@ -398,14 +402,22 @@ class _HostResolver:
             }
         )
         config = self.configs.get(str(umo)) or {}
-        forced = (config.get("session_service_config") or {}).get("persona_id")
+        if self.sp is None:
+            forced = (config.get("session_service_config") or {}).get("persona_id")
+        else:
+            forced = (self.sp.get(str(umo)) or {}).get("persona_id")
         persona_id = forced or conversation_persona_id
         if persona_id is None:
             runner = config.get("agent_runner") or {}
+            # 宿主读的是 ``agent_runner["config"]``（不是把 persona 直接挂在
+            # agent_runner 下）；更老的形状仍被插件侧兼容读取。
+            runner_config = runner.get("config")
+            if not isinstance(runner_config, dict):
+                runner_config = runner
             if runner.get("runner_type") == "local":
-                persona_id = (runner.get("persona") or {}).get("persona_id") or self.system_default
+                persona_id = (runner_config.get("persona") or {}).get("persona_id") or self.system_default
             else:
-                persona_id = runner.get("persona_id") or self.system_default
+                persona_id = runner_config.get("persona_id") or self.system_default
         persona = self.personas.get(persona_id)
         return persona_id, persona, forced, self.webchat
 
@@ -449,12 +461,69 @@ class _MessageEvent:
     def get_sender_id(self):
         return "1"
 
+    def get_messages(self):
+        return []
+
+
+def _frozen_identity(umo="aiocqhttp:FriendMessage:1"):
+    # 惰性导入：与其它测试文件里的 astrbot 桩保持原来的 import 顺序。
+    from imago_fusion.core.route_identity import freeze_route_identity
+
+    return freeze_route_identity(_MessageEvent(umo))
+
+
+class _SubmitScheduler(_SchedulerStub):
+    """``_submit`` 只需要 ``submit``/``query``；顺带把提交到的任务留下来供断言。"""
+
+    def __init__(self):
+        super().__init__()
+        self.submitted = []
+
+    def submit(self, task):
+        # ``_submit`` 返回的是 scheduler 的提交结果（任务 id），不是任务对象。
+        self.submitted.append(task)
+        self.tasks[task.id] = task
+        return task.id
+
+    def query(self, *, umo, owner_user_id, bot_instance_id):
+        return [
+            task
+            for task in self.submitted
+            if task.umo == umo
+            and task.owner_user_id == owner_user_id
+            and task.bot_instance_id == bot_instance_id
+        ]
+
+
+class _QuotaDecision:
+    def __init__(self, allowed=True, charged=0, reason=""):
+        self.allowed = allowed
+        self.charged = charged
+        self.reason = reason
+
+
+class _QuotaStore:
+    """额度替身：不拦不扣，只为让 ``_submit`` 的账务分支跑通。"""
+
+    def __init__(self):
+        self.consumed = []
+
+    def can_consume(self, user_id, amount, policy):
+        return _QuotaDecision()
+
+    def consume(self, user_id, amount, policy):
+        self.consumed.append((user_id, amount))
+        return _QuotaDecision(charged=amount)
+
 
 PERSONAS = {
     "persona-umo": SimpleNamespace(prompt="UMO 强制的人设"),
     "persona-conv": SimpleNamespace(prompt="会话覆盖的人设"),
     "persona-runner": SimpleNamespace(prompt="runner 配置的人设"),
     "persona-webchat": SimpleNamespace(prompt="webchat 默认人设"),
+    "persona-stale": SimpleNamespace(prompt="旧配置残留的人设"),
+    "persona-mystery": SimpleNamespace(prompt="来源不明的人设"),
+    "default": SimpleNamespace(prompt="系统默认人设"),
 }
 UMO = "aiocqhttp:FriendMessage:1"
 
@@ -463,6 +532,28 @@ class ResolvePersonaSourceTests(unittest.IsolatedAsyncioTestCase):
     def _plugin(self, **context):
         plugin = object.__new__(_plugin_class())
         plugin.context = _Context(**context)
+        # ``_submit`` 需要的最小落地面：一个可用节点、一个真 store、一个提交桩。
+        plugin.raw_config = {
+            "providers": [
+                {
+                    "id": "node-a",
+                    "api_type": "openai_chat",
+                    "base_url": "https://example.invalid/v1",
+                    "api_keys": ["TEST_KEY"],
+                    "model": "test-model",
+                }
+            ],
+            "storage_config": {"max_upload_mb": 20, "block_private_networks": False},
+            "reference_compress_config": {"enable": False},
+            "quota_config": {"enable": False},
+            "task_config": {"llm_caption": False},
+        }
+        self._tmp = TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        plugin.store = PersonaStore(Path(self._tmp.name), lambda: 20 * 1024 * 1024)
+        plugin.scheduler = _SubmitScheduler()
+        plugin.quota_store = _QuotaStore()
+        plugin.session = None
         return plugin
 
     async def test_umo_level_selection_wins_and_is_labelled_umo_forced(self):
@@ -504,15 +595,85 @@ class ResolvePersonaSourceTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(source, attempt_diagnostics.PERSONA_SOURCE_CONVERSATION)
 
     async def test_runner_config_shapes_local_and_other(self):
+        """宿主读的是 ``agent_runner["config"]``；更老的平铺形状仍要能读出来。"""
+
         for runner in (
+            {"runner_type": "local", "config": {"persona": {"persona_id": "persona-runner"}}},
+            {"runner_type": "provider", "config": {"persona_id": "persona-runner"}},
+            # 老形状（persona 直接挂在 agent_runner 下）——兼容读，不误判成默认
             {"runner_type": "local", "persona": {"persona_id": "persona-runner"}},
             {"runner_type": "provider", "persona_id": "persona-runner"},
         ):
-            resolver = _HostResolver(PERSONAS, {UMO: {"agent_runner": runner}})
-            plugin = self._plugin(resolver=resolver)
+            configs = {UMO: {"agent_runner": runner}}
+            resolver = _HostResolver(PERSONAS, configs)
+            plugin = self._plugin(resolver=resolver, configs=configs)
             persona_id, _prompt, source = await plugin._resolve_persona_detail(_MessageEvent(UMO))
             self.assertEqual(persona_id, "persona-runner", runner)
             self.assertEqual(source, attempt_diagnostics.PERSONA_SOURCE_RUNNER, runner)
+
+    async def test_system_default_runner_is_labelled_implicit_not_runner(self):
+        """没有任何来源信号时宿主落到系统默认人设：这是 implicit，不是 runner。"""
+
+        configs = {UMO: {"agent_runner": {"runner_type": "local", "config": {}}}}
+        resolver = _HostResolver(PERSONAS, configs, system_default="default")
+        plugin = self._plugin(resolver=resolver, configs=configs)
+        persona_id, _prompt, source = await plugin._resolve_persona_detail(_MessageEvent(UMO))
+        self.assertEqual(persona_id, "default")
+        self.assertEqual(source, attempt_diagnostics.PERSONA_SOURCE_IMPLICIT)
+
+    async def test_stale_config_force_never_beats_the_host_session_preference(self):
+        """t5 现场（t11 R1-08 补例）：SP 无 force、旧配置里仍写着 persona_id。
+
+        宿主权威的"强制"只来自会话偏好（SP）；配置文件里残留的 ``persona_id``
+        不是强制来源。此时会话人格胜出、图也选对，来源必须是 ``conversation``，
+        绝不能因为旧配置有个值就贴 ``umo_forced``。
+        """
+
+        configs = {
+            UMO: {
+                # 旧版本残留值 —— **不是** 权威强制来源
+                "session_service_config": {"persona_id": "persona-stale"},
+                "agent_runner": {
+                    "runner_type": "local",
+                    "config": {"persona": {"persona_id": "persona-runner"}},
+                },
+            }
+        }
+        resolver = _HostResolver(PERSONAS, configs, sp={UMO: {}})
+        plugin = self._plugin(
+            resolver=resolver,
+            configs=configs,
+            conversation_personas={UMO: "persona-conv"},
+        )
+        persona_id, prompt, source = await plugin._resolve_persona(_MessageEvent(UMO))
+        self.assertEqual(persona_id, "persona-conv")
+        self.assertEqual(prompt, "会话覆盖的人设")
+        self.assertEqual(source, attempt_diagnostics.PERSONA_SOURCE_CONVERSATION)
+        # 落进任务与 manifest 的也是同一份来源，不会事后改判。
+        task_id = await plugin._submit(
+            _MessageEvent(UMO), "画一只猫", persona=True, identity=_frozen_identity(UMO)
+        )
+        task = plugin.scheduler.submitted[-1]
+        self.assertEqual(task.id, task_id)
+        self.assertEqual(task.persona_id, "persona-conv")
+        self.assertEqual(
+            task.runtime["persona_source"],
+            attempt_diagnostics.PERSONA_SOURCE_CONVERSATION,
+        )
+
+    async def test_unattributable_winner_is_labelled_unknown(self):
+        """来源信号和实际胜出者对不上时只能标 unknown——不凭 id 相同反推来源。"""
+
+        class _OddResolver(_HostResolver):
+            async def resolve_selected_persona(self, **kwargs):
+                await super().resolve_selected_persona(**kwargs)
+                return "persona-mystery", PERSONAS["persona-mystery"], None, False
+
+        configs = {UMO: {}}
+        plugin = self._plugin(resolver=_OddResolver(PERSONAS, configs), configs=configs)
+        persona_id, _prompt, source = await plugin._resolve_persona_detail(_MessageEvent(UMO))
+        self.assertEqual(persona_id, "persona-mystery")
+        self.assertEqual(source, attempt_diagnostics.PERSONA_SOURCE_UNKNOWN)
 
     async def test_webchat_default_is_labelled_implicit(self):
         resolver = _HostResolver(
@@ -551,10 +712,26 @@ class ResolvePersonaSourceTests(unittest.IsolatedAsyncioTestCase):
 
     def test_source_helper_domain_is_closed_and_unknown_is_never_guessed(self):
         source = _plugin_class()._persona_source
-        self.assertEqual(source(forced_persona_id="p"), attempt_diagnostics.PERSONA_SOURCE_UMO)
-        self.assertEqual(source(conversation_persona_id="p"), attempt_diagnostics.PERSONA_SOURCE_CONVERSATION)
+        self.assertEqual(
+            source(forced_persona_id="p", persona_id="p"),
+            attempt_diagnostics.PERSONA_SOURCE_UMO,
+        )
+        self.assertEqual(
+            source(conversation_persona_id="p", persona_id="p"),
+            attempt_diagnostics.PERSONA_SOURCE_CONVERSATION,
+        )
+        self.assertEqual(
+            source(runner_persona_id="p", persona_id="p"),
+            attempt_diagnostics.PERSONA_SOURCE_RUNNER,
+        )
         self.assertEqual(source(webchat_default=True), attempt_diagnostics.PERSONA_SOURCE_IMPLICIT)
-        self.assertEqual(source(), attempt_diagnostics.PERSONA_SOURCE_RUNNER)
+        self.assertEqual(source(persona_id="default"), attempt_diagnostics.PERSONA_SOURCE_IMPLICIT)
+        # 没有任何来源信号、或信号与胜出者对不上 ⇒ unknown（不猜、不靠 id 相等反推）
+        self.assertEqual(source(persona_id="p"), attempt_diagnostics.PERSONA_SOURCE_UNKNOWN)
+        self.assertEqual(
+            source(forced_persona_id="p", persona_id="q"),
+            attempt_diagnostics.PERSONA_SOURCE_UNKNOWN,
+        )
         self.assertIn(
             attempt_diagnostics.PERSONA_SOURCE_UNKNOWN, attempt_diagnostics.PERSONA_SOURCES
         )
@@ -780,6 +957,44 @@ class PreparePersonaLibraryTests(unittest.IsolatedAsyncioTestCase):
         warnings = [item for item in self.logger.lines if "人格图库" in item]
         self.assertIn("pool=1", warnings[0])
         self.assertIn("reason=read_failed:PermissionError", warnings[0])
+
+    async def test_file_vanishing_after_enumeration_is_error_not_ok_or_empty(self):
+        """t5 现场：枚举成功、随后文件消失。
+
+        首候选在这种输入上给出 ``library=ok, pool=1`` 并照常请求 adapter；正确行为是
+        ``library=error`` + 只报**真正读进内存**的张数（这里是 0），并且在任何
+        adapter 调用之前安全失败。
+        """
+
+        plugin = self._plugin()
+        for seed in (41, 42, 43):
+            plugin.store.add_reference("persona-a", png_bytes(seed=seed), PNG_MIME)
+        self.assertEqual(len(plugin.store.scan_references("persona-a").entries), 3)
+        real_read = plugin.store.read_reference
+
+        def vanishing_read(persona_id, filename):
+            # 枚举已经数到这张，真正要读时它已经不在了（外部清理/并发删除）。
+            (plugin.store.persona_dir(persona_id) / filename).unlink(missing_ok=True)
+            return real_read(persona_id, filename)
+
+        task = self._task()
+        with patch.object(plugin.store, "read_reference", vanishing_read):
+            with patch("imago_fusion.main.logger", self.logger):
+                with self.assertRaises(PersonaReferenceError) as raised:
+                    await plugin._prepare(task)
+        self.assertEqual(raised.exception.reason, "read_missing")
+        self.assertEqual(
+            task.runtime["persona_library_status"], persona_store.REFERENCE_STATUS_ERROR
+        )
+        self.assertEqual(task.runtime["persona_reference_pool"], 0, "一张都没读进内存")
+        self.assertEqual(task.runtime["persona_library_reason"], "read_missing")
+        self.assertNotIn(TaskStage.REQUESTING_PROVIDER, plugin.scheduler.stages)
+        warnings = [item for item in self.logger.lines if "人格图库" in item]
+        self.assertEqual(len(warnings), 1)
+        self.assertIn("status=error", warnings[0])
+        self.assertIn("pool=0", warnings[0])
+        self.assertIn("reason=read_missing", warnings[0])
+        _no_identity(self, warnings[0], "persona-a")
 
 
 # ======================================================================

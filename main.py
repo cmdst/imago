@@ -543,11 +543,12 @@ class ImagoFusion(Star):
         （t11 R1-08：photo 曾因兼容包装丢来源，manifest 里恒为 unknown）。
 
         来源只用于观测（``人格图库 ... source=`` 与 ``runtime["persona_source"]``）：
-        ``umo_forced`` = UMO 层显式指定（含 ``[%None]`` 禁用，此时后续一定取不到
-        prompt 而安全失败）；``conversation`` = 会话覆盖；``runner_config`` = 命中
-        runner 配置；``implicit_default`` = 宿主 implicit 默认；其余一律 ``unknown``
-        而**不猜**。来源判定只依据本函数亲自拿到的入参，不依据 resolver 的第二/第三
-        返回值（宿主在不同版本里对它们的含义不一致）。
+        ``umo_forced`` = 会话偏好（SP）强制；``conversation`` = 会话覆盖；
+        ``runner_config`` = 命中 runner 配置；``implicit_default`` = 宿主 implicit
+        默认；其余一律 ``unknown`` 而**不猜**。强制来源以 resolver 交回的
+        ``force_applied_persona_id``（宿主按 SP 判定）为准，配置文件里残留的
+        ``session_service_config.persona_id`` 不参与判定；每层还要与胜出者核对，
+        对不上就 ``unknown``。
         """
         manager = getattr(self.context, "persona_manager", None)
         resolver = getattr(manager, "resolve_selected_persona", None)
@@ -566,6 +567,11 @@ class ImagoFusion(Star):
                 conversation_persona_id = getattr(conversation, "persona_id", None) or None
         except Exception:
             pass
+        config = {}
+        try:
+            config = self.context.get_config(umo=umo) or {}
+        except Exception:
+            config = {}
         provider_settings = {}
         try:
             # 与主链 _decorate_llm_request 对齐：主链
@@ -574,35 +580,28 @@ class ImagoFusion(Star):
             # 从不读全局默认配置。插件侧取同一数据源，避免默认配置的
             # default_personality 与会话命中配置不同导致人设错位。
             provider_settings = persona_provider_settings(
-                self.context.get_config(umo=umo),
+                config,
                 self.context.get_config(),
             )
         except Exception:
             provider_settings = {}
-        forced_persona_id = None
-        webchat_default = False
-        try:
-            session_config = self.context.get_config(umo=umo) or {}
-            session_block = session_config.get("session_service_config")
-            if isinstance(session_block, dict):
-                forced_persona_id = session_block.get("persona_id") or None
-        except Exception:
-            forced_persona_id = None
+        # 强制来源**只能**取自宿主 resolver 交回的 ``force_applied_persona_id``
+        # （宿主用会话偏好 SP 判它）。配置文件里那份 ``session_service_config``
+        # 可能是旧版本残留：t5 现场出现过「SP 无 force、旧配置仍写着 persona_id、
+        # 会话人格实际胜出」，此时按配置贴 umo_forced 就是错标。
+        runner_persona_id = self._runner_persona_id(config)
         persona_id, persona, host_forced, host_webchat = await resolver(
             umo=umo,
             conversation_persona_id=conversation_persona_id,
             platform_name=identity.platform_name or event.get_platform_name(),
             provider_settings=provider_settings,
         )
-        if forced_persona_id is None and host_forced:
-            # 插件侧没读到会话 UMO 配置（不同宿主版本落点不同）时，用 resolver 自己
-            # 报的 force 值补齐来源判定 —— 只用于分类，不参与 persona_id 选择。
-            forced_persona_id = host_forced
-        if isinstance(host_webchat, bool):
-            webchat_default = host_webchat
+        webchat_default = host_webchat if isinstance(host_webchat, bool) else False
         source = self._persona_source(
-            forced_persona_id=forced_persona_id,
+            forced_persona_id=host_forced,
             conversation_persona_id=conversation_persona_id,
+            runner_persona_id=runner_persona_id,
+            persona_id=str(persona_id or ""),
             webchat_default=webchat_default,
         )
         persona_id = str(persona_id or "")
@@ -664,16 +663,67 @@ class ImagoFusion(Star):
         else:
             logger.info(template, *arguments)
 
+    # 宿主 ``persona_mgr.SYSTEM_DEFAULT_PERSONA_ID``：没有任何来源信号时落到它。
+    _PERSONA_SYSTEM_DEFAULT_ID = "default"
+
     @staticmethod
-    def _persona_source(*, forced_persona_id=None, conversation_persona_id=None, webchat_default=False) -> str:
-        """把"谁选的人格"归到封闭值域；判不出就 ``unknown``，绝不臆测。"""
-        if forced_persona_id:
-            return attempt_diagnostics.PERSONA_SOURCE_UMO
-        if conversation_persona_id:
-            return attempt_diagnostics.PERSONA_SOURCE_CONVERSATION
+    def _runner_persona_id(config) -> str:
+        """按宿主读法取 runner 配置里的 ``persona_id``（缺项返回空串）。
+
+        宿主读 ``cfg["agent_runner"]["config"]``：``runner_type == "local"`` 取
+        ``runner_config["persona"]["persona_id"]``，其它取 ``runner_config["persona_id"]``。
+        更老的形状（persona 直接挂在 ``agent_runner`` 下）也兼容读，但两者都没有时
+        返回空串——"没有来源信号"，交给系统默认去判定。
+        """
+        if not isinstance(config, dict):
+            return ""
+        agent_runner = config.get("agent_runner")
+        if not isinstance(agent_runner, dict):
+            return ""
+        runner_config = agent_runner.get("config")
+        if not isinstance(runner_config, dict):
+            runner_config = agent_runner
+        if agent_runner.get("runner_type") == "local":
+            persona = runner_config.get("persona")
+            value = persona.get("persona_id") if isinstance(persona, dict) else None
+        else:
+            value = runner_config.get("persona_id")
+        return str(value or "").strip()
+
+    @classmethod
+    def _persona_source(
+        cls,
+        *,
+        forced_persona_id=None,
+        conversation_persona_id=None,
+        runner_persona_id=None,
+        persona_id="",
+        webchat_default=False,
+    ) -> str:
+        """把"谁选的人格"归到封闭值域；判不出就 ``unknown``，绝不臆测。
+
+        判定顺序就是宿主的顺序（会话偏好强制 > 会话覆盖 > runner 配置 > 系统默认），
+        并且每一层都要核对"实际胜出者确实落在这一层给出的 ID 上"：对不上说明
+        我们对宿主状态的还原不可靠 ⇒ ``unknown``。**不**凭"ID 相同"反推来源，
+        也**不**把配置文件里残留的 persona_id 当成会话偏好。
+        """
+        winner = str(persona_id or "")
         if webchat_default:
             return attempt_diagnostics.PERSONA_SOURCE_IMPLICIT
-        return attempt_diagnostics.PERSONA_SOURCE_RUNNER
+        for candidate, source in (
+            (forced_persona_id, attempt_diagnostics.PERSONA_SOURCE_UMO),
+            (conversation_persona_id, attempt_diagnostics.PERSONA_SOURCE_CONVERSATION),
+            (runner_persona_id, attempt_diagnostics.PERSONA_SOURCE_RUNNER),
+        ):
+            value = str(candidate or "").strip()
+            if not value:
+                continue
+            if not winner or winner == value:
+                return source
+            return attempt_diagnostics.PERSONA_SOURCE_UNKNOWN
+        if not winner or winner == cls._PERSONA_SYSTEM_DEFAULT_ID:
+            return attempt_diagnostics.PERSONA_SOURCE_IMPLICIT
+        return attempt_diagnostics.PERSONA_SOURCE_UNKNOWN
 
     async def _submit(self, event, prompt: str, *, persona=False, resolved_persona=None, count=1, aspect_ratio="", size="", extra_params="", style="", plain_draw_tool=False, identity: RouteIdentity | None = None):
         """创建后台绘图/Persona 图片任务。
