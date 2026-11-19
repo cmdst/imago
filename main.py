@@ -70,7 +70,7 @@ from .core.prompting import (
     summary_user_prompt,
     vision_user_prompt,
 )
-from .core.security import parse_extra_params, redact, redact_debug
+from .core.security import parse_extra_params, redact, redact_debug, safe_label
 from .integrations.active_send import ProactiveSender, SendOutcome
 from .integrations.chat_memory_context import load_chat_memory_context_state
 from .integrations.web_api import PageAPI
@@ -1901,6 +1901,81 @@ class ImagoFusion(Star):
             task.state.value,
         )
 
+    # 成功 attempt 记录的**唯一**投影：清单 ``attempts.succeeded`` 与终态行都从
+    # 这里取值 ⇒ 天然同源；同时白名单 + 限长 + 脱敏，历史版本或适配器塞进来的
+    # 额外内容不会被照抄进 ``task.json`` 或日志。
+    _SUCCESS_TEXT_FIELDS = (
+        ("provider_id", 64),
+        ("model", 64),
+        ("mode", 24),
+        ("route", 16),
+        ("api_type", 32),
+        ("model_basis", 16),
+    )
+    _SUCCESS_COUNT_FIELDS = ("node_index", "node_count", "model_index", "model_attempts")
+
+    @classmethod
+    def _success_record(cls, record: object) -> dict:
+        """把 ``task.runtime["succeeded"]`` 投影成有界、已脱敏的事实字典。
+
+        Args:
+            record: 调度器写的成功记录（可能缺失、可能不是字典、可能是旧版
+                ``{provider_id, model}`` 两键形状）。
+
+        Returns:
+            只含白名单键的字典；没有可用事实时返回 ``{}``。
+        """
+        if not isinstance(record, dict) or not record:
+            return {}
+        facts: dict = {}
+        for key, limit in cls._SUCCESS_TEXT_FIELDS:
+            value = safe_label(record.get(key), limit)
+            if value:
+                facts[key] = value
+        for key in cls._SUCCESS_COUNT_FIELDS:
+            value = record.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                facts[key] = value
+        return facts
+
+    @classmethod
+    def _success_log_facts(cls, record: object) -> str:
+        """终态行里的"成功 attempt"事实片段（与清单 ``attempts.succeeded`` 同源）。
+
+        只有真的返回过图的 attempt 才会写 ``task.runtime["succeeded"]``，所以这里的
+        内容证明的是**生成侧**成功；任务整体是否成功仍由同一行的终态名与
+        ``delivery_ok`` 决定（物化失败/全回吐/投递失败时状态不是 succeeded）。
+
+        ``basis=dispatch`` 是硬口径：节点/模型是**调度器请求**的值，不是远端实际
+        使用的模型——原生 Provider 不回执，插件不做这种声称。
+
+        Args:
+            record: ``task.runtime.get("succeeded")``（可能缺失或不是字典）。
+
+        Returns:
+            单行、有界、已脱敏的片段；没有成功记录时返回 ``"success=-"``。
+        """
+        facts = cls._success_record(record)
+        if not facts:
+            return "success=-"
+        node = facts.get("provider_id") or "-"
+        model = facts.get("model") or "-"
+        mode = facts.get("mode") or "-"
+        route = facts.get("route") or "-"
+        parts = [f"success={node}:{model}:{mode}:{route}"]
+        node_index = facts.get("node_index")
+        node_count = facts.get("node_count")
+        if node_index is not None and node_count is not None:
+            parts.append(f"nodes={node_index}/{node_count}")
+        model_index = facts.get("model_index")
+        model_attempts = facts.get("model_attempts")
+        if model_index is not None and model_attempts is not None:
+            parts.append(f"models={model_index}/{model_attempts}")
+        basis = facts.get("model_basis")
+        if basis:
+            parts.append(f"basis={basis}")
+        return " ".join(parts)
+
     async def _finalize_task(self, task: DrawTask) -> None:
         # 兜底清理：任务未走到配文等待分支（超时/取消等）时取消仍可能运行的预生成
         # 任务并回收，避免取消状态残留到 session 关闭之后。
@@ -1916,10 +1991,18 @@ class ImagoFusion(Star):
         elapsed = max(0, int(time.monotonic() - task.created_at))
         prefix = self._log_prefix(task.runtime.get("source_event"))
         usable = max(0, int(task.runtime.get("usable_output_count", 0) or 0))
+        # 生成侧与投递侧分列：``provider`` 是 Provider 真的返回的图数（可能已经产生
+        # 费用），``usable`` 是物化/回吐之后真正可交付的图数。二者不等、或
+        # ``provider`` 有值而终态不是 succeeded 时，读者能立刻看出"有图但没发成"，
+        # 不会把这一行误读成任务成功。
+        provider_count = max(0, int(task.runtime.get("provider_output_count", 0) or 0))
+        # 成功 attempt 的节点/模型/模式：与清单里的 ``attempts.succeeded`` 同一份
+        # runtime 记录，因此日志与清单永远对得上（缺记录时是 ``success=-``）。
+        success = self._success_log_facts(task.runtime.get("succeeded"))
         attempts = ",".join(task.runtime.get("attempt_errors", [])[-8:]) or "-"
         if task.state in (TaskState.FAILED, TaskState.TIMED_OUT, TaskState.DELIVERY_FAILED):
             logger.error(
-                "%s task=%s 终态 %s 耗时=%ds usable=%d errors=%s attempts=%s",
+                "%s task=%s 终态 %s 耗时=%ds usable=%d errors=%s attempts=%s provider=%d %s",
                 prefix,
                 task.id[:8],
                 task.state.value,
@@ -1927,11 +2010,14 @@ class ImagoFusion(Star):
                 usable,
                 ",".join(task.errors[-8:]) or "-",
                 attempts,
+                provider_count,
+                success,
             )
         elif task.state == TaskState.NO_OUTPUT:
             logger.warning(
-                "%s task=%s 终态 %s 耗时=%ds attempts=%s",
+                "%s task=%s 终态 %s 耗时=%ds attempts=%s provider=%d usable=%d %s",
                 prefix, task.id[:8], task.state.value, elapsed, attempts,
+                provider_count, usable, success,
             )
         else:
             delivery_ok = bool(
@@ -1939,8 +2025,9 @@ class ImagoFusion(Star):
                 or task.runtime.get("notification_delivery_success", False)
             )
             logger.info(
-                "%s task=%s 终态 %s 耗时=%ds usable=%d delivery_ok=%s",
+                "%s task=%s 终态 %s 耗时=%ds usable=%d delivery_ok=%s provider=%d %s",
                 prefix, task.id[:8], task.state.value, elapsed, usable, delivery_ok,
+                provider_count, success,
             )
 
         # 增强汇总：只在本次任务真的碰过增强时才打（开关关闭时 runtime 里没有该键，
@@ -2055,7 +2142,8 @@ class ImagoFusion(Star):
                 task.runtime.get("attempt_diagnostics")
             ),
             # 成功节点/模型 + 文字降级尝试次数：和 errors/timeouts 同一份口径。
-            "succeeded": dict(task.runtime.get("succeeded") or {}),
+            # 与终态行同一个投影函数 ⇒ 同源、同限长、同脱敏（旧两键形状仍可读）。
+            "succeeded": self._success_record(task.runtime.get("succeeded")),
             "text_attempts": int(task.runtime.get("text_attempts", 0) or 0),
             "timeouts": list(task.runtime.get("timeouts") or [])[-6:],
             "timeout_kind": str(task.runtime.get("timeout_kind", "") or ""),

@@ -54,6 +54,37 @@ def redact_debug(value: object) -> str:
     return text
 
 
+_LABEL_URL = re.compile(r"https?://[^\s<>\]\[()\"']+", flags=re.I)
+_LABEL_PATH = re.compile(r"(?:[A-Za-z]:[\\/]|/)(?:[^\s<>\"']+[\\/])+[^\s<>\"']*")
+_LABEL_CONTROL = re.compile(r"[\x00-\x1f\x7f-\x9f]+")
+
+
+def safe_label(value: object, limit: int = 64) -> str:
+    """把配置/调度标签投影成**有界、可记录**的单行文本（节点 id、模型名、api_type）。
+
+    与 :func:`redact_debug` 的区别只在"长数字"一条规则：``redact_debug`` 会把
+    ``...-20250901`` 这类版本号/模型别名替换成 ``<id>``，而成功记账必须能回答
+    "这次到底是哪个模型出的图"，所以这里保留数字。其余口径一致并额外做两件事：
+
+    1. 凭据与 ``data:image`` base64 掩码（复用 :func:`redact`），URL/本地路径替换；
+    2. 控制字符压成空格、折叠连续空白、按 ``limit`` 截断——保证一条日志不会被
+       换行或终端控制符切开，也不会因为超长标签污染整行。
+
+    Args:
+        value: 任意标签值；``None`` 视作空串（不写 ``None``/``null`` 到日志）。
+        limit: 截断长度，默认 64（与既有 ``str(value)[:64]`` 的口径一致）。
+
+    Returns:
+        已脱敏、已截断的单行文本（可能为空串，调用方自行决定占位符）。
+    """
+    text = redact("" if value is None else str(value)).strip()
+    text = _LABEL_URL.sub("<url>", text)
+    text = _LABEL_PATH.sub("<path>", text)
+    text = _LABEL_CONTROL.sub(" ", text)
+    text = " ".join(text.split())
+    return text[: max(0, int(limit))]
+
+
 def safe_component(value: str) -> str:
     value = value.strip()
     if not value or value in {".", ".."}:

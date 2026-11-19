@@ -26,7 +26,7 @@ from ..core.prompting import (
     reference_relation_suffix,
 )
 from ..core.references import CAPTION_MAX_IMAGES, classify_rejection
-from ..core.security import redact_debug
+from ..core.security import redact_debug, safe_label
 from ..providers import ADAPTERS
 
 
@@ -54,6 +54,14 @@ FALLBACK_CAPTION_SYSTEM = (
 # ``vision_timeout + 15 + 20`` 的余量（契约 §6 D2：超时/取消要及时前进或终止）。
 _TEXT_GUARD_SECONDS = 15.0
 _TEXT_STAGE_MARGIN_SECONDS = 20.0
+
+#: 成功记录里的模型标签口径（**不得**改成 "remote" / "actual" 之类的措辞）。
+#:
+#: ``astrbot_native`` 等节点把请求交给 AstrBot Provider，插件既看不到服务端最终
+#: 用了哪个模型、也拿不到"回执"；插件唯一能证明的只有"调度器请求了哪个节点/模型"。
+#: 因此清单与终态日志统一写 ``model_basis="dispatch"``，任何字段都不得把调度标签
+#: 冒充远端实际模型（v1.4.2 冻结口径）。
+SUCCESS_MODEL_BASIS = "dispatch"
 
 
 # ------------------------------------------------- 逐腿参考图实发计划（v1.4.2 C-PERSONA）
@@ -463,6 +471,52 @@ class TaskScheduler:
                 except Exception as exc:
                     task.errors.append(f"finalize:{type(exc).__name__}")
 
+    def _record_success(
+        self,
+        task: DrawTask,
+        attempt,
+        model: str,
+        *,
+        mode: str,
+        route: dict | None = None,
+    ) -> dict[str, Any]:
+        """记录**唯一**最终成功 attempt 的调度事实（清单与终态 INFO 的同源锚点）。
+
+        只有"适配器真的返回了图"的调用点才允许走到这里：失败/无结果/取消/超时
+        一概不写。因此 ``task.runtime["succeeded"]`` 存在即证明**生成侧**成功，
+        任务整体是否成功仍由 state 与投递事实决定（物化失败/全回吐/投递失败时
+        状态不是 succeeded）。
+
+        Args:
+            task: 当前任务；记录写进 ``task.runtime["succeeded"]``。
+            attempt: 胜出的 attempt 配置（节点 id 与 ``api_type`` 从这里取）。
+            model: 胜出的模型名（同节点备用模型时与 ``attempt.model`` 不同）。
+            mode: ``"normal"`` 或 ``"text_fallback"``。
+            route: ``_generate`` 里算出的调度位置事实（route/node_index/
+                node_count/model_index/model_attempts）；缺省时不写这些键，绝不猜。
+
+        Returns:
+            写进 runtime 的那份记录（有界、脱敏、不含身份原文与提示词）。
+        """
+        record: dict[str, Any] = {
+            "provider_id": safe_label(getattr(attempt, "id", ""), 64),
+            "model": safe_label(model, 64),
+            "mode": str(mode),
+            "api_type": safe_label(getattr(attempt, "api_type", ""), 32),
+            # 明确标注"这是调度器请求的节点/模型"，不是远端实际使用的模型。
+            "model_basis": SUCCESS_MODEL_BASIS,
+        }
+        if isinstance(route, dict):
+            label = safe_label(route.get("route"), 16)
+            if label:
+                record["route"] = label
+            for key in ("node_index", "node_count", "model_index", "model_attempts"):
+                value = route.get(key)
+                if isinstance(value, int) and not isinstance(value, bool):
+                    record[key] = max(0, value)
+        task.runtime["succeeded"] = record
+        return record
+
     @staticmethod
     def _record_outcome(task: DrawTask, outcome, results: list[ImageResult]) -> bool:
         value = getattr(outcome, "generation_success", None)
@@ -775,6 +829,7 @@ class TaskScheduler:
         status,
         deadline: float,
         text_quota: int,
+        route: dict | None = None,
     ) -> _TextStageOutcome:
         """单节点内的纯文字重试（契约 §4.2）。
 
@@ -941,6 +996,11 @@ class TaskScheduler:
                 finally:
                     # 原生节点单次调用内部的子请求（≤4）单独实计，纯文字不例外。
                     self._record_adapter_subcalls(task, adapter)
+                if not results:
+                    # 文字腿同样可能"调用成功但没有图"（适配器返回 ``[]``）：按无输出
+                    # 结束本阶段，交给下一个节点带原图重试。若把 ``[]`` 当成果返回，
+                    # 上层会以为"文字降级拿到了图"，从而吃掉既有回退（v1.4.2 反例）。
+                    raise NoOutputError("适配器未返回任何图片")
                 self.debug(
                     task,
                     "task=%s 绘图模型成功 node=%s model=%s results=%d references=%d persona_refs=%d explicit=%d forms=%s bytes=%d",
@@ -959,6 +1019,11 @@ class TaskScheduler:
                 task.runtime["delivered_reference_files"] = []
                 task.runtime["delivered_reference_digests"] = []
                 task.runtime["delivered_references_text"] = True
+                # 文字腿的胜出同样记账：节点/模型没变，但模式是 text_fallback，
+                # 清单与终态 INFO 因此能和普通成功区分开（同源同一份记录）。
+                self._record_success(
+                    task, attempt, model, mode="text_fallback", route=route,
+                )
                 self._fallback_node(
                     task, provider_id, model,
                     outcome="succeeded", reason="succeeded",
@@ -1096,7 +1161,7 @@ class TaskScheduler:
                     providers[0] = replace(primary, model=override_model)
         last_error = None
         no_output_error = None
-        for provider in providers:
+        for provider_index, provider in enumerate(providers):
             models = []
             for model in (provider.model, *provider.available_models):
                 if model not in models:
@@ -1105,6 +1170,16 @@ class TaskScheduler:
                 models = [""]
             for model_index, model in enumerate(models, start=1):
                 attempt = replace(provider, model=model)
+                # 调度位置事实：主/后备节点、同节点第几个模型。终态 INFO 与清单都
+                # 从这里取，**不**在事后按"当前配置"重新猜一次（配置可能已变，且
+                # 主节点覆写会重排 providers）。
+                route = {
+                    "route": "primary" if provider_index == 0 else "fallback",
+                    "node_index": provider_index + 1,
+                    "node_count": len(providers),
+                    "model_index": model_index,
+                    "model_attempts": len(models),
+                }
                 # ``config`` 是本函数开头已取好的 RuntimeConfig，不新增一次
                 # load_config（逐图重复解析的教训就在那儿）。
                 plan = self._plan_attempt_request(task, attempt, config)
@@ -1185,6 +1260,12 @@ class TaskScheduler:
                         # BF-01：原生节点单次调用内部的子请求（≤4）单独累计，
                         # 成功/失败/超时都要计数，不能只按 adapter 调用次数。
                         self._record_adapter_subcalls(task, adapter)
+                    if not results:
+                        # 适配器返回 ``[]`` 而不抛错：请求确实完成了，但没有任何图。
+                        # 这是**无输出**，必须与适配器自己抛 ``NoOutputError`` 完全
+                        # 同口径结算（不是成功、不写 ``succeeded``、也不吃掉既有
+                        # 的"本节点下一个模型 / 下一个节点"回退策略）。
+                        raise NoOutputError("适配器未返回任何图片")
                     self.debug(
                         task,
                         "task=%s 绘图模型成功 node=%s model=%s results=%d references=%d persona_refs=%d explicit=%d forms=%s bytes=%d",
@@ -1207,11 +1288,11 @@ class TaskScheduler:
                         for image in delivered
                     ]
                     task.runtime["delivered_references_text"] = False
-                    # 成功节点/模型：让 manifest 与 INFO 直接回答"这次是谁出的图"（验收 10）。
-                    task.runtime["succeeded"] = {
-                        "provider_id": str(attempt.id or "")[:64],
-                        "model": str(model or "")[:64],
-                    }
+                    # 成功节点/模型/模式：manifest 与终态 INFO 都读这一份记录，
+                    # 直接回答"这次是谁、以什么模式出的图"（普通 / 文字降级）。
+                    self._record_success(
+                        task, attempt, model, mode="normal", route=route,
+                    )
                     return results
                 except (ProviderError, asyncio.TimeoutError) as exc:
                     last_error = exc
@@ -1252,6 +1333,7 @@ class TaskScheduler:
                             status=getattr(exc, "status", None),
                             deadline=deadline,
                             text_quota=text_quota,
+                            route=route,
                         )
                         if text_outcome.results is not None:
                             return text_outcome.results
