@@ -12,9 +12,11 @@ AstrBot 把同一个 ``AstrMessageEvent`` 交给同一轮里的所有处理器�
 
 from __future__ import annotations
 
+import hashlib
 import unicodedata
-from pathlib import Path
 from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import unquote
 
 from astrbot.api.message_components import At, Image, Plain
 
@@ -289,30 +291,181 @@ def _chain_has_image(component) -> bool:
     return any(_chain_has_image(child) for child in _iter_children(component))
 
 
-def _frozen_product_images(image_allowlist) -> list:
-    """按冻结的本地成品路径重建顶层 ``Image``（严格纯图分支的唯一图源）。
+MAX_PRODUCT_INLINE_BYTES = 8 * 1024 * 1024
 
-    只认调用方在发送前冻结的**本地文件**：路径必须存在且是普通文件；构造失败
-    或读不到就跳过（fail closed）。绝不沿用链上组件的 ``url``/``file`` —— 钩子
-    只改这两个字段就能换掉实际出站的图（t13 R2-01 反例①）；也绝不透传
-    ``Node``/``Nodes`` 转发封套（反例②：``send_group_forward_msg`` 会带着
-    node/nickname/user_id 元数据出站）。远端 URL 成品没有冻结本地字节，同样
-    不发 —— 宁可少发，也不把无法核验的来源送上 wire。
+
+@dataclass(frozen=True, slots=True)
+class ProductImage:
+    """发送前冻结的一份本任务成品（本地路径 + 原始字节摘要 + 可选原始字节）。"""
+
+    path: str
+    digest: str
+    data: bytes = b""
+
+
+def _digest_bytes(data: bytes) -> str:
+    return hashlib.sha256(data).hexdigest()
+
+
+def freeze_product_images(paths, *, inline_limit: int = MAX_PRODUCT_INLINE_BYTES):
+    """把本次任务的本地成品冻结成不可变清单（t24 R2-01 成品归属）。
+
+    只接受调用方给出的**本任务产物**：路径必须是普通文件，读取失败或建不出
+    清单的项一律跳过（fail closed，不当成品）。小于 ``inline_limit`` 的原始
+    字节一并留住，这样即使同一条路径随后被钩子改写，最终序列化的仍是校验过
+    的那份字节；更大的文件只留摘要，发送时重新读取并要求摘要吻合。
     """
+    products = []
+    seen = set()
+    for item in paths or ():
+        raw = _safe_str(item)
+        if not raw:
+            continue
+        try:
+            candidate = Path(raw)
+            if not candidate.is_file():
+                continue
+            resolved = str(candidate.resolve())
+            if resolved in seen:
+                continue
+            data = candidate.read_bytes()
+        except OSError:
+            continue
+        seen.add(resolved)
+        products.append(
+            ProductImage(
+                path=resolved,
+                digest=_digest_bytes(data),
+                data=data if len(data) <= inline_limit else b"",
+            )
+        )
+    return tuple(products)
+
+
+def _product_payload(product: ProductImage) -> bytes | None:
+    """取回**校验过**的成品字节；读不到或摘要对不上就返回 ``None``。"""
+    if product.data:
+        return product.data if _digest_bytes(product.data) == product.digest else None
+    try:
+        data = Path(product.path).read_bytes()
+    except OSError:
+        return None
+    return data if _digest_bytes(data) == product.digest else None
+
+
+def _component_local_path(component) -> str:
+    """组件自带的本地来源（``path`` 优先，其次 ``file://`` / 绝对路径）。"""
+    value = getattr(component, "path", None)
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    value = getattr(component, "file", None)
+    if isinstance(value, str):
+        text = value.strip()
+        if text.startswith("file://"):
+            return unquote(text[len("file://") :])
+        if text.startswith("/"):
+            return text
+    return ""
+
+
+def _product_for(component, products):
+    """把链上组件对回冻结成品；对不上返回 ``None``（外来图/未冻结来源）。"""
+    raw = _component_local_path(component)
+    if not raw or not products:
+        return None
+    try:
+        resolved = str(Path(raw).resolve())
+    except OSError:
+        return None
+    for product in products:
+        if product.path == resolved:
+            return product
+    return None
+
+
+def _walk(component):
+    """组件自身 + 容器内的全部子组件（转发容器展开）。"""
+    yield component
+    for child in _iter_children(component):
+        yield from _walk(child)
+
+
+def _surviving_product_images(chain, products) -> list:
+    """严格纯图：链上**存活**且字节校验通过的本任务成品（按链上顺序）。"""
+    if not products:
+        return []
     images = []
     seen = set()
-    for item in image_allowlist or ():
-        raw = _safe_str(item)
-        if not raw or raw in seen:
-            continue
-        seen.add(raw)
-        try:
-            if not Path(raw).is_file():
+    for component in chain or ():
+        for child in _walk(component):
+            if not isinstance(child, Image):
                 continue
-            images.append(Image.fromFileSystem(raw))
-        except Exception:
-            continue
+            product = _product_for(child, products)
+            if product is None or product.path in seen:
+                continue
+            payload = _product_payload(product)
+            if payload is None:
+                continue
+            seen.add(product.path)
+            images.append(Image.fromBytes(payload))
     return images
+
+
+def _reinstate_product(component, products, state: dict):
+    """普通链上一律用冻结字节替换本任务成品；外来组件原样保留。"""
+    if isinstance(component, Image):
+        product = _product_for(component, products)
+        if product is None:
+            return component
+        payload = _product_payload(product)
+        if payload is None:
+            return component
+        state["product_images"] = int(state.get("product_images", 0)) + 1
+        return Image.fromBytes(payload)
+    if _is_node(component):
+        return _reinstate_container(component, products, state)
+    return component
+
+
+def _reinstate_children(children, products, state: dict):
+    rebuilt = []
+    for child in children or ():
+        rebuilt.append(_reinstate_product(child, products, state))
+    return rebuilt
+
+
+def _reinstate_container(component, products, state: dict):
+    """安全复制转发容器，递归把成品的字节换成冻结版本（保留原元数据）。"""
+    if Nodes is not None and isinstance(component, Nodes):
+        rebuilt_nodes = []
+        for node in getattr(component, "nodes", None) or ():
+            value = _reinstate_node(node, products, state)
+            if value is not None:
+                rebuilt_nodes.append(value)
+        if not rebuilt_nodes or Nodes is None:
+            return component
+        try:
+            return Nodes(rebuilt_nodes)
+        except Exception:  # pragma: no cover - 宿主构造失败时保持原样
+            return component
+    return _reinstate_node(component, products, state)
+
+
+def _reinstate_node(node, products, state: dict):
+    content = getattr(node, "content", None) or []
+    if not isinstance(content, list):
+        content = [content]
+    rebuilt = _reinstate_children(content, products, state)
+    if Node is None:
+        return node
+    try:
+        value = Node(rebuilt)
+        for attribute in ("id", "name", "uin", "seq", "time"):
+            if hasattr(node, attribute):
+                setattr(value, attribute, getattr(node, attribute))
+    except Exception:  # pragma: no cover - 宿主构造失败时保持原样
+        return node
+    return value
 
 
 def _rebuild_node(node, *, target: str, state: dict):
@@ -382,16 +535,20 @@ def sanitize_chain(
     target: str = "",
     image_only: bool = False,
     image_allowlist=None,
+    products=None,
     mention_without_image: bool = True,
     observations: dict | None = None,
 ) -> list:
     """按冻结身份过滤出站组件（主发、旁发与 after 钩子共用）。
 
     严格纯图（``image_only``：群聊开 @ 但没有可信目标、且有可用成品图）：
-    整条链**由冻结的本地成品重建** —— 只返回顶层 ``Image``，顺序按
-    ``image_allowlist``；链上已没有图片（钩子把成品图删光/清链）或白名单为空
-    时返回空列表（fail closed）。钩子注入的文本、别人的图、改过 ``url``/``file``
-    的组件以及 ``Node``/``Nodes`` 转发封套都不会出站。
+    整条链**由冻结的本地成品重建** —— 只返回顶层 ``Image``，且只取钩子**仍然
+    保留**、并且字节仍与冻结摘要吻合的那几张（删一张不会回灌整张单，删光或
+    只剩外来图时返回空列表，fail closed）。不沿用链上组件的 ``url``/``file``，
+    也不透传 ``Node``/``Nodes`` 转发封套；钩子注入的文本与别人的图都不会出站。
+
+    ``products``（:func:`freeze_product_images` 的产物）是本次任务的成品清单；
+    未提供时按 ``image_allowlist`` 现冻结（兼容旧调用方）。
 
     其它情况：
     - 丢弃链上所有旧 ``At``（顶层与容器内），再按需用新建的规范 ``At`` 统一
@@ -411,15 +568,15 @@ def sanitize_chain(
       ``observations["dropped_split_components"]``（有界诊断，不含内容）。
     """
     state = {"had_mention": False}
+    if products is None:
+        products = freeze_product_images(image_allowlist) if image_allowlist else ()
     if image_only:
-        images = _frozen_product_images(image_allowlist)
-        if not images:
-            return []
-        if not any(_chain_has_image(component) for component in chain or ()):
-            # 钩子把成品图全删了：尊重清空，不用白名单把图"补"回去。
-            return []
+        images = _surviving_product_images(chain, products)
+        if observations is not None:
+            observations["product_images"] = len(images)
         return images
 
+    product_state = {"product_images": 0}
     result = []
     for component in chain or ():
         value = _scrub(component, target=target, state=state)
@@ -437,6 +594,12 @@ def sanitize_chain(
                 if observations is not None:
                     observations["dropped_split_components"] = len(result) - len(kept)
                 result = kept
+    # t24 R2-01：普通链上，命中冻结成品的组件一律换成**校验过的原始字节**，
+    # 这样同一条路径被钩子改写后，线上送出的仍是本任务那几张图；外来装饰保持
+    # 原样、也不计入成品张数（``observations["product_images"]``）。
+    result = [_reinstate_product(item, products, product_state) for item in result]
+    if observations is not None:
+        observations["product_images"] = int(product_state["product_images"])
     if not result or not target or not state["had_mention"]:
         return result
     if count_images(result) <= 0 and not mention_without_image:

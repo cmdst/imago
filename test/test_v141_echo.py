@@ -215,6 +215,7 @@ class _Sender:
     async def send(
         self, umo, event, chain, before_send=None, identity=None, mention_target="",
         image_only=False, image_allowlist=None, mention_needs_image=False,
+        products=None,
     ):
         # v1.4.2 P0：`_finish_task` 会用冻结身份与提及目标调用主动发送；
         # 这个替身只记录，不参与 @ 决策（@ 守门在 active_send 里）。
@@ -224,6 +225,7 @@ class _Sender:
         self.identity = identity
         self.mention_target = mention_target
         self.mention_needs_image = mention_needs_image
+        self.products = products
         return _Outcome(True)
 
 

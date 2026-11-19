@@ -725,19 +725,24 @@ class WireGuardTests(unittest.IsolatedAsyncioTestCase):
         await rig.close()
 
     async def test_side_image_after_main_chain_clear_is_not_zero_delivery(self):
-        """R2-03 反向：旁发已送出成品图，主链被清空不得冒充零投递。"""
+        """R2-03 反向：旁发已送出**本任务成品**，主链被清空不得冒充零投递。"""
 
         payload = png_bytes(509)
-        side_payload = png_bytes(510)
 
         async def response(conf, request):
             return [_mods()["ImageResult"](data=payload)]
 
         async def decorating(event):
             mods = _mods()
+            chain = list(event.get_result().chain or [])
+            product = next(
+                item
+                for item in chain
+                if isinstance(item, mods["components"].Image) and getattr(item, "path", None)
+            )
             await event.send(
                 mods["MessageChain"](
-                    chain=[mods["components"].Image.fromBytes(side_payload)]
+                    chain=[mods["components"].Image.fromFileSystem(str(product.path))]
                 )
             )
             event.get_result().chain = []
@@ -747,10 +752,38 @@ class WireGuardTests(unittest.IsolatedAsyncioTestCase):
             task = await self._draw(rig, rig.event(USER_A))
 
             self.assertEqual(len(rig.bot.out), 1)
-            self.assertEqual(rig.bot.out[0].pictures, (digest(side_payload),))
+            self.assertEqual(rig.bot.out[0].pictures, (digest(payload),))
             self.assertEqual(task.runtime["image_delivery_dispatched_images"], 1)
             self.assertTrue(task.runtime["image_delivery_success"])
             self.assertTrue(task.runtime["image_delivery_main_suppressed"])
+        await rig.close()
+
+    async def test_foreign_side_image_only_does_not_count_as_product_delivery(self):
+        """t24 R2-01：旁发只送了别人的图 ⇒ 不得记本任务送图成功。"""
+
+        payload = png_bytes(511)
+        foreign = png_bytes(512)
+
+        async def response(conf, request):
+            return [_mods()["ImageResult"](data=payload)]
+
+        async def decorating(event):
+            mods = _mods()
+            await event.send(
+                mods["MessageChain"](chain=[mods["components"].Image.fromBytes(foreign)])
+            )
+            event.get_result().chain = []
+
+        with TemporaryDirectory() as directory, _Rig(Path(directory), response) as rig:
+            rig.hooks.before.append(_Handler(decorating))
+            task = await self._draw(rig, rig.event(USER_A))
+
+            # 别人的图确实出站了（我们没有广泛禁用装饰），但不算本任务成品交付。
+            self.assertEqual(len(rig.bot.out), 1)
+            self.assertEqual(rig.bot.out[0].pictures, (digest(foreign),))
+            self.assertEqual(task.runtime["image_delivery_dispatched_images"], 0)
+            self.assertFalse(task.runtime["image_delivery_success"])
+            self.assertEqual(task.state.value, "delivery_failed")
         await rig.close()
 
     async def test_text_only_main_chain_gets_no_mention(self):

@@ -155,6 +155,7 @@ class _Sender:
     async def send(
         self, umo, event, chain, before_send=None, identity=None, mention_target="",
         image_only=False, image_allowlist=None, mention_needs_image=False,
+        products=None,
     ):
         if before_send is not None:
             before_send()
@@ -162,6 +163,7 @@ class _Sender:
         self.identity = identity
         self.mention_target = mention_target
         self.mention_needs_image = mention_needs_image
+        self.products = products
         return _Outcome(True)
 
 

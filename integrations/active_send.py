@@ -13,7 +13,7 @@ from astrbot.core.platform.message_session import MessageSession
 from astrbot.core.platform.message_type import MessageType
 from astrbot.core.star.star_handler import EventType, star_handlers_registry
 
-from ..core.route_identity import count_images, freeze_route_identity, sanitize_chain
+from ..core.route_identity import freeze_route_identity, sanitize_chain
 
 
 @dataclass(frozen=True)
@@ -57,6 +57,7 @@ class _ProactiveMessageEvent(AstrMessageEvent):
         mention_target: str = "",
         image_only: bool = False,
         image_allowlist=None,
+        products=None,
     ) -> None:
         self._context = context
         self._outbound_session = outbound_session
@@ -66,6 +67,9 @@ class _ProactiveMessageEvent(AstrMessageEvent):
         # 群聊开 @ 但无可信目标、且已有可用成品图：主发与所有旁发只准出本任务成品图。
         self._image_only = bool(image_only)
         self._image_allowlist = image_allowlist
+        # 本次任务的成品清单（路径 + 原始字节摘要，t24 R2-01）：主发与旁发都只
+        # 认这份清单里的字节，路径被改写也不会把别人的图当成品发出去。
+        self._products = products or ()
         self._send_stage_started = False
         self._side_send_started = False
         self._side_send_error = ""
@@ -97,14 +101,17 @@ class _ProactiveMessageEvent(AstrMessageEvent):
         # 只允许冻结触发者本人、最多一个；注入的人、广播与重复提及都在这里拦掉。
         # 严格纯图分支还额外只允许本任务成品图（文本/表情/别人的图会被过滤）。
         self.begin_send_stage()
+        observations: dict = {}
         sanitized = sanitize_chain(
             list(getattr(message, "chain", None) or []),
             target=self._mention_target,
             image_only=self._image_only,
             image_allowlist=self._image_allowlist,
+            products=self._products,
             mention_without_image=not self._mention_needs_image,
-            observations=self._filter_observations,
+            observations=observations,
         )
+        self._filter_observations.update(observations)
         if not sanitized:
             if self._image_only:
                 # 严格纯图：过滤后没有任何可安全投递的内容 ⇒ 不发，也不算一次
@@ -116,7 +123,7 @@ class _ProactiveMessageEvent(AstrMessageEvent):
             raise RuntimeError(self._side_send_error)
         # 先记"尝试"，等适配器真的接受了整条链，再把它计入"已提交"（R2-03）：
         # `send_message` 返回 False 或抛异常时 `_side_image_count` 不得虚增。
-        attempted = count_images(sanitized)
+        attempted = int(observations.get("product_images", 0) or 0)
         self._side_image_attempted += attempted
         outbound = MessageChain(chain=sanitized)
         try:
@@ -210,6 +217,7 @@ class ProactiveSender:
         mention_target: str = "",
         image_only: bool = False,
         image_allowlist=None,
+        products=None,
     ) -> _ProactiveMessageEvent:
         session = MessageSession.from_str(umo)
         platform = self._platform(session)
@@ -253,6 +261,7 @@ class ProactiveSender:
             mention_target=mention_target,
             image_only=image_only,
             image_allowlist=image_allowlist,
+            products=products,
         )
         event.plugins_name = getattr(source, "plugins_name", None)
         result = MessageEventResult(chain=list(chain))
@@ -296,6 +305,7 @@ class ProactiveSender:
         mention_target: str = "",
         image_only: bool = False,
         image_allowlist=None,
+        products=None,
         mention_needs_image: bool = False,
     ) -> SendOutcome:
         """主动发送适配：装饰链 → 提及守门 → 发送 → after 钩子。
@@ -303,7 +313,12 @@ class ProactiveSender:
         ``mention_needs_image`` 只作用于**主发**：任务本身出了成品图时置真——此时
         主链若被钩子改成纯文本，不得凭空补一条 @ 提醒；任务本身没有图（失败/超时/
         回吐等既有终态通知）时置假，沿用原有的"通知带 @ 触发者"语义。
-        旁发（``event.send``）恒为"必须带图"，见 ``_ProactiveMessageEvent``。
+        旁发（``event.send``）恒为"必须带图"，见 ``_ProactiveMessageEvent``；
+        主发豁免只作为本次调用的**局部**参数，绝不写进事件对象——否则 after 钩子
+        的旁发会继承它，把一条纯文本旁发补成独立的 @ 提醒（t24 R2-03）。
+
+        ``products`` 是本次任务的成品清单（:func:`freeze_product_images`），主发
+        与旁发都只认这份清单里校验过的字节（t24 R2-01）。
         """
         try:
             event = self.build_event(
@@ -315,6 +330,7 @@ class ProactiveSender:
                 mention_target=mention_target,
                 image_only=image_only,
                 image_allowlist=image_allowlist,
+                products=products,
             )
         except Exception as exc:
             return SendOutcome(False, type(exc).__name__, False)
@@ -340,14 +356,14 @@ class ProactiveSender:
         result = event.get_result()
         # 装饰链与主发共用同一套提及策略：只保留冻结触发者的一个 At，别的 At
         # （注入/篡改/广播/重复）在这里统一拦掉；钩子删掉的提及不会被补回。
-        event.mention_needs_image = bool(mention_needs_image)
         main_observations: dict = {}
         processed = sanitize_chain(
             list(getattr(result, "chain", None) or []),
             target=event.mention_target,
             image_only=event.image_only,
             image_allowlist=event.image_allowlist,
-            mention_without_image=not event.mention_needs_image,
+            products=products,
+            mention_without_image=not mention_needs_image,
             observations=main_observations,
         )
         self.debug(
@@ -355,7 +371,7 @@ class ProactiveSender:
             len(processed),
             event.is_stopped(),
         )
-        main_attempted = count_images(processed)
+        main_attempted = int(main_observations.get("product_images", 0) or 0)
         main_sent = False
         main_suppressed = False
         error = ""

@@ -18,6 +18,7 @@ t1 的只读取证证明两件事（固定基线 ``feat/v1.4.1@a1056441``）：
 from __future__ import annotations
 
 import asyncio
+import base64
 import hashlib
 import io
 import random
@@ -735,7 +736,11 @@ class MentionOutboundTests(_PluginHarness, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.runtime["image_delivery_dispatched_images"], 0)
 
     async def test_stop_after_side_send_with_image_still_counts_as_delivered(self):
-        """含图旁发后 stop 仍算送达（原语义保留，R1-05）。"""
+        """含**本任务成品**的旁发后 stop 仍算送达（原语义保留，R1-05）。
+
+        旁发必须携带本任务成品：t24 R2-01 之后，"只发别人的图"不再算送图，
+        所以这里按链上已落盘的成品图再发一次，验证 stop 语义本身没被改坏。
+        """
 
         payload = png_bytes(91)
         with TemporaryDirectory() as directory:
@@ -743,9 +748,18 @@ class MentionOutboundTests(_PluginHarness, unittest.IsolatedAsyncioTestCase):
 
             async def decorating(event):
                 components = _mods()["components"]
+                chain = list(event.get_result().chain or [])
+                product = next(
+                    item
+                    for item in chain
+                    if isinstance(item, components.Image) and getattr(item, "path", None)
+                )
                 await event.send(
                     self.active_send.MessageChain(
-                        chain=[components.Image.fromBytes(png_bytes(92)), components.Plain("early")]
+                        chain=[
+                            components.Image.fromFileSystem(str(product.path)),
+                            components.Plain("early"),
+                        ]
                     )
                 )
                 event.stop_event()
@@ -1261,19 +1275,21 @@ class P0FollowupTests(_PluginHarness, unittest.IsolatedAsyncioTestCase):
         self.assertEqual(mentions, ["1001"])
 
     async def test_silent_mode_rebuilds_only_frozen_top_level_images(self):
-        """严格纯图只发冻结本地产物重建的顶层 Image（t13 R2-01）。
+        """严格纯图只发**留在链上**的冻结本地产物（t24 R2-01/R2-02）。
 
-        钩子把成品塞进 ``Node``/``Nodes``、再往容器里掺广播提及与文本时：
-        出站**不得**出现转发封套（``send_group_forward_msg`` 会连带 node/name/
-        user_id 元数据），也不得带任何文本/提及；图片只能是冻结路径重建的那张。
-        没给白名单（或白名单为空）时必须 fail closed，一个组件都不发。
+        两件事必须同时成立：
+        1. 钩子把成品塞进 ``Node``/``Nodes`` 并掺入广播提及与文本时，出站只能是
+           顶层 ``Image`` —— 不得出现转发封套（``send_group_forward_msg`` 会连带
+           node/name/user_id 元数据）、文本或提及；
+        2. 只认链上仍然存在的成品：只剩外来图时不得按整单把成品"补"回来。
         """
 
         components = _mods()["components"]
         with TemporaryDirectory() as directory:
             product = Path(directory) / "product.png"
-            product.write_bytes(png_bytes(36))
-            forward = components.Nodes(
+            product_bytes = png_bytes(36)
+            product.write_bytes(product_bytes)
+            foreign_only = components.Nodes(
                 nodes=[
                     components.Node(
                         content=[
@@ -1284,17 +1300,36 @@ class P0FollowupTests(_PluginHarness, unittest.IsolatedAsyncioTestCase):
                     )
                 ]
             )
+            with_product = components.Nodes(
+                nodes=[
+                    components.Node(
+                        content=[
+                            components.At(qq="all"),
+                            components.Image.fromFileSystem(str(product)),
+                            components.Image.fromBytes(png_bytes(99)),
+                            components.Plain("x"),
+                        ]
+                    )
+                ]
+            )
             cleaned = self.route.sanitize_chain(
-                [forward],
+                [with_product],
                 target="",
                 image_only=True,
                 image_allowlist=[str(product)],
             )
             payload = [await item.to_dict() for item in cleaned]
+            # 只剩外来图：不得用白名单把成品补回整单。
+            self.assertEqual(
+                self.route.sanitize_chain(
+                    [foreign_only], target="", image_only=True, image_allowlist=[str(product)]
+                ),
+                [],
+            )
             # 白名单为空 / 未提供：fail closed，不猜、不透传链上的图。
             self.assertEqual(
                 self.route.sanitize_chain(
-                    [forward], target="", image_only=True, image_allowlist=None
+                    [with_product], target="", image_only=True, image_allowlist=None
                 ),
                 [],
             )
@@ -1305,9 +1340,14 @@ class P0FollowupTests(_PluginHarness, unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("nodes", kinds)
         self.assertNotIn("text", kinds)
         self.assertNotIn("at", kinds)
-        # 出站来源是冻结的本地成品文件，而不是链上那个「别人的图」。
-        self.assertEqual(cleaned[0].path, str(product))
-        self.assertIn("product.png", str(payload[0]["data"]["file"]))
+        # 出站字节是冻结的那份成品（base64 内联），不是链上那个「别人的图」。
+        self.assertEqual(cleaned[0].path, "")
+        file_uri = str(payload[0]["data"]["file"])
+        self.assertTrue(file_uri.startswith("base64://"))
+        self.assertEqual(
+            hashlib.sha256(base64.b64decode(file_uri[len("base64://") :])).hexdigest(),
+            hashlib.sha256(product_bytes).hexdigest(),
+        )
 
     # ── R1-05 派发图片计数：只有文字不算送图成功 ────────────────────────
 
@@ -1360,13 +1400,24 @@ class P0FollowupTests(_PluginHarness, unittest.IsolatedAsyncioTestCase):
             def digests(chain):
                 found = []
                 for item in chain:
+                    # 成品图以冻结字节内联（base64://）出站；兼容仍是本地路径的形态。
                     path = getattr(item, "path", "")
-                    if not path:
+                    if path:
+                        try:
+                            found.append(hashlib.sha256(Path(path).read_bytes()).hexdigest())
+                        except OSError:
+                            pass
                         continue
-                    try:
-                        found.append(hashlib.sha256(Path(path).read_bytes()).hexdigest())
-                    except OSError:
-                        continue
+                    file_uri = str(getattr(item, "file", "") or "")
+                    if file_uri.startswith("base64://"):
+                        try:
+                            found.append(
+                                hashlib.sha256(
+                                    base64.b64decode(file_uri[len("base64://") :])
+                                ).hexdigest()
+                            )
+                        except Exception:  # pragma: no cover - 坏载荷直接忽略
+                            pass
                 return found
 
             async def decorating(event):

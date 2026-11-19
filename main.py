@@ -49,7 +49,12 @@ from .core import diagnostics as attempt_diagnostics
 from .core import echo as echo_guard
 from .core.network import fetch_reference, materialize_result
 from .core.references import ReferencePlanner, quoted_reply_missing_images
-from .core.route_identity import RouteIdentity, freeze_route_identity, image_only_reply
+from .core.route_identity import (
+    RouteIdentity,
+    freeze_product_images,
+    freeze_route_identity,
+    image_only_reply,
+)
 
 from .core import runtime
 from .core.prompting import (
@@ -1968,6 +1973,11 @@ class ImagoFusion(Star):
             chain = [*head, *chain]
         self.scheduler.set_stage(task, TaskStage.DECORATING)
         task.runtime[f"{delivery_prefix}_attempted"] = True
+        # t24 R2-01：发送前把本次落盘的成品连**原始字节**一起冻结。之后无论在
+        # 装饰/after 钩子里被改路径、改 url 还是直接覆盖同路径文件，出站与计数都
+        # 只认这份校验过的字节（读不出的项不当成品，fail closed）。
+        products = freeze_product_images(output_paths)
+        task.runtime[f"{delivery_prefix}_product_count"] = len(products)
         send_outcome = await self.sender.send(
             task.umo,
             event,
@@ -1978,6 +1988,7 @@ class ImagoFusion(Star):
             image_only=silent_image_only,
             mention_needs_image=bool(generation_success),
             image_allowlist=[str(path) for path in output_paths],
+            products=products,
         )
         # 主发送流程已结束（无论成败）：超时补发通知以此为准，避免平台实际
         # 已收到主消息后又被终态通知重复打扰。
