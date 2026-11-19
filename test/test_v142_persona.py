@@ -137,7 +137,10 @@ class _Sender:
     def __init__(self):
         self.chain = None
 
-    async def send(self, umo, event, chain, before_send=None, identity=None, mention_target=""):
+    async def send(
+        self, umo, event, chain, before_send=None, identity=None, mention_target="",
+        image_only=False, image_allowlist=None,
+    ):
         if before_send is not None:
             before_send()
         self.chain = list(chain)

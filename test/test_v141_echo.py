@@ -212,7 +212,10 @@ class _Sender:
     def __init__(self):
         self.chain = None
 
-    async def send(self, umo, event, chain, before_send=None, identity=None, mention_target=""):
+    async def send(
+        self, umo, event, chain, before_send=None, identity=None, mention_target="",
+        image_only=False, image_allowlist=None,
+    ):
         # v1.4.2 P0：`_finish_task` 会用冻结身份与提及目标调用主动发送；
         # 这个替身只记录，不参与 @ 决策（@ 守门在 active_send 里）。
         if before_send is not None:

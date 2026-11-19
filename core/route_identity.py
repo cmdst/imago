@@ -16,7 +16,13 @@ import unicodedata
 from collections.abc import Iterable
 from dataclasses import dataclass
 
-from astrbot.api.message_components import At
+from astrbot.api.message_components import At, Image, Plain
+
+try:  # 合并转发组件在部分宿主/测试替身里可能不存在：缺失时按「未知容器」处理。
+    from astrbot.api.message_components import Node, Nodes
+except ImportError:  # pragma: no cover - 仅在精简替身中出现
+    Node = None  # type: ignore[assignment]
+    Nodes = None  # type: ignore[assignment]
 
 GROUP_MESSAGE = "GroupMessage"
 FRIEND_MESSAGE = "FriendMessage"
@@ -76,7 +82,11 @@ class RouteIdentity:
     platform_name: str = ""
     platform_id: str = ""
     message_type: str = ""
+    # ``sender_user_id`` 是**归一化**后的键（strip），用于查重/额度台账；
+    # ``sender_user_id_raw`` 保留入口原值，只服务出站 @ 的可信性判定。二者分开，
+    # 才不会让「带空白的 ID」借 strip 变成合法提及，也不会为了修 @ 放松额度。
     sender_user_id: str = ""
+    sender_user_id_raw: str = ""
     sender_nickname: str = ""
     group_id: str = ""
     self_id: str = ""
@@ -97,7 +107,7 @@ class RouteIdentity:
             return "", MENTION_DISABLED
         if not self.is_group:
             return "", MENTION_NOT_GROUP
-        raw = self.sender_user_id
+        raw = self.sender_user_id_raw if self.sender_user_id_raw != "" else self.sender_user_id
         target = raw.strip()
         if not target:
             return "", MENTION_MISSING_SENDER
@@ -183,12 +193,14 @@ def freeze_route_identity(event) -> RouteIdentity:
         # 测试替身可能没有 unified_msg_origin 属性；用已冻结的三段拼出同一形状。
         umo = f"{platform_id}:{message_type}:{session_id}"
 
+    raw_sender = sender_user_id
     return RouteIdentity(
         umo=umo.strip(),
         platform_name=platform_name.strip(),
         platform_id=platform_id.strip(),
         message_type=message_type,
-        sender_user_id=sender_user_id.strip(),
+        sender_user_id=raw_sender.strip(),
+        sender_user_id_raw=raw_sender,
         sender_nickname=_safe_str(getattr(sender, "nickname", "")).strip(),
         group_id=group_id.strip(),
         self_id=_safe_str(getattr(message_obj, "self_id", "")).strip(),
@@ -196,21 +208,168 @@ def freeze_route_identity(event) -> RouteIdentity:
     )
 
 
-def sanitize_chain(chain: Iterable | None, *, target: str) -> list:
-    """按冻结身份过滤出站组件：最多保留一个冻结合法触发者的 @。
+_NODE_CLASSES = tuple(item for item in (Node, Nodes) if item is not None)
+
+def image_only_reply(
+    *, identity, at_trigger_user: bool, generation_success: bool
+) -> bool:
+    """本次回包是否必须「严格纯图」（P0 与 persona 共用的单一判定入口）。
+
+    成立条件：本次真的有成品图、群聊、配置开启 @、但冻结身份里没有可信单人
+    目标。此时主发与所有旁发都只能出本任务成品图，任何非图组件（配文、降级
+    告知、人格限额提示、钩子文本）都不许出站；私聊/关 @ 或目标合法时返回
+    ``False``，既有文字语义不变。
+    """
+    if not generation_success or not at_trigger_user:
+        return False
+    if not isinstance(identity, RouteIdentity) or not identity.is_group:
+        return False
+    return identity.mention_decision(enabled=True)[0] == ""
+
+
+
+
+def _is_node(component) -> bool:
+    return bool(_NODE_CLASSES) and isinstance(component, _NODE_CLASSES)
+
+
+def _image_allowed(component, allowlist) -> bool:
+    if allowlist is None:
+        return True
+    candidates = {
+        _safe_str(getattr(component, "path", "")),
+        _safe_str(getattr(component, "file", "")),
+        _safe_str(getattr(component, "url", "")),
+    }
+    return bool(candidates & allowlist)
+
+
+def _rebuild_node(node, *, target: str, image_only: bool, allowlist, state: dict):
+    """安全复制一个 ``Node`` 并递归清理其内容；无法安全重建时返回 ``None``。"""
+    content = getattr(node, "content", None) or []
+    if not isinstance(content, list):
+        content = [content]
+    cleaned = []
+    for child in content:
+        value = _scrub(child, target=target, image_only=image_only, allowlist=allowlist, state=state)
+        if value is not None:
+            cleaned.append(value)
+    if not cleaned or Node is None:
+        return None
+    try:
+        rebuilt = Node(cleaned)
+        for attribute in ("id", "name", "uin", "seq", "time"):
+            if hasattr(node, attribute):
+                setattr(rebuilt, attribute, getattr(node, attribute))
+    except Exception:
+        # 不能安全生成的容器一律拦下：宁可少发，也不把未清理的转发载荷送出去。
+        return None
+    return rebuilt
+
+
+def _rebuild_nodes(component, *, target: str, image_only: bool, allowlist, state: dict):
+    rebuilt_nodes = []
+    for node in getattr(component, "nodes", None) or []:
+        value = _rebuild_node(
+            node, target=target, image_only=image_only, allowlist=allowlist, state=state
+        )
+        if value is not None:
+            rebuilt_nodes.append(value)
+    if not rebuilt_nodes or Nodes is None:
+        return None
+    try:
+        return Nodes(rebuilt_nodes)
+    except Exception:
+        return None
+
+
+def _scrub(component, *, target: str, image_only: bool, allowlist, state: dict):
+    """返回允许出站的组件；``None`` 表示丢弃。"""
+    if isinstance(component, At):
+        state["had_mention"] = True
+        if (
+            target
+            and not state["kept"]
+            and _safe_str(getattr(component, "qq", "")).strip() == target
+        ):
+            state["kept"] = True
+            return component
+        # 非目标 / 广播 / 重复 / 冻结身份不可信：一律不进载荷。
+        return None
+    if image_only:
+        # 严格纯图：只允许本任务已落盘的成品图；文本、表情、别人的图、
+        # 以及转发容器里的非图片内容全部过滤（过滤后为空就不发，见调用方）。
+        if isinstance(component, Image):
+            return component if _image_allowed(component, allowlist) else None
+        if _is_node(component):
+            return _scrub_container(
+                component, target=target, image_only=image_only, allowlist=allowlist, state=state
+            )
+        return None
+    if isinstance(component, Plain):
+        return component
+    if _is_node(component):
+        return _scrub_container(
+            component, target=target, image_only=image_only, allowlist=allowlist, state=state
+        )
+    return component
+
+
+def _scrub_container(component, *, target: str, image_only: bool, allowlist, state: dict):
+    if Nodes is not None and isinstance(component, Nodes):
+        return _rebuild_nodes(
+            component, target=target, image_only=image_only, allowlist=allowlist, state=state
+        )
+    return _rebuild_node(
+        component, target=target, image_only=image_only, allowlist=allowlist, state=state
+    )
+
+
+def count_images(chain: Iterable | None) -> int:
+    """数出链上（含转发容器内）会被适配器序列化的图片组件数。"""
+    total = 0
+    for component in chain or ():
+        if isinstance(component, Image):
+            total += 1
+        elif Nodes is not None and isinstance(component, Nodes):
+            for node in getattr(component, "nodes", None) or []:
+                total += count_images(getattr(node, "content", None))
+        elif Node is not None and isinstance(component, Node):
+            total += count_images(getattr(component, "content", None))
+    return total
+
+
+def sanitize_chain(
+    chain: Iterable | None,
+    *,
+    target: str = "",
+    image_only: bool = False,
+    image_allowlist: Iterable | None = None,
+) -> list:
+    """按冻结身份过滤出站组件（主发、旁发与 after 钩子共用）。
 
     - ``target`` 为空（私聊/关 @/身份无效/无冻结身份）⇒ 移除链上所有 ``At``；
     - 非目标 ``At``（钩子注入的别人、广播 ``AtAll``、改写过的 ID）⇒ 移除；
     - 目标 ``At`` 重复出现 ⇒ 只保留第一个；
-    - 钩子显式删除了目标 ``At`` ⇒ 尊重删除，不再补回。
+    - 钩子把唯一提及**改成别人/广播**（链上仍带提及）⇒ 重建一个规范的冻结
+      ``At`` 并置前；钩子把提及**显式删光**（链上再无 ``At``）⇒ 尊重删除，不补；
+    - ``Node``/``Nodes`` 合并转发容器递归处理：安全复制后清理嵌套提及，无法
+      安全重建的容器直接拦下，不涉提及的正常内容保持原样；
+    - ``image_only``（群聊开 @ 但没有可信目标、且有可用成品图）⇒ 只保留
+      ``image_allowlist`` 里本任务的成品图，文本/表情/他人图片全部过滤。
     """
+    allowlist = None if not image_allowlist else {_safe_str(item) for item in image_allowlist}
+    state = {"had_mention": False, "kept": False}
     result: list = []
-    kept_target = False
     for component in chain or ():
-        if isinstance(component, At):
-            value = _safe_str(getattr(component, "qq", "")).strip()
-            if not target or kept_target or value != target:
-                continue
-            kept_target = True
-        result.append(component)
+        value = _scrub(
+            component, target=target, image_only=image_only, allowlist=allowlist, state=state
+        )
+        if value is not None:
+            result.append(value)
+    if state["had_mention"] and not state["kept"] and target and result:
+        # 只有「链上本来有提及、但没有任何合法目标提及存活」时才归一化重建；
+        # 纯文本/显式删光的链不会走到这里。
+        result = [At(qq=target), *result]
+        state["kept"] = True
     return result

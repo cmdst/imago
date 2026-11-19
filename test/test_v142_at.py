@@ -17,6 +17,8 @@ t1 的只读取证证明两件事（固定基线 ``feat/v1.4.1@a1056441``）：
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import io
 import random
 import sys
@@ -378,8 +380,8 @@ class RouteIdentityTests(unittest.TestCase):
         self.assertEqual(_at_targets(self.route.sanitize_chain([At(qq="999")], target="1001")), [])
 
 
-class MentionOutboundTests(unittest.IsolatedAsyncioTestCase):
-    """``_finish_task`` → 真 ``ProactiveSender`` → 假 bot 出站载荷。"""
+class _PluginHarness:
+    """``_finish_task`` 级用例共用的插件/任务/钩子装配。"""
 
     def setUp(self) -> None:
         mods = _mods()
@@ -448,6 +450,9 @@ class MentionOutboundTests(unittest.IsolatedAsyncioTestCase):
             sender_nickname="A",
             group_id="g1",
         )
+
+class MentionOutboundTests(_PluginHarness, unittest.IsolatedAsyncioTestCase):
+    """``_finish_task`` → 真 ``ProactiveSender`` → 假 bot 出站载荷。"""
 
     # ── 主发链：群图只 @ 冻结触发者 ────────────────────────────────────────
 
@@ -670,7 +675,8 @@ class MentionOutboundTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outcome.success, outcome.error)
         self.assertTrue(outcome.side_send_started)
         self.assertEqual(len(outbound), 2)
-        self.assertEqual(_at_targets(outbound[0]), [])
+        # 旁发被改写的提及不再放行，而是归一成唯一的规范冻结 At（R1-03）。
+        self.assertEqual(_at_targets(outbound[0]), ["1001"])
         self.assertEqual(_at_targets(outbound[1]), ["1001"])
 
     async def test_stop_without_any_send_is_not_success(self):
@@ -696,7 +702,9 @@ class MentionOutboundTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(task.runtime["image_delivery_error"], "StoppedWithoutSend")
         self.assertTrue(task.runtime["runner_send_completed"])
 
-    async def test_stop_after_real_side_send_counts_as_delivered(self):
+    async def test_stop_after_text_only_side_send_is_not_image_delivery(self):
+        """旁发只有文字再 stop：图片任务没有图片派发，不得记送图成功（R1-05）。"""
+
         payload = png_bytes(9)
         with TemporaryDirectory() as directory:
             plugin = self._plugin(directory)
@@ -715,9 +723,41 @@ class MentionOutboundTests(unittest.IsolatedAsyncioTestCase):
             )
             outbound = plugin.context.outbound
 
-        self.assertTrue(outcome.success, outcome.error)
-        self.assertEqual(len(outbound), 1)
+        self.assertFalse(outcome.success)
+        self.assertEqual(outcome.error, "NoImageDispatched")
         self.assertTrue(outcome.side_send_started)
+        self.assertEqual(outcome.dispatched_image_count, 0)
+        self.assertEqual(len(outbound), 1)
+        self.assertFalse(task.runtime["image_delivery_success"])
+        self.assertEqual(task.runtime["image_delivery_dispatched_images"], 0)
+
+    async def test_stop_after_side_send_with_image_still_counts_as_delivered(self):
+        """含图旁发后 stop 仍算送达（原语义保留，R1-05）。"""
+
+        payload = png_bytes(91)
+        with TemporaryDirectory() as directory:
+            plugin = self._plugin(directory)
+
+            async def decorating(event):
+                components = _mods()["components"]
+                await event.send(
+                    self.active_send.MessageChain(
+                        chain=[components.Image.fromBytes(png_bytes(92)), components.Plain("early")]
+                    )
+                )
+                event.stop_event()
+
+            self._hooks(decorating=decorating)
+            task = self._task(plugin, self._group_identity())
+            outcome = await plugin._finish_task(
+                task, [self.ImageResult(data=payload, mime_type="image/png")]
+            )
+            outbound = plugin.context.outbound
+
+        self.assertTrue(outcome.success, outcome.error)
+        self.assertEqual(outcome.dispatched_image_count, 1)
+        self.assertEqual(len(outbound), 1)
+        self.assertTrue(task.runtime["image_delivery_success"])
 
     async def test_after_hook_side_send_is_sanitized_too(self):
         payload = png_bytes(10)
@@ -741,7 +781,7 @@ class MentionOutboundTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(outcome.success, outcome.error)
         self.assertEqual(len(outbound), 2)
-        self.assertEqual(_at_targets(outbound[1]), [])
+        self.assertEqual(_at_targets(outbound[1]), ["1001"])
 
 
     async def test_hook_removing_all_mentions_is_respected(self):
@@ -1029,6 +1069,308 @@ class EntryFreezeTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(len(submitted), 1)
                 self.assertEqual(submitted[0].owner_user_id, "1001")
                 self.assertEqual(submitted[0].umo, "aiocqhttp:GroupMessage:g1")
+
+
+
+# ── t11 P0 返工（R1-01..R1-06）的定点回归 ───────────────────────────────────
+
+
+class P0FollowupTests(_PluginHarness, unittest.IsolatedAsyncioTestCase):
+    """R1-01..R1-06：原值身份、纯图策略、提及归一、转发容器、派发计数、并发屏障。"""
+
+    def _padded_identity(self):
+        return self.route.RouteIdentity(
+            umo="aiocqhttp:GroupMessage:g1",
+            platform_name="aiocqhttp",
+            platform_id="inst1",
+            message_type="GroupMessage",
+            sender_user_id="1001",
+            sender_user_id_raw=" 1001 ",
+            sender_nickname="A",
+            group_id="g1",
+        )
+
+    def _only(self, chain):
+        return [type(item).__name__ for item in chain]
+
+    # ── R1-01 原值提及身份与归一键分离 ────────────────────────────────────
+
+    def test_freeze_keeps_raw_sender_separate_from_normalized_key(self):
+        identity = self.route.freeze_route_identity(_FakeEvent(sender=" 1001 "))
+
+        self.assertEqual(identity.sender_user_id, "1001")
+        self.assertEqual(identity.sender_user_id_raw, " 1001 ")
+        self.assertEqual(
+            identity.mention_decision(enabled=True),
+            ("", self.route.MENTION_INVALID_FORMAT),
+        )
+
+    async def test_padded_sender_earns_no_mention_but_keeps_quota_key(self):
+        payload = png_bytes(31)
+        with TemporaryDirectory() as directory:
+            plugin = self._plugin(directory)
+            plugin.quota_store = _QuotaStore()
+            plugin.raw_config["quota_config"] = {"enabled": True}
+            identity = self._padded_identity()
+            self.assertIsNotNone(plugin._quota_access(identity))
+            task = self._task(plugin, identity)
+            outcome = await plugin._finish_task(
+                task, [self.ImageResult(data=payload, mime_type="image/png")]
+            )
+            outbound = plugin.context.outbound
+
+        self.assertEqual(_at_targets(outbound[0]), [])
+        self.assertEqual(self._only(outbound[0]), ["Image"])
+        self.assertTrue(outcome.success, outcome.error)
+        self.assertTrue(task.runtime["silent_image_only"])
+        self.assertEqual(task.runtime["mention_reason"], self.route.MENTION_INVALID_FORMAT)
+        # 额度键仍用归一后的 user_id（不因提及非法而绕过/改变额度）
+        self.assertEqual(task.owner_user_id, "1001")
+
+    # ── R1-02 纯图策略：不组装任何非图组件 ───────────────────────────────
+
+    async def test_silent_image_only_drops_caption_and_partial_notice(self):
+        payload = png_bytes(32)
+        with TemporaryDirectory() as directory:
+            plugin = self._plugin(directory)
+            plugin.raw_config["task_config"]["llm_caption"] = True
+            plugin.raw_config["task_config"]["llm_caption_pregen"] = True
+            captioned = []
+
+            async def build_caption(task, generation_success, image_count):
+                captioned.append((task.id, generation_success, image_count))
+                return "CAPTION"
+
+            plugin._build_caption = build_caption
+            identity = self._group_identity(sender="0")
+            task = self._task(plugin, identity)
+            task.errors.append("partial_error")
+            outcome = await plugin._finish_task(
+                task, [self.ImageResult(data=payload, mime_type="image/png")]
+            )
+            outbound = plugin.context.outbound
+
+        self.assertEqual(captioned, [])
+        self.assertEqual(len(outbound), 1)
+        self.assertEqual(self._only(outbound[0]), ["Image"])
+        self.assertTrue(outcome.success, outcome.error)
+        self.assertTrue(task.runtime["image_delivery_success"])
+
+    async def test_silent_image_only_suppresses_hook_side_text(self):
+        payload = png_bytes(33)
+        with TemporaryDirectory() as directory:
+            plugin = self._plugin(directory)
+            components = _mods()["components"]
+
+            async def decorating(event):
+                await event.send(
+                    self.active_send.MessageChain(chain=[components.Plain("hook side")])
+                )
+
+            self._hooks(decorating=decorating)
+            task = self._task(plugin, self._group_identity(sender="abc"))
+            outcome = await plugin._finish_task(
+                task, [self.ImageResult(data=payload, mime_type="image/png")]
+            )
+            outbound = plugin.context.outbound
+
+        self.assertEqual(len(outbound), 1)
+        self.assertEqual(self._only(outbound[0]), ["Image"])
+        self.assertTrue(outcome.success, outcome.error)
+        self.assertFalse(outcome.side_send_started)
+        self.assertEqual(outcome.dispatched_image_count, 1)
+
+    async def test_silent_image_only_with_empty_chain_is_not_delivery(self):
+        payload = png_bytes(34)
+        with TemporaryDirectory() as directory:
+            plugin = self._plugin(directory)
+
+            async def decorating(event):
+                event.get_result().chain = []
+                event.stop_event()
+
+            self._hooks(decorating=decorating)
+            task = self._task(plugin, self._group_identity(sender="0"))
+            outcome = await plugin._finish_task(
+                task, [self.ImageResult(data=payload, mime_type="image/png")]
+            )
+            outbound = plugin.context.outbound
+
+        self.assertEqual(outbound, [])
+        self.assertFalse(outcome.success)
+        self.assertEqual(outcome.dispatched_image_count, 0)
+        self.assertFalse(task.runtime["image_delivery_success"])
+        self.assertEqual(task.runtime["image_delivery_dispatched_images"], 0)
+
+    # ── R1-03 提及归一：替换成规范冻结 At，显式删光不补 ─────────────────
+
+    async def test_hook_replacing_the_only_mention_is_normalized_to_frozen_at(self):
+        payload = png_bytes(35)
+        with TemporaryDirectory() as directory:
+            plugin = self._plugin(directory)
+            components = _mods()["components"]
+
+            async def decorating(event):
+                for component in event.get_result().chain:
+                    if isinstance(component, components.At):
+                        component.qq = 2002
+
+            self._hooks(decorating=decorating)
+            task = self._task(plugin, self._group_identity())
+            outcome = await plugin._finish_task(
+                task, [self.ImageResult(data=payload, mime_type="image/png")]
+            )
+            outbound = plugin.context.outbound
+
+        self.assertTrue(outcome.success, outcome.error)
+        self.assertEqual(_at_targets(outbound[0]), ["1001"])
+        self.assertEqual(self._only(outbound[0]), ["At", "Image"])
+
+    # ── R1-04 转发容器（Node/Nodes）递归守门 ─────────────────────────────
+
+    async def test_forwarded_nodes_payload_carries_no_foreign_mention(self):
+        components = _mods()["components"]
+        inner_plain = components.Node(
+            content=[components.At(qq="all"), components.At(qq=2002), components.Plain("inside")]
+        )
+        forward = components.Nodes(nodes=[inner_plain])
+        chain = [
+            components.Node(content=[components.At(qq=1001), components.Plain("outer")]),
+            forward,
+        ]
+
+        cleaned = self.route.sanitize_chain(chain, target="1001")
+        payload = [await item.to_dict() for item in cleaned]
+
+        def walk(value):
+            if isinstance(value, dict):
+                if value.get("type") == "at":
+                    yield str(value.get("data", {}).get("qq"))
+                for item in value.values():
+                    yield from walk(item)
+            elif isinstance(value, list):
+                for item in value:
+                    yield from walk(item)
+
+        mentions = [qq for document in payload for qq in walk(document)]
+        self.assertEqual(mentions, ["1001"])
+
+    async def test_forwarded_nodes_in_silent_mode_keep_images_only(self):
+        components = _mods()["components"]
+        image = components.Image.fromBytes(png_bytes(36))
+        forward = components.Nodes(
+            nodes=[components.Node(content=[components.At(qq="all"), image, components.Plain("x")])]
+        )
+
+        cleaned = self.route.sanitize_chain([forward], target="", image_only=True, image_allowlist=None)
+        payload = [await item.to_dict() for item in cleaned]
+
+        def types(value):
+            if isinstance(value, dict):
+                if "type" in value and isinstance(value["type"], str):
+                    yield value["type"]
+                for item in value.values():
+                    yield from types(item)
+            elif isinstance(value, list):
+                for item in value:
+                    yield from types(item)
+
+        kinds = [kind for document in payload for kind in types(document)]
+        self.assertIn("image", kinds)
+        self.assertNotIn("text", kinds)
+
+    # ── R1-05 派发图片计数：只有文字不算送图成功 ────────────────────────
+
+    async def test_decorator_text_only_chain_is_not_image_delivery(self):
+        payload = png_bytes(37)
+        with TemporaryDirectory() as directory:
+            plugin = self._plugin(directory)
+            components = _mods()["components"]
+
+            async def decorating(event):
+                event.get_result().chain = [components.Plain("only text")]
+
+            self._hooks(decorating=decorating)
+            task = self._task(plugin, self._group_identity())
+            outcome = await plugin._finish_task(
+                task, [self.ImageResult(data=payload, mime_type="image/png")]
+            )
+
+        self.assertFalse(outcome.success)
+        self.assertEqual(outcome.dispatched_image_count, 0)
+        self.assertFalse(task.runtime["image_delivery_success"])
+        self.assertEqual(task.runtime["image_delivery_dispatched_images"], 0)
+
+    async def test_successful_image_delivery_records_dispatch_count(self):
+        payload = png_bytes(38)
+        with TemporaryDirectory() as directory:
+            plugin = self._plugin(directory)
+            task = self._task(plugin, self._group_identity())
+            outcome = await plugin._finish_task(
+                task, [self.ImageResult(data=payload, mime_type="image/png")]
+            )
+
+        self.assertTrue(outcome.success, outcome.error)
+        self.assertEqual(outcome.dispatched_image_count, 1)
+        self.assertEqual(task.runtime["image_delivery_dispatched_images"], 1)
+        self.assertTrue(task.runtime["image_delivery_success"])
+
+    # ── R1-06 并发屏障：B 先完成也不能抢 A 的图或 @ ─────────────────────
+
+    async def test_two_group_tasks_keep_own_image_and_mention_when_b_lands_first(self):
+        payload_a = png_bytes(41)
+        payload_b = png_bytes(42)
+        digest_a = hashlib.sha256(payload_a).hexdigest()
+        digest_b = hashlib.sha256(payload_b).hexdigest()
+        with TemporaryDirectory() as directory:
+            plugin = self._plugin(directory)
+            entered = asyncio.Event()
+            release_a = asyncio.Event()
+
+            def digests(chain):
+                found = []
+                for item in chain:
+                    path = getattr(item, "path", "")
+                    if not path:
+                        continue
+                    try:
+                        found.append(hashlib.sha256(Path(path).read_bytes()).hexdigest())
+                    except OSError:
+                        continue
+                return found
+
+            async def decorating(event):
+                # 屏障：A 的成品图先卡在发送前，B 在这期间完成并出站。
+                if digest_a in digests(list(event.get_result().chain or [])):
+                    entered.set()
+                    await release_a.wait()
+
+            self._hooks(decorating=decorating)
+            task_a = self._task(plugin, self._group_identity(sender="1001"))
+            task_b = self._task(plugin, self._group_identity(sender="1002"))
+            # 两个任务必须落在不同缓存目录，否则同一 id 会让成品图互相覆盖。
+            task_a.id = "a" * 32
+            task_b.id = "b" * 32
+            handle_a = asyncio.create_task(
+                plugin._finish_task(task_a, [self.ImageResult(data=payload_a, mime_type="image/png")])
+            )
+            await asyncio.wait_for(entered.wait(), 5)
+            handle_b = asyncio.create_task(
+                plugin._finish_task(task_b, [self.ImageResult(data=payload_b, mime_type="image/png")])
+            )
+            outcome_b = await asyncio.wait_for(handle_b, 5)
+            release_a.set()
+            outcome_a = await asyncio.wait_for(handle_a, 5)
+            # 成品图在临时目录里，出站载荷的图片字节必须**在目录还在时**取样。
+            landed = [(_at_targets(chain), digests(chain)) for chain in plugin.context.outbound]
+
+        self.assertTrue(outcome_a.success, outcome_a.error)
+        self.assertTrue(outcome_b.success, outcome_b.error)
+        # B 先出站：@B 且只有 B 的图；A 后出站：@A 且只有 A 的图。
+        self.assertEqual(
+            landed,
+            [(["1002"], [digest_b]), (["1001"], [digest_a])],
+        )
 
 
 

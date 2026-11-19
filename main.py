@@ -49,7 +49,7 @@ from .core import diagnostics as attempt_diagnostics
 from .core import echo as echo_guard
 from .core.network import fetch_reference, materialize_result
 from .core.references import ReferencePlanner, quoted_reply_missing_images
-from .core.route_identity import RouteIdentity, freeze_route_identity
+from .core.route_identity import RouteIdentity, freeze_route_identity, image_only_reply
 
 from .core import runtime
 from .core.prompting import (
@@ -1750,6 +1750,15 @@ class ImagoFusion(Star):
         task.runtime["mention_target"] = mention_target
         task.runtime["mention_target_present"] = bool(mention_target)
         task.runtime["mention_reason"] = mention_reason
+        # 群聊、开了 @、但冻结身份里没有可信目标，而本次确实有可用成品图：
+        # 走严格纯图回包——只送本任务成品图，既不补文字解释也不发假/错提及。
+        # 失败/超时/全回吐仍走原有通知路径（它们本来就没有图，不属于这个分支）。
+        silent_image_only = image_only_reply(
+            identity=identity,
+            at_trigger_user=bool(cfg.at_trigger_user),
+            generation_success=generation_success,
+        )
+        task.runtime["silent_image_only"] = silent_image_only
         echo_all_blocked = bool(
             echo_blocked and echo_guard.blocked_all(echo_state, len(results))
         )
@@ -1759,9 +1768,15 @@ class ImagoFusion(Star):
                 chain.append(Plain(echo_guard.ECHO_BLOCKED_TEXT))
             else:
                 chain.append(Plain("绘制超时，请稍后再试。" if task.state == TaskState.TIMED_OUT else "绘制失败，请稍后再试。"))
-        elif task.errors:
+        elif task.errors and not silent_image_only:
             chain.append(Plain("部分图片绘制失败。"))
-        if echo_all_blocked:
+        if silent_image_only:
+            # 严格纯图：源头就不组装/不等待回包配文（含预生成），避免任何文字
+            # 与提及进入这条回包；预生成协程取消，不留悬挂任务。
+            pregen_pending = task.runtime.get("caption_pregen_task")
+            if pregen_pending is not None and not pregen_pending.done():
+                pregen_pending.cancel()
+        elif echo_all_blocked:
             # R3-01（契约 §4.7）：全回吐是"模型把参考图原样送回"的终态结论，
             # 不是"缺一句说明"。这里既不调用 LLM 配文（零付费），也不让配文覆盖
             # 冻结正文；预生成任务若还在跑就取消，避免留下悬挂协程。
@@ -1811,7 +1826,7 @@ class ImagoFusion(Star):
         notice = self._fallback_notice(
             cfg.reference_fallback, str(fallback_info.get("notice", "") or "").strip(),
         )
-        if notice and generation_success and not task.errors:
+        if notice and generation_success and not task.errors and not silent_image_only:
             # v1.4.0 §5.3 U1/U4：只有当**最终成品来自节点内纯文字重试**且本次干净
             # 成功时才追加告知；失败/部分失败路径不再追加（既有失败文案已足够，
             # 也不得让用户误以为"降级成功了"）。
@@ -1828,33 +1843,44 @@ class ImagoFusion(Star):
             before_send=lambda: self.scheduler.set_stage(task, TaskStage.SENDING),
             identity=identity,
             mention_target=mention_target,
+            image_only=silent_image_only,
+            image_allowlist=[str(path) for path in output_paths],
         )
         # 主发送流程已结束（无论成败）：超时补发通知以此为准，避免平台实际
         # 已收到主消息后又被终态通知重复打扰。
         task.runtime["runner_send_completed"] = True
-        task.runtime[f"{delivery_prefix}_success"] = send_outcome.success
-        task.runtime[f"{delivery_prefix}_error"] = send_outcome.error
+        dispatched_images = int(getattr(send_outcome, "dispatched_image_count", 0) or 0)
+        task.runtime[f"{delivery_prefix}_dispatched_images"] = dispatched_images
+        delivery_success = send_outcome.success
+        delivery_error = send_outcome.error
+        if generation_success and dispatched_images <= 0:
+            # 图片任务只发出文字/没有图：算「生成成功、投递失败」，不能记送图成功。
+            delivery_success = False
+            delivery_error = delivery_error or "NoImageDispatched"
+        task.runtime[f"{delivery_prefix}_success"] = delivery_success
+        task.runtime[f"{delivery_prefix}_error"] = delivery_error
         task.runtime[f"{delivery_prefix}_side_effects_started"] = send_outcome.side_effects_started
         task.runtime[f"{delivery_prefix}_side_send_started"] = send_outcome.side_send_started
         task.runtime[f"{delivery_prefix}_side_send_error"] = send_outcome.side_send_error
-        if not send_outcome.success:
+        if not delivery_success:
             logger.error(
                 "%s task=%s generation_success=%s delivery=%s 主动发送失败 type=%s",
                 self._log_prefix(event),
                 task.id[:8],
                 generation_success,
                     delivery_kind,
-                    send_outcome.error or "Unknown",
+                    delivery_error or "Unknown",
                 )
         return SendOutcome(
-            send_outcome.success,
-            send_outcome.error,
+            delivery_success,
+            delivery_error,
             side_effects_started=send_outcome.side_effects_started,
             side_send_started=send_outcome.side_send_started,
             side_send_error=send_outcome.side_send_error,
             generation_success=generation_success,
             usable_output_count=usable_output_count,
             delivery_kind=delivery_kind,
+            dispatched_image_count=dispatched_images,
         )
 
     def _settle_task_quota(self, task: DrawTask) -> None:

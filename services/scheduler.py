@@ -530,9 +530,20 @@ class TaskScheduler:
         task.runtime["generation_success"] = generation_success
         task.runtime["usable_output_count"] = max(0, usable_output_count)
         prefix = "image_delivery" if delivery_kind == "image" else "notification_delivery"
+        success = bool(getattr(outcome, "success", outcome))
+        error = str(getattr(outcome, "error", "") or "")
+        dispatched = getattr(outcome, "dispatched_image_count", None)
+        if dispatched is not None:
+            dispatched_images = max(0, int(dispatched or 0))
+            task.runtime[f"{prefix}_dispatched_images"] = dispatched_images
+            if delivery_kind == "image" and success and dispatched_images <= 0:
+                # 图片任务只发出文字/没有图：适配器虽然被调用过，但没有图片派发，
+                # 不得记送图成功（这条是「派发」，不是成员实际收件）。
+                success = False
+                error = error or "NoImageDispatched"
         task.runtime[f"{prefix}_attempted"] = True
-        task.runtime[f"{prefix}_success"] = bool(getattr(outcome, "success", outcome))
-        task.runtime[f"{prefix}_error"] = str(getattr(outcome, "error", "") or "")
+        task.runtime[f"{prefix}_success"] = success
+        task.runtime[f"{prefix}_error"] = error
         task.runtime[f"{prefix}_side_effects_started"] = bool(
             getattr(outcome, "side_effects_started", False)
         )
