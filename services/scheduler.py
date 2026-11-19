@@ -19,7 +19,14 @@ except ImportError:  # 允许在不含 AstrBot 运行依赖的源码环境运行
 from ..core import diagnostics
 from ..core.config import available_providers, matches_template
 from ..core.errors import ConfigurationError, NoOutputError, ProviderError, ProviderTimeout
-from ..core.models import DrawTask, GenerationRequest, ImageResult, TaskStage, TaskState
+from ..core.models import (
+    DrawTask,
+    GenerationRequest,
+    ImageResult,
+    TaskStage,
+    TaskState,
+    deliverable_image_count,
+)
 from ..core.prompting import (
     REFERENCE_RELATION_SUFFIX,
     reference_caption_user_prompt,
@@ -1012,6 +1019,14 @@ class TaskScheduler:
                     # 结束本阶段，交给下一个节点带原图重试。若把 ``[]`` 当成果返回，
                     # 上层会以为"文字降级拿到了图"，从而吃掉既有回退（v1.4.2 反例）。
                     raise NoOutputError("适配器未返回任何图片")
+                if not deliverable_image_count(results):
+                    # R1-10：非空容器不等于有图。``[ImageResult(data=b"")]`` 这类
+                    # "空包装"（或非图对象）在物化阶段必然被拒；若在这里按成功返回，
+                    # 既会写下伪赢家，也会吃掉"文字阶段失败 → 下一个节点带图重试"的
+                    # 既有策略。判据只看载荷形状（``core.models.has_deliverable_image``）：
+                    # 不预取远端 URL、不读本地路径，真正的取图/回吐/投递失败仍是
+                    # 物化之后的独立事实。
+                    raise NoOutputError("适配器未返回可用的图片")
                 self.debug(
                     task,
                     "task=%s 绘图模型成功 node=%s model=%s results=%d references=%d persona_refs=%d explicit=%d forms=%s bytes=%d",
@@ -1277,6 +1292,15 @@ class TaskScheduler:
                         # 同口径结算（不是成功、不写 ``succeeded``、也不吃掉既有
                         # 的"本节点下一个模型 / 下一个节点"回退策略）。
                         raise NoOutputError("适配器未返回任何图片")
+                    if not deliverable_image_count(results):
+                        # R1-10：与文字腿共用同一条载荷形状判据。``[ImageResult(data=b"")]``
+                        # 这类"非空容器 + 空载荷"以前只按 ``len(results)`` 就被当成成功，
+                        # 结果是：``succeeded`` 记了赢家、``provider_output_count=1``，
+                        # 随后物化拒绝、终态 no_output，清单/INFO 却仍显示正常成功者。
+                        # 现在按"有没有声称带图的条目"判：没有就走既有 no_output 回退
+                        # （同节点下一个模型 → 下一个节点），不记赢家；判据不预取 URL、
+                        # 不读本地路径，合法图引用之后的物化/回吐/投递失败照样分列。
+                        raise NoOutputError("适配器未返回可用的图片")
                     self.debug(
                         task,
                         "task=%s 绘图模型成功 node=%s model=%s results=%d references=%d persona_refs=%d explicit=%d forms=%s bytes=%d",

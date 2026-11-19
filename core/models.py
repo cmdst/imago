@@ -311,6 +311,42 @@ class ImageResult:
     local_path: Path | None = None
 
 
+def has_deliverable_image(result: object) -> bool:
+    """这次 attempt 交回的条目里，是否**声称**带了一张可交付的图（只看形状）。
+
+    判据与 ``core.network.materialize_result`` 的读取优先级严格对齐，绝不各写
+    一套（v1.4.2 R1-10：非空容器包着空载荷时，两处会给出相反结论）：
+
+    1. ``local_path`` 优先。路径是否存在、是否普通文件、是否为空，全部留给物化
+       阶段判——这里不 stat、不读盘，物化失败仍是一条独立事实。
+    2. 其次是 ``data``：只要**不是 None** 就只看字节，空字节即无载荷，**不**因为
+       同时带了 URL 就回落到 URL（物化阶段同样在 ``data`` 分支直接拒绝空字节）。
+    3. 只有 ``data is None`` 时才看 ``url``：空白地址不算载荷。远端是否可达、
+       是否私网、是否真返回图片，都不在这里预取（契约：不为判空访问外网）。
+    4. 不是 ``ImageResult`` 的对象（非图）一律不算。
+
+    因此本函数回答的是"有没有声称带图的条目"，不是"能不能真的取到图"。
+    """
+
+    if not isinstance(result, ImageResult):
+        return False
+    if result.local_path:
+        return True
+    if result.data is not None:
+        return bool(result.data)
+    return bool((result.url or "").strip())
+
+
+def deliverable_image_count(results: object) -> int:
+    """``results`` 里带可交付图片载荷的条目数；不可迭代按 0 处理。"""
+
+    try:
+        items = list(results)  # type: ignore[arg-type]
+    except TypeError:
+        return 0
+    return sum(1 for item in items if has_deliverable_image(item))
+
+
 @dataclass(slots=True)
 class GenerationRequest:
     prompt: str
