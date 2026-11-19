@@ -486,6 +486,7 @@ class TaskScheduler:
         *,
         mode: str,
         route: dict | None = None,
+        plan_seq: int | None = None,
     ) -> dict[str, Any]:
         """记录**唯一**最终成功 attempt 的调度事实（清单与终态 INFO 的同源锚点）。
 
@@ -501,6 +502,12 @@ class TaskScheduler:
             mode: ``"normal"`` 或 ``"text_fallback"``。
             route: ``_generate`` 里算出的调度位置事实（route/node_index/
                 node_count/model_index/model_attempts）；缺省时不写这些键，绝不猜。
+            plan_seq: 这次胜出调用对应逐腿记录的 ``seq``（任务内本地标识）。写进
+                ``runtime["succeeded_reference_plan_seq"]``，供 finalizer 把"胜出腿"
+                与真实 reference plan 关联 —— 里头的节点/模型是**显示标签**（截到
+                64 字符），长模型名会与逐腿记录逐字不等，按标签匹配会漏掉挤占提示
+                （t17 R2-06）。该键不进 ``succeeded``（不进清单/INFO），不改变任何
+                脱敏长度。
 
         Returns:
             写进 runtime 的那份记录（有界、脱敏、不含身份原文与提示词）。
@@ -522,6 +529,10 @@ class TaskScheduler:
                 if isinstance(value, int) and not isinstance(value, bool):
                     record[key] = max(0, value)
         task.runtime["succeeded"] = record
+        if isinstance(plan_seq, int) and not isinstance(plan_seq, bool) and plan_seq > 0:
+            # 任务内本地标识：finalizer 据此定位"胜出腿"那条逐腿记录，不依赖
+            # 可能被截断/碰撞的显示标签（R2-06）。只写 runtime，不进清单/INFO。
+            task.runtime["succeeded_reference_plan_seq"] = plan_seq
         return record
 
     @staticmethod
@@ -1022,7 +1033,7 @@ class TaskScheduler:
                 )
                 # rev3.2（t11 R1-12）：纯文字腿同样只在真正进入 generate 前记账。
                 # 该腿 references 恒为空，实发计数严格 0/0，不沿用带图腿的旧值。
-                self._record_reference_plan(
+                text_plan_record = self._record_reference_plan(
                     task, text_plan, node=attempt.id, model=model,
                     kind="text_fallback", route=route,
                 )
@@ -1082,6 +1093,7 @@ class TaskScheduler:
                 # 清单与终态 INFO 因此能和普通成功区分开（同源同一份记录）。
                 self._record_success(
                     task, attempt, model, mode="text_fallback", route=route,
+                    plan_seq=text_plan_record.get("seq"),
                 )
                 self._fallback_node(
                     task, provider_id, model,
@@ -1296,7 +1308,7 @@ class TaskScheduler:
                     )
                     # 真实调用边界：只有走到这里（适配器已构造、密钥已选好）才把这条腿
                     # 记进逐腿清单，构造/门禁失败不会留下"已实发"的假记录。
-                    self._record_reference_plan(
+                    plan_record = self._record_reference_plan(
                         task, plan, node=attempt.id, model=model, route=route
                     )
                     try:
@@ -1364,6 +1376,7 @@ class TaskScheduler:
                     # 直接回答"这次是谁、以什么模式出的图"（普通 / 文字降级）。
                     self._record_success(
                         task, attempt, model, mode="normal", route=route,
+                        plan_seq=plan_record.get("seq"),
                     )
                     return results
                 except (ProviderError, asyncio.TimeoutError) as exc:

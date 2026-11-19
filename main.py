@@ -2155,10 +2155,24 @@ class ImagoFusion(Star):
 
     @staticmethod
     def _success_reference_plan(task: DrawTask) -> dict:
-        """按"最终胜出的那条腿"取逐腿参考图记录（取不到就返回空，不猜）。"""
+        """按"最终胜出的那条腿"取逐腿参考图记录（取不到就返回空，不猜）。
+
+        R2-06：``succeeded`` 里的节点/模型是**显示标签**（脱敏后截到 64 字符），
+        与逐腿记录里的原始字符串不一定逐字相等 —— 106 字符的模型名就是这样丢掉
+        "人格参考图被节点限额挤占"提示的。因此优先用调度器写下的**任务内本地标识**
+        （``succeeded_reference_plan_seq`` = 胜出腿那条记录的 ``seq``）关联；
+        只有旧记录没有这个标识时，才退回按显示标签匹配（兼容旧 runtime/旧清单）。
+        有标识却找不到记录（例如已被裁切）时宁可不提示，也绝不按标签猜。
+        """
         plans = task.runtime.get("reference_plans")
         success = task.runtime.get("succeeded")
         if not isinstance(plans, list) or not isinstance(success, dict):
+            return {}
+        seq = task.runtime.get("succeeded_reference_plan_seq")
+        if isinstance(seq, int) and not isinstance(seq, bool) and seq > 0:
+            for record in reversed(plans):
+                if isinstance(record, dict) and record.get("seq") == seq:
+                    return record
             return {}
         node = str(success.get("provider_id") or "")
         model = str(success.get("model") or "")
