@@ -12,7 +12,8 @@ const state={
   groupValues:{},chatProviders:[],
   optimizerProviderId:'',visionProviderId:'',
   dirty:false,quotaDirty:false,quotas:[],quotaPolicy:{},quotaSort:{key:'user_id',direction:'asc'},
-  rebuilding:false,selectedReferences:new Set(),expanded:new Set(),warnings:[]
+  rebuilding:false,selectedReferences:new Set(),expanded:new Set(),warnings:[],
+  personaDetail:null
 };
 
 /* ---------------------------------------------------------------- 基础工具 */
@@ -57,6 +58,21 @@ function beginPersonaRequest(personaId){
 }
 function personaRequestCurrent(request){
   return Boolean(request)&&request.seq===personaRequestSeq&&state.current===request.personaId;
+}
+
+/* 写操作的"已渲染目标"（t11 R2-05）。
+   删除图卡 / 保存摘要 / 重建摘要作用的都是**界面上现在显示的内容**，而它来自上一次
+   成功渲染的详情；`state.current` 只代表"用户刚选中了谁"。切 A→B 而 B 的详情还没回来
+   时，界面仍是 A 的图卡与 A 的摘要——此时按 `state.current` 提交就会把 A 的东西写到 B
+   名下（删他人的图、覆盖他人的摘要）。所以目标一律取自 `state.personaDetail`，并要求它
+   仍是最新那一代（代次相同、且 state.current 未变）；否则这次写直接拒绝并提示重试：
+   宁可少做一次，也不写到"即将变成别人"或"已经不是它"的对象上。
+   上传不走这里——它绑定的是点击瞬间的人格，用户明确知道要传给谁（t7 已修）。 */
+function renderedPersonaTarget(action){
+  const detail=state.personaDetail||null;
+  if(personaRequestCurrent(detail))return detail.personaId;
+  notify(`正在读取 Persona 详情，本次${action}已取消，请稍后重试`,true);
+  return '';
 }
 async function loadPersonaDetail(options){
   const personaId=String((options&&options.personaId)||state.current||'');
@@ -597,7 +613,7 @@ document.addEventListener('click',async event=>{
   const expand=event.target.closest('[data-expand]');
   if(expand){const index=Number(expand.dataset.expand);if(state.expanded.has(index))state.expanded.delete(index);else state.expanded.add(index);expand.closest('.provider-node').classList.toggle('expanded');return}
   const deleteButton=event.target.closest('[data-delete]');
-  if(deleteButton){deleteButton.disabled=true;const personaId=state.current;const r=await apiPost('delete',{persona_id:personaId,filename:deleteButton.dataset.delete});notify(r.message,!r.success);if(!r.success)deleteButton.disabled=false;else if(state.current===personaId)await loadPersonaDetail()}
+  if(deleteButton){deleteButton.disabled=true;const personaId=renderedPersonaTarget('删除参考图');if(!personaId){deleteButton.disabled=false;return}const r=await apiPost('delete',{persona_id:personaId,filename:deleteButton.dataset.delete});notify(r.message,!r.success);if(!r.success)deleteButton.disabled=false;else if(state.current===personaId)await loadPersonaDetail()}
 });
 $('#provider-list').addEventListener('input',event=>{
   if(event.target.dataset.param){syncParam(event.target);return}
@@ -639,14 +655,14 @@ $('#optimizer-provider').addEventListener('change',event=>{state.optimizerProvid
 $('#vision-provider').addEventListener('change',event=>{state.visionProviderId=event.target.value;setDirty(true);renderGroups()});
 $('#persona-search').addEventListener('input',renderPersonaOptions);
 $('#persona-select').addEventListener('change',async event=>{state.current=event.target.value;await loadPersonaDetail().catch(e=>notify(e.message,true))});
-$('#rebuild').addEventListener('click',async()=>{if(state.rebuilding||!state.current)return;const personaId=state.current;setRebuildLoading(true);try{const r=await apiPost('rebuild',{persona_id:personaId,reference_names:[...state.selectedReferences]});if(!r.success){notify(r.message||'重建失败',true);return}if(state.current===personaId)await loadPersonaDetail();notify(r.message||'外观摘要已重建')}catch(error){notify(error.message||'重建失败',true)}finally{setRebuildLoading(false)}});
+$('#rebuild').addEventListener('click',async()=>{if(state.rebuilding)return;const personaId=renderedPersonaTarget('重建外观摘要');if(!personaId)return;setRebuildLoading(true);try{const r=await apiPost('rebuild',{persona_id:personaId,reference_names:[...state.selectedReferences]});if(!r.success){notify(r.message||'重建失败',true);return}if(state.current===personaId)await loadPersonaDetail();notify(r.message||'外观摘要已重建')}catch(error){notify(error.message||'重建失败',true)}finally{setRebuildLoading(false)}});
 $('#persona-summary').addEventListener('input',updateSummaryCount);
-$('#save-summary').addEventListener('click',async()=>{const summary=$('#persona-summary').value.trim();if(!summary){notify('外观摘要不能为空',true);return}const r=await apiPost('summary',{persona_id:state.current,summary});notify(r.message,!r.success);if(r.success)await loadPersonaDetail()});
+$('#save-summary').addEventListener('click',async()=>{const summary=$('#persona-summary').value.trim();if(!summary){notify('外观摘要不能为空',true);return}const personaId=renderedPersonaTarget('保存外观摘要');if(!personaId)return;const r=await apiPost('summary',{persona_id:personaId,summary});notify(r.message,!r.success);if(r.success&&state.current===personaId)await loadPersonaDetail()});
 $('#upload').addEventListener('click',()=>{uploadReferences().catch(error=>notify(error&&error.message?error.message:'上传失败',true))});
 window.addEventListener('beforeunload',event=>{if(!state.dirty&&!state.quotaDirty)return;event.preventDefault();event.returnValue=''});
 
 /* 测试钩子：Node vm 回归直接调用真实渲染/装配逻辑（对线上无副作用）。 */
-window.__imagoWebui={state,catalogEntry,catalogLabel,paramFields,capabilitiesOf,qualityText,thinkingCapText,referencesText,thinkingValues,thinkingLabel,normalizeProvider,renderProviders,renderGroups,groupState,buildProviderPayload,applySnapshot,syncProviderField,syncGroupField,setParamValue,clearConfirmMessage,loadPersonaDetail,renderGallery,readFile,uploadReferences,sameFiles,beginPersonaRequest,personaRequestCurrent,personaRequestSeq:()=>personaRequestSeq};
+window.__imagoWebui={state,catalogEntry,catalogLabel,paramFields,capabilitiesOf,qualityText,thinkingCapText,referencesText,thinkingValues,thinkingLabel,normalizeProvider,renderProviders,renderGroups,groupState,buildProviderPayload,applySnapshot,syncProviderField,syncGroupField,setParamValue,clearConfirmMessage,loadPersonaDetail,renderGallery,readFile,uploadReferences,sameFiles,beginPersonaRequest,personaRequestCurrent,personaRequestSeq:()=>personaRequestSeq,renderedPersonaTarget};
 
 (async()=>{
   try{

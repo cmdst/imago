@@ -25,6 +25,10 @@ ALLOWED_MIME = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp"
 ALIAS_SECRET_FILENAME = "persona_alias.key"
 ALIAS_SECRET_BYTES = 32
 ALIAS_SECRET_MODE = 0o600
+#: 可用密钥的最短**原始字节**数（与 ``core.diagnostics._PERSONA_ALIAS_KEY_MIN_BYTES``
+#: 同值；短于它就当没有密钥，绝不拿弱口令当 HMAC key）。长度按原始字节算，
+#: 不按 ``strip()`` 之后的长度算 —— 空白字节也是密钥的一部分。
+ALIAS_SECRET_MIN_BYTES = 16
 
 #: 图库三态 + 故障态。值域与 ``core.diagnostics.PERSONA_LIBRARY_*`` 逐字相同；
 #: 这里只留字符串常量，避免 ``services`` 反向依赖 ``core.diagnostics``。
@@ -305,6 +309,9 @@ class PersonaStore:
     def alias_secret(self) -> bytes:
         """读取（首次则生成）本机别名密钥；任何 IO 问题都退化为"没有密钥"。
 
+        持久化按**原始字节**：读回来的是什么字节，参与 HMAC 的就是什么字节
+        （不 strip、不 decode、不做换行规整），因此同一把密钥跨重启得到同一别名。
+
         权限最小化：新文件建出来就是 ``0600``，再补一次 ``chmod`` 兜住 umask
         差异；文件内容只在内存里用，永不写日志、manifest 或异常消息。失败
         （只读盘、权限不对）时返回 ``b""``，调用方据此退化成
@@ -316,14 +323,21 @@ class PersonaStore:
         try:
             # 首次调用时文件还不存在：读失败（FileNotFoundError 也是 OSError）
             # 只能说明"该生成一把"，不能直接退化成没有密钥。
-            existing = path.read_bytes().strip() if path.is_file() else b""
-            if len(existing) >= 16:
+            #
+            # t11 R2-07：密钥是**二进制**，必须逐字节原样读写。历史实现在这里
+            # ``.strip()``，把"首空格/尾换行"这类合法密钥字节吃掉（磁盘 32 字节、
+            # 进程里 30 字节）—— 于是持久化的字节与真正参与 HMAC 的 key 不是同一份，
+            # 两把不同的密钥也可能被规整成同一把。这里不再做任何文本化处理。
+            existing = path.read_bytes() if path.is_file() else b""
+            if len(existing) >= ALIAS_SECRET_MIN_BYTES:
                 self._alias_secret = existing
                 return existing
             secret = secrets.token_bytes(ALIAS_SECRET_BYTES)
             handle = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, ALIAS_SECRET_MODE)
             try:
-                os.write(handle, secret)
+                written = 0
+                while written < len(secret):
+                    written += os.write(handle, secret[written:])
             finally:
                 os.close(handle)
             try:

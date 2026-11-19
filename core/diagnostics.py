@@ -337,12 +337,17 @@ MAX_LABEL_CHARS = 48
 
 
 def _alias_key(secret: Any) -> bytes:
-    """把调用方给的本地密钥规范成 HMAC key；不合格就返回空（=不推导别名）。"""
+    """把调用方给的本地密钥规范成 HMAC key；不合格就返回空（=不推导别名）。
+
+    这里**不**对密钥做 ``strip()``（t11 R2-07）：密钥是二进制，两端空白字节也是
+    密钥的一部分。规整会把两把不同的密钥折叠成同一把（别名撞车），也会让"磁盘上
+    写下的字节"与"真正参与 HMAC 的字节"不一致。长度只按原始字节数判定。
+    """
     if isinstance(secret, str):
         secret = secret.encode("utf-8")
     if not isinstance(secret, (bytes, bytearray)):
         return b""
-    data = bytes(secret).strip()
+    data = bytes(secret)
     if len(data) < _PERSONA_ALIAS_KEY_MIN_BYTES:
         return b""
     return data
