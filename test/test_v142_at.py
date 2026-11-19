@@ -995,6 +995,9 @@ class EntryFreezeTests(unittest.IsolatedAsyncioTestCase):
                 async def resolve_persona(inner_event, identity=None):
                     return "persona", "prompt"
 
+                # v1.4.2 集成后真实解析入口是 `_resolve_persona_detail`（带来源），
+                # `_resolve_persona` 只是兼容包装；两处都替换，断言仍落在同一 await 屏障。
+                plugin._resolve_persona_detail = resolve_persona
                 plugin._resolve_persona = resolve_persona
                 async for _ in getattr(plugin, method)(event, "画一只猫"):
                     pass
@@ -1013,6 +1016,9 @@ class EntryFreezeTests(unittest.IsolatedAsyncioTestCase):
                 async def resolve_persona(inner_event, identity=None):
                     return "persona", "prompt"
 
+                # v1.4.2 集成后真实解析入口是 `_resolve_persona_detail`（带来源），
+                # `_resolve_persona` 只是兼容包装；两处都替换，断言仍落在同一 await 屏障。
+                plugin._resolve_persona_detail = resolve_persona
                 plugin._resolve_persona = resolve_persona
                 if entry == "tool-image":
                     await plugin.generate_fusion_image(event, prompt="画一只猫")

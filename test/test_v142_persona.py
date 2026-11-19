@@ -137,10 +137,12 @@ class _Sender:
     def __init__(self):
         self.chain = None
 
-    async def send(self, umo, event, chain, before_send=None):
+    async def send(self, umo, event, chain, before_send=None, identity=None, mention_target=""):
         if before_send is not None:
             before_send()
         self.chain = list(chain)
+        self.identity = identity
+        self.mention_target = mention_target
         return _Outcome(True)
 
 
