@@ -13,7 +13,7 @@ AstrBot 把同一个 ``AstrMessageEvent`` 交给同一轮里的所有处理器�
 from __future__ import annotations
 
 import unicodedata
-from collections.abc import Iterable
+from pathlib import Path
 from dataclasses import dataclass
 
 from astrbot.api.message_components import At, Image, Plain
@@ -233,25 +233,77 @@ def _is_node(component) -> bool:
     return bool(_NODE_CLASSES) and isinstance(component, _NODE_CLASSES)
 
 
-def _image_allowed(component, allowlist) -> bool:
-    if allowlist is None:
+
+def _iter_children(component):
+    """容器组件的内容组件（``Node``/``Nodes``）；非容器返回空序列。"""
+    if Nodes is not None and isinstance(component, Nodes):
+        for node in getattr(component, "nodes", None) or ():
+            content = getattr(node, "content", None) or []
+            if not isinstance(content, list):
+                content = [content]
+            for child in content:
+                yield child
+        return
+    if Node is not None and isinstance(component, Node):
+        content = getattr(component, "content", None) or []
+        if not isinstance(content, list):
+            content = [content]
+        for child in content:
+            yield child
+
+
+def count_images(chain) -> int:
+    """数出链上（含转发容器内）会被适配器序列化的图片组件数。"""
+    total = 0
+    for component in chain or ():
+        if isinstance(component, Image):
+            total += 1
+        else:
+            total += count_images(_iter_children(component))
+    return total
+
+
+def _chain_has_image(component) -> bool:
+    """组件本身或容器内容里是否还有图片（判定钩子是否把成品图删光）。"""
+    if isinstance(component, Image):
         return True
-    candidates = {
-        _safe_str(getattr(component, "path", "")),
-        _safe_str(getattr(component, "file", "")),
-        _safe_str(getattr(component, "url", "")),
-    }
-    return bool(candidates & allowlist)
+    return any(_chain_has_image(child) for child in _iter_children(component))
 
 
-def _rebuild_node(node, *, target: str, image_only: bool, allowlist, state: dict):
-    """安全复制一个 ``Node`` 并递归清理其内容；无法安全重建时返回 ``None``。"""
+def _frozen_product_images(image_allowlist) -> list:
+    """按冻结的本地成品路径重建顶层 ``Image``（严格纯图分支的唯一图源）。
+
+    只认调用方在发送前冻结的**本地文件**：路径必须存在且是普通文件；构造失败
+    或读不到就跳过（fail closed）。绝不沿用链上组件的 ``url``/``file`` —— 钩子
+    只改这两个字段就能换掉实际出站的图（t13 R2-01 反例①）；也绝不透传
+    ``Node``/``Nodes`` 转发封套（反例②：``send_group_forward_msg`` 会带着
+    node/nickname/user_id 元数据出站）。远端 URL 成品没有冻结本地字节，同样
+    不发 —— 宁可少发，也不把无法核验的来源送上 wire。
+    """
+    images = []
+    seen = set()
+    for item in image_allowlist or ():
+        raw = _safe_str(item)
+        if not raw or raw in seen:
+            continue
+        seen.add(raw)
+        try:
+            if not Path(raw).is_file():
+                continue
+            images.append(Image.fromFileSystem(raw))
+        except Exception:
+            continue
+    return images
+
+
+def _rebuild_node(node, *, target: str, state: dict):
+    """安全复制一个 ``Node`` 并递归清理嵌套提及；无法安全重建时返回 ``None``。"""
     content = getattr(node, "content", None) or []
     if not isinstance(content, list):
         content = [content]
     cleaned = []
     for child in content:
-        value = _scrub(child, target=target, image_only=image_only, allowlist=allowlist, state=state)
+        value = _scrub(child, target=target, state=state)
         if value is not None:
             cleaned.append(value)
     if not cleaned or Node is None:
@@ -267,12 +319,10 @@ def _rebuild_node(node, *, target: str, image_only: bool, allowlist, state: dict
     return rebuilt
 
 
-def _rebuild_nodes(component, *, target: str, image_only: bool, allowlist, state: dict):
+def _rebuild_nodes(component, *, target: str, state: dict):
     rebuilt_nodes = []
     for node in getattr(component, "nodes", None) or []:
-        value = _rebuild_node(
-            node, target=target, image_only=image_only, allowlist=allowlist, state=state
-        )
+        value = _rebuild_node(node, target=target, state=state)
         if value is not None:
             rebuilt_nodes.append(value)
     if not rebuilt_nodes or Nodes is None:
@@ -283,93 +333,75 @@ def _rebuild_nodes(component, *, target: str, image_only: bool, allowlist, state
         return None
 
 
-def _scrub(component, *, target: str, image_only: bool, allowlist, state: dict):
-    """返回允许出站的组件；``None`` 表示丢弃。"""
+def _scrub_container(component, *, target: str, state: dict):
+    if Nodes is not None and isinstance(component, Nodes):
+        return _rebuild_nodes(component, target=target, state=state)
+    return _rebuild_node(component, target=target, state=state)
+
+
+def _scrub(component, *, target: str, state: dict):
+    """返回允许出站的组件；``None`` 表示丢弃。
+
+    顶层的旧 ``At`` 与容器内的旧 ``At`` 一律丢弃：合法提及由
+    :func:`sanitize_chain` 在最后用**新建的规范组件**统一重建置前（t13 R2-02）。
+    这既修掉「正确的 At 被钩子挪到图片后面」的顺序问题，也不会把带着边缘空白
+    或其它变形的原始 ``At.qq`` 原样透给 wire。
+    """
     if isinstance(component, At):
         state["had_mention"] = True
-        if (
-            target
-            and not state["kept"]
-            and _safe_str(getattr(component, "qq", "")).strip() == target
-        ):
-            state["kept"] = True
-            return component
-        # 非目标 / 广播 / 重复 / 冻结身份不可信：一律不进载荷。
-        return None
-    if image_only:
-        # 严格纯图：只允许本任务已落盘的成品图；文本、表情、别人的图、
-        # 以及转发容器里的非图片内容全部过滤（过滤后为空就不发，见调用方）。
-        if isinstance(component, Image):
-            return component if _image_allowed(component, allowlist) else None
-        if _is_node(component):
-            return _scrub_container(
-                component, target=target, image_only=image_only, allowlist=allowlist, state=state
-            )
         return None
     if isinstance(component, Plain):
         return component
     if _is_node(component):
-        return _scrub_container(
-            component, target=target, image_only=image_only, allowlist=allowlist, state=state
-        )
+        return _scrub_container(component, target=target, state=state)
     return component
 
 
-def _scrub_container(component, *, target: str, image_only: bool, allowlist, state: dict):
-    if Nodes is not None and isinstance(component, Nodes):
-        return _rebuild_nodes(
-            component, target=target, image_only=image_only, allowlist=allowlist, state=state
-        )
-    return _rebuild_node(
-        component, target=target, image_only=image_only, allowlist=allowlist, state=state
-    )
-
-
-def count_images(chain: Iterable | None) -> int:
-    """数出链上（含转发容器内）会被适配器序列化的图片组件数。"""
-    total = 0
-    for component in chain or ():
-        if isinstance(component, Image):
-            total += 1
-        elif Nodes is not None and isinstance(component, Nodes):
-            for node in getattr(component, "nodes", None) or []:
-                total += count_images(getattr(node, "content", None))
-        elif Node is not None and isinstance(component, Node):
-            total += count_images(getattr(component, "content", None))
-    return total
-
-
 def sanitize_chain(
-    chain: Iterable | None,
+    chain,
     *,
     target: str = "",
     image_only: bool = False,
-    image_allowlist: Iterable | None = None,
+    image_allowlist=None,
+    mention_without_image: bool = True,
 ) -> list:
     """按冻结身份过滤出站组件（主发、旁发与 after 钩子共用）。
 
-    - ``target`` 为空（私聊/关 @/身份无效/无冻结身份）⇒ 移除链上所有 ``At``；
-    - 非目标 ``At``（钩子注入的别人、广播 ``AtAll``、改写过的 ID）⇒ 移除；
-    - 目标 ``At`` 重复出现 ⇒ 只保留第一个；
-    - 钩子把唯一提及**改成别人/广播**（链上仍带提及）⇒ 重建一个规范的冻结
-      ``At`` 并置前；钩子把提及**显式删光**（链上再无 ``At``）⇒ 尊重删除，不补；
-    - ``Node``/``Nodes`` 合并转发容器递归处理：安全复制后清理嵌套提及，无法
-      安全重建的容器直接拦下，不涉提及的正常内容保持原样；
-    - ``image_only``（群聊开 @ 但没有可信目标、且有可用成品图）⇒ 只保留
-      ``image_allowlist`` 里本任务的成品图，文本/表情/他人图片全部过滤。
+    严格纯图（``image_only``：群聊开 @ 但没有可信目标、且有可用成品图）：
+    整条链**由冻结的本地成品重建** —— 只返回顶层 ``Image``，顺序按
+    ``image_allowlist``；链上已没有图片（钩子把成品图删光/清链）或白名单为空
+    时返回空列表（fail closed）。钩子注入的文本、别人的图、改过 ``url``/``file``
+    的组件以及 ``Node``/``Nodes`` 转发封套都不会出站。
+
+    其它情况：
+    - 丢弃链上所有旧 ``At``（顶层与容器内），再按需用新建的规范 ``At`` 统一
+      置前 —— 位置靠后的正确提及、``qq`` 带空白、被替换成别人/广播的提及都会
+      收敛成「冻结触发者、恰好一个、排在最前」；
+    - ``target`` 为空（私聊/关 @/身份无效/无冻结身份）⇒ 不补任何提及；
+    - 钩子把提及**显式删光**（链上再无 ``At``）⇒ 尊重删除，不补；
+    - 只有本次回包**带图片**，或调用方明确声明这是既有的终态通知上下文
+      （``mention_without_image=True``，主发路径）时才归一化提及：钩子经
+      ``event.send`` 旁发的一条纯文本不会被补成独立的 @ 提醒（t13 R2-02）；
+    - ``Node``/``Nodes`` 容器安全复制后递归清理嵌套提及，无法安全重建的容器
+      直接拦下，不涉提及的正常内容保持原样。
     """
-    allowlist = None if not image_allowlist else {_safe_str(item) for item in image_allowlist}
-    state = {"had_mention": False, "kept": False}
-    result: list = []
+    state = {"had_mention": False}
+    if image_only:
+        images = _frozen_product_images(image_allowlist)
+        if not images:
+            return []
+        if not any(_chain_has_image(component) for component in chain or ()):
+            # 钩子把成品图全删了：尊重清空，不用白名单把图"补"回去。
+            return []
+        return images
+
+    result = []
     for component in chain or ():
-        value = _scrub(
-            component, target=target, image_only=image_only, allowlist=allowlist, state=state
-        )
+        value = _scrub(component, target=target, state=state)
         if value is not None:
             result.append(value)
-    if state["had_mention"] and not state["kept"] and target and result:
-        # 只有「链上本来有提及、但没有任何合法目标提及存活」时才归一化重建；
-        # 纯文本/显式删光的链不会走到这里。
-        result = [At(qq=target), *result]
-        state["kept"] = True
-    return result
+    if not result or not target or not state["had_mention"]:
+        return result
+    if count_images(result) <= 0 and not mention_without_image:
+        return result
+    return [At(qq=target), *result]

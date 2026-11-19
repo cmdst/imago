@@ -1,6 +1,6 @@
 # 更新日志
 
-## 1.4.2（未发布开发候选）
+## 1.4.2（本地交付候选，未部署）
 
 **一句话**：在 1.4.1 候选（压缩 / 回吐闸 / 超时分层，尚未发布）之上补齐三处链路缺陷——群图 `@` 归属、Persona 绑定与图库读取、成功 attempt 的统一记账与终态观感。**不加配置键、不换 schema、不改默认值**。
 
@@ -8,7 +8,7 @@
 
 - **群图 `@` 归属与出站守门**：六个绘图入口（`/f画`、`/f拍照`、`/f画`/`/f拍照` 快捷命令、`generate_fusion_image`、`generate_fusion_persona_image`）在**第一次可能让出控制之前**（含 Persona 解析、引用消息与参考图下载）冻结不可变的发起人 / 会话 / 平台 / 结构化会话类型快照；建任务、查重、额度、Persona 解析与主动发送事件一律取自这份快照，不再从被钩子或后续事件改写的活事件回读。原先用 `":GroupMessage:" in umo` 猜群、直接用 `owner_user_id` 拼 `At` 的做法删除：群聊判定只看结构化会话类型，`@` 目标经适配器形状校验——OneBot 只接受正 ASCII 十进制 QQ 号，拒绝空/前后空白/`0`/`all`·`@all`·`全体成员` 等广播词/超长/不可打印字符；其它平台的不透明 ID（如 `-100123456`、`wxid_*@im.wechat`）不套纯数字规则，也不查真实群成员。
 - **装饰钩子与旁发同守门**：`ProactiveSender` 组装主动事件时不再读活事件的 `sender`；主发链与钩子里的 `event.send()` 旁发都过同一道提及守门——只保留冻结合法触发者**一个** `At`，钩子注入的别人、写入的广播/`AtAll`、重复提及全部拦掉；钩子**显式删除**提及则不补回。钩子 `stop` 且没有任何实际派发时不再记成功（`SendOutcome.success=False`，错误码 `StoppedWithoutSend`），避免调度器判成 `SUCCEEDED` 或据此误重发；清链但未 `stop` 仍按 `DecoratorSuppressed` 失败结算。群聊启用 `@` 但入站身份缺失/无效时，有图的成功回包是**静默纯图**（不补文字解释、不发假 `@`、也不因 `@` 失败丢图）；私聊与关闭 `@` 不新增提及，钩子也带不出。
-- **Persona 绑定一致性**：WebUI 上传把 `persona_id` 的取值从「读文件挂起之后」提前到**点击瞬间**，迟到回调不再把 A 的图写进已切换到的 B，也不再用旧请求的响应清空/重载新选人格的界面；`/f拍照`、`ref_upload` 与两个工具按宿主 resolver 的**最终有效人格**解析并精确绑定一次（`runtime["persona_source"]` 记 `umo_forced` / `conversation` / `runner_config` / `implicit_default` / `unknown`，`runtime["persona_alias"]` 是加盐 `sha256` 前 12 位，稳定、不可逆、不可枚举）。
+- **Persona 绑定一致性**：WebUI 上传把 `persona_id` 的取值从「读文件挂起之后」提前到**点击瞬间**，迟到回调不再把 A 的图写进已切换到的 B，也不再用旧请求的响应清空/重载新选人格的界面；`/f拍照`、`ref_upload` 与两个工具按宿主 resolver 的**最终有效人格**解析并精确绑定一次（`runtime["persona_source"]` 记 `umo_forced` / `conversation` / `runner_config` / `implicit_default` / `unknown`，`runtime["persona_alias"]` 是本机密钥派生的 `HMAC-SHA256` 前 12 位十六进制别名（密钥首次使用时以 0600 权限生成在插件数据目录，绝不写进代码、清单或日志；密钥读不出时退化为固定常量 `persona-unkeyed`，同样不可逆、不可枚举），因此稳定且不可枚举）。
 - **图库三态与逐腿实发**：`PersonaStore.scan_references()` 把**目录不存在 / 空库 / 枚举或读取失败**分开（历史 `list_references` 语义保留），读取失败按安全失败处理（0 次 provider 调用），不再静默伪装空库；显式参考图仍在最前、不受人格限额截断、原图不变。`_plan_attempt_request()` 让每个实际发往节点的腿独立记录显式/人格图数、有效 `limit` 与封闭原因（`ok` / `limit_unlimited` / `limit_covers_pool` / `limit_trimmed` / `limit_exhausted_by_explicit` / `library_missing` / `library_empty` / `library_error` / `no_persona_pool` / `text_fallback`）；文字降级腿的参考图计数**一律 0/0**（旧实现会把上一轮的值错报成 `persona_refs=1`）。
 - **成功 attempt 单一记账**：普通、切备用节点、切同节点备用模型、文字降级四条真实出图路径统一经 `_record_success()` 记录最终成功的节点 / 模型 / 模式（`normal` | `text_fallback`）与调度位置；`model_basis="dispatch"` 明示这是**调度器请求**的节点/模型，原生 Provider 无回执，不称远端实际模型。任务清单 `attempts.succeeded` 与终态 `INFO` 行来自同一份白名单投影（限长、脱敏、只含整数计数），旧两键记录仍可解析；终态行保留原有字段顺序后追加 `provider=<n>` 与 `success=<node>:<model>:<mode>:<route>`，`generate` 与 delivery 分列（`provider` vs `usable`/`delivery_ok`），`enhance`/`upscale` 信息行未改。适配器返回空列表不再被当成成功：`_generate` / `_text_stage` 统一抛 `NoOutputError`（走既有 `no_output` 分类，不触发安全判定），普通腿继续同节点下一个模型/下一个节点，文字腿按 `text_failed` 结束本节点。
 
@@ -18,10 +18,11 @@
 - `core/security.py` 新增 `safe_label()`（`redact` + URL/路径/控制符投影 + 折叠 + 截断），用于节点/模型标签的日志与清单投影；刻意不套用 `redact_debug` 的「6+ 位数字→`<id>`」规则，保留 `model-20250901` 这类标签。
 - 配置面**零新增**：12 组、默认值与 1.4.1 候选逐键一致；旧配置无需迁移。
 
-### 未验证（留 fix 侧真实链路）
+### 未验证（留 fix 侧真实链路；本候选未部署）
 
 - 以上三处都以**本地证据**为准：假平台/假适配器捕获的出站载荷、`adapter.generate` 实参、实际写出的 `task.json`、同 task 的终态 `INFO` 行。**没有**在线事故归因、真实群成员/@ 生效情况、真实 Provider 服务端接收，也未接真实模型/百度接口。
-- 历史任务（如 11-16 Ops 派单里的 `persona_pool=0`）无法还原当时有效 Persona 与实发张数；本轮只保证候选代码在这些路径上的取值与记录方式，不代表历史已解释。
+- 历史任务（如 11-16 Ops 派单里的 `persona_pool=0`）无法还原当时有效 Persona 与实发张数；
+- **交付状态**：本条只描述本地分支上的候选代码。**没有部署、没有重载、没有改动任何线上实例**；上线由 fix/人工按交付单执行，本节不声称线上版本已改变，也不改写既有线上记录。本轮只保证候选代码在这些路径上的取值与记录方式，不代表历史已解释。
 
 ## 1.4.1（未发布开发候选）
 

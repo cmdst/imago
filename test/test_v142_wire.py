@@ -54,6 +54,7 @@ def _mods():
 
     if not _cache:
         _ensure_real_astrbot()
+        from astrbot.core.message import components
         from astrbot.core.message.message_event_result import MessageChain
         from astrbot.core.platform.astr_message_event import AstrMessageEvent
         from astrbot.core.platform.astrbot_message import AstrBotMessage, Group, MessageMember
@@ -76,6 +77,7 @@ def _mods():
 
         _cache.update(
             MessageChain=MessageChain,
+            components=components,
             AstrMessageEvent=AstrMessageEvent,
             AstrBotMessage=AstrBotMessage,
             Group=Group,
@@ -518,6 +520,292 @@ class WireConcurrencyTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(task_a.state.is_terminal)
             self.assertTrue(task_b.state.is_terminal)
         await rig.close()
+
+
+
+class WireGuardTests(unittest.IsolatedAsyncioTestCase):
+    """t13 R2-01/02/03：真 OneBot 序列化后的成品字节、提及与投递记账。
+
+    这些用例一律走**真实命令入口 → 真调度器 → 真适配器序列化 → 假 bot**，
+    断言的是平台真正会收到的 JSON 段序列（``at`` / ``image`` / ``text`` 与图片
+    字节 digest），不是 ``context.outbound`` 里的组件对象。
+    """
+
+    async def _draw(self, rig, event, prompt="A 画一只猫"):
+        return await rig.done(await rig.draw(event, prompt))
+
+    async def test_strict_mode_ignores_hook_rewritten_image_url(self):
+        """R2-01 ①：钩子只改 ``Image.url`` 也换不掉实际出站的成品字节。
+
+        身份不可信（sender 带边缘空白）⇒ 严格纯图分支；钩子把成品图的 ``url``
+        指向另一张合成图，同时保留 ``path``/``file``。真 OneBot 用 ``url or file``
+        序列化，历史实现会把别人的图发出去；修复后只按冻结本地路径重建顶层
+        ``Image``，线上一律是本任务成品。
+        """
+
+        product = png_bytes(501)
+        other = png_bytes(502)
+        foreign = "data:image/png;base64," + base64.b64encode(other).decode()
+
+        async def response(conf, request):
+            return [_mods()["ImageResult"](data=product)]
+
+        async def decorating(event):
+            mods = _mods()
+            chain = list(event.get_result().chain or [])
+            for item in chain:
+                if isinstance(item, mods["components"].Image):
+                    item.url = foreign
+            event.get_result().chain = chain
+
+        with TemporaryDirectory() as directory, _Rig(Path(directory), response) as rig:
+            rig.hooks.before.append(_Handler(decorating))
+            event = rig.event(USER_A + " ")
+            task = await self._draw(rig, event)
+
+            self.assertEqual(len(rig.bot.out), 1)
+            frame = rig.bot.out[0]
+            self.assertEqual(frame.sequence, ("image",))
+            self.assertEqual(frame.at, ())
+            self.assertEqual(frame.pictures, (digest(product),))
+            self.assertEqual(frame.text, ())
+            self.assertEqual(task.runtime["mention_reason"], "invalid_format")
+            self.assertTrue(task.runtime["silent_image_only"])
+        await rig.close()
+
+    async def test_strict_mode_does_not_forward_node_envelopes(self):
+        """R2-01 ②：钩子把成品塞进 ``Node``/``Nodes`` 也不得走转发封套。"""
+
+        product = png_bytes(503)
+        other = png_bytes(504)
+
+        async def response(conf, request):
+            return [_mods()["ImageResult"](data=product)]
+
+        async def decorating(event):
+            mods = _mods()
+            components = mods["components"]
+            images = [
+                item
+                for item in event.get_result().chain or []
+                if isinstance(item, components.Image)
+            ]
+            images.append(components.Image.fromBytes(other))
+            event.get_result().chain = [
+                components.Nodes(
+                    nodes=[
+                        components.Node(
+                            content=[
+                                components.At(qq="all"),
+                                *images,
+                                components.Plain("forward text"),
+                            ]
+                        )
+                    ]
+                )
+            ]
+
+        with TemporaryDirectory() as directory, _Rig(Path(directory), response) as rig:
+            rig.hooks.before.append(_Handler(decorating))
+            task = await self._draw(rig, rig.event(USER_A + " "))
+
+            self.assertEqual(len(rig.bot.out), 1)
+            frame = rig.bot.out[0]
+            # 只有顶层成品图：没有转发容器、没有文本、没有提及、没有别人的图。
+            self.assertEqual(frame.sequence, ("image",))
+            self.assertEqual(frame.at, ())
+            self.assertEqual(frame.pictures, (digest(product),))
+            self.assertEqual(frame.text, ())
+            self.assertTrue(task.runtime["silent_image_only"])
+        await rig.close()
+
+    async def test_mention_moved_after_image_is_rebuilt_in_front(self):
+        """R2-02：正确的 At 被挪到图后，也要收敛成"新建 At、恰好一个、置前"。"""
+
+        payload = png_bytes(505)
+
+        async def response(conf, request):
+            return [_mods()["ImageResult"](data=payload)]
+
+        async def decorating(event):
+            mods = _mods()
+            components = mods["components"]
+            chain = list(event.get_result().chain or [])
+            mentions = [item for item in chain if isinstance(item, components.At)]
+            rest = [item for item in chain if not isinstance(item, components.At)]
+            event.get_result().chain = [*rest, *mentions]
+
+        with TemporaryDirectory() as directory, _Rig(Path(directory), response) as rig:
+            rig.hooks.before.append(_Handler(decorating))
+            await self._draw(rig, rig.event(USER_A))
+
+            self.assertEqual(len(rig.bot.out), 1)
+            frame = rig.bot.out[0]
+            self.assertEqual(_without_spacers(frame.sequence), ("at", "image"))
+            self.assertEqual(frame.at, (USER_A,))
+            self.assertEqual(frame.pictures, (digest(payload),))
+        await rig.close()
+
+    async def test_mention_with_trailing_blank_is_rebuilt_canonically(self):
+        """R2-02：钩子把 ``At.qq`` 改成「A + 尾空白」也不得原样透给 wire。"""
+
+        payload = png_bytes(506)
+
+        async def response(conf, request):
+            return [_mods()["ImageResult"](data=payload)]
+
+        async def decorating(event):
+            mods = _mods()
+            for item in event.get_result().chain or []:
+                if isinstance(item, mods["components"].At):
+                    item.qq = USER_A + " "
+
+        with TemporaryDirectory() as directory, _Rig(Path(directory), response) as rig:
+            rig.hooks.before.append(_Handler(decorating))
+            await self._draw(rig, rig.event(USER_A))
+
+            self.assertEqual(len(rig.bot.out), 1)
+            frame = rig.bot.out[0]
+            self.assertEqual(frame.at, (USER_A,))
+            self.assertEqual(_without_spacers(frame.sequence), ("at", "image"))
+        await rig.close()
+
+    async def test_text_only_hook_side_send_creates_no_mention_or_extra_frame(self):
+        """R2-02：钩子纯文本旁发不得被补成独立的 @ 提醒（一条旁发帧、无 at）。"""
+
+        payload = png_bytes(507)
+
+        async def response(conf, request):
+            return [_mods()["ImageResult"](data=payload)]
+
+        async def decorating(event):
+            mods = _mods()
+            await event.send(
+                mods["MessageChain"](
+                    chain=[
+                        mods["components"].At(qq="999999"),
+                        mods["components"].Plain("side text"),
+                    ]
+                )
+            )
+
+        with TemporaryDirectory() as directory, _Rig(Path(directory), response) as rig:
+            rig.hooks.before.append(_Handler(decorating))
+            await self._draw(rig, rig.event(USER_A))
+
+            self.assertEqual(len(rig.bot.out), 2)
+            side, main = rig.bot.out
+            self.assertEqual(side.at, ())
+            self.assertEqual(side.pictures, ())
+            self.assertEqual(side.text, ("side text",))
+            self.assertEqual(main.at, (USER_A,))
+            self.assertEqual(main.pictures, (digest(payload),))
+        await rig.close()
+
+    async def test_rejected_main_send_reports_zero_dispatched_images(self):
+        """R2-03：适配器拒绝（返回 False）时不得把"尝试"记成"已提交"。"""
+
+        payload = png_bytes(508)
+
+        async def response(conf, request):
+            return [_mods()["ImageResult"](data=payload)]
+
+        async def refuse(*args, **kwargs):
+            return False
+
+        with TemporaryDirectory() as directory, _Rig(Path(directory), response) as rig:
+            with patch.object(rig.plugin.context, "send_message", new=refuse):
+                task = await self._draw(rig, rig.event(USER_A))
+
+            self.assertEqual(rig.bot.out, [])
+            self.assertEqual(task.runtime["image_delivery_dispatched_images"], 0)
+            self.assertFalse(task.runtime["image_delivery_success"])
+            self.assertEqual(task.state.value, "delivery_failed")
+
+        await rig.close()
+
+    async def test_side_image_after_main_chain_clear_is_not_zero_delivery(self):
+        """R2-03 反向：旁发已送出成品图，主链被清空不得冒充零投递。"""
+
+        payload = png_bytes(509)
+        side_payload = png_bytes(510)
+
+        async def response(conf, request):
+            return [_mods()["ImageResult"](data=payload)]
+
+        async def decorating(event):
+            mods = _mods()
+            await event.send(
+                mods["MessageChain"](
+                    chain=[mods["components"].Image.fromBytes(side_payload)]
+                )
+            )
+            event.get_result().chain = []
+
+        with TemporaryDirectory() as directory, _Rig(Path(directory), response) as rig:
+            rig.hooks.before.append(_Handler(decorating))
+            task = await self._draw(rig, rig.event(USER_A))
+
+            self.assertEqual(len(rig.bot.out), 1)
+            self.assertEqual(rig.bot.out[0].pictures, (digest(side_payload),))
+            self.assertEqual(task.runtime["image_delivery_dispatched_images"], 1)
+            self.assertTrue(task.runtime["image_delivery_success"])
+            self.assertTrue(task.runtime["image_delivery_main_suppressed"])
+        await rig.close()
+
+    async def test_text_only_main_chain_gets_no_mention(self):
+        """R2-02：任务出了图、钩子却把主链换成纯文本 ⇒ 不补 @，也不算送图成功。"""
+
+        payload = png_bytes(512)
+
+        async def response(conf, request):
+            return [_mods()["ImageResult"](data=payload)]
+
+        async def decorating(event):
+            mods = _mods()
+            event.get_result().chain = [mods["components"].Plain("textonly")]
+
+        with TemporaryDirectory() as directory, _Rig(Path(directory), response) as rig:
+            rig.hooks.before.append(_Handler(decorating))
+            task = await self._draw(rig, rig.event(USER_A))
+
+            self.assertEqual(len(rig.bot.out), 1)
+            frame = rig.bot.out[0]
+            self.assertEqual(frame.at, ())
+            self.assertEqual(frame.pictures, ())
+            self.assertEqual(frame.text, ("textonly",))
+            self.assertEqual(task.runtime["image_delivery_dispatched_images"], 0)
+            self.assertFalse(task.runtime["image_delivery_success"])
+            self.assertEqual(task.state.value, "delivery_failed")
+        await rig.close()
+
+    async def test_every_path_empty_is_still_a_delivery_failure(self):
+        """R2-03：主链清空且全路无发，仍必须失败（不得记成功）。"""
+
+        payload = png_bytes(511)
+
+        async def response(conf, request):
+            return [_mods()["ImageResult"](data=payload)]
+
+        async def decorating(event):
+            event.get_result().chain = []
+
+        with TemporaryDirectory() as directory, _Rig(Path(directory), response) as rig:
+            rig.hooks.before.append(_Handler(decorating))
+            task = await self._draw(rig, rig.event(USER_A))
+
+            self.assertEqual(rig.bot.out, [])
+            self.assertEqual(task.runtime["image_delivery_dispatched_images"], 0)
+            self.assertFalse(task.runtime["image_delivery_success"])
+            self.assertEqual(task.state.value, "delivery_failed")
+        await rig.close()
+
+
+class _Handler:
+    """最小 handler 替身：``_run_hooks`` 只取 ``.handler`` 并 await 其返回值。"""
+
+    def __init__(self, handler):
+        self.handler = handler
 
 
 if __name__ == "__main__":  # pragma: no cover

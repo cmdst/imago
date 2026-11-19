@@ -1976,11 +1976,19 @@ class ImagoFusion(Star):
             identity=identity,
             mention_target=mention_target,
             image_only=silent_image_only,
+            mention_needs_image=bool(generation_success),
             image_allowlist=[str(path) for path in output_paths],
         )
         # 主发送流程已结束（无论成败）：超时补发通知以此为准，避免平台实际
         # 已收到主消息后又被终态通知重复打扰。
         task.runtime["runner_send_completed"] = True
+        # 「尝试交给适配器」与「适配器已接受」分开记（t13 R2-03）：只有后者能算
+        # 投递；主链被钩子清空作为独立观察保留，不用它冒充零投递。
+        attempted_images = int(getattr(send_outcome, "attempted_image_count", 0) or 0)
+        task.runtime[f"{delivery_prefix}_attempted_images"] = attempted_images
+        task.runtime[f"{delivery_prefix}_main_suppressed"] = bool(
+            getattr(send_outcome, "main_suppressed", False)
+        )
         dispatched_images = int(getattr(send_outcome, "dispatched_image_count", 0) or 0)
         task.runtime[f"{delivery_prefix}_dispatched_images"] = dispatched_images
         delivery_success = send_outcome.success

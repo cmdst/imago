@@ -675,8 +675,11 @@ class MentionOutboundTests(_PluginHarness, unittest.IsolatedAsyncioTestCase):
         self.assertTrue(outcome.success, outcome.error)
         self.assertTrue(outcome.side_send_started)
         self.assertEqual(len(outbound), 2)
-        # 旁发被改写的提及不再放行，而是归一成唯一的规范冻结 At（R1-03）。
-        self.assertEqual(_at_targets(outbound[0]), ["1001"])
+        # 纯文本旁发：钩子注入的提及被丢弃，也不会被补成一条独立的 @ 提醒
+        # （t13 R2-02：没带成品图的 hook 旁发不得凭空 @ 人）。
+        self.assertEqual(_at_targets(outbound[0]), [])
+        self.assertEqual([type(item).__name__ for item in outbound[0]], ["Plain"])
+        # 主发仍然是唯一的规范冻结 At。
         self.assertEqual(_at_targets(outbound[1]), ["1001"])
 
     async def test_stop_without_any_send_is_not_success(self):
@@ -781,7 +784,9 @@ class MentionOutboundTests(_PluginHarness, unittest.IsolatedAsyncioTestCase):
 
         self.assertTrue(outcome.success, outcome.error)
         self.assertEqual(len(outbound), 2)
-        self.assertEqual(_at_targets(outbound[1]), ["1001"])
+        # after 钩子的纯文本旁发同样不得带出任何提及（广播 AtAll 也被丢弃）。
+        self.assertEqual(_at_targets(outbound[1]), [])
+        self.assertEqual(_at_targets(outbound[0]), ["1001"])
 
 
     async def test_hook_removing_all_mentions_is_respected(self):
@@ -1255,29 +1260,54 @@ class P0FollowupTests(_PluginHarness, unittest.IsolatedAsyncioTestCase):
         mentions = [qq for document in payload for qq in walk(document)]
         self.assertEqual(mentions, ["1001"])
 
-    async def test_forwarded_nodes_in_silent_mode_keep_images_only(self):
+    async def test_silent_mode_rebuilds_only_frozen_top_level_images(self):
+        """严格纯图只发冻结本地产物重建的顶层 Image（t13 R2-01）。
+
+        钩子把成品塞进 ``Node``/``Nodes``、再往容器里掺广播提及与文本时：
+        出站**不得**出现转发封套（``send_group_forward_msg`` 会连带 node/name/
+        user_id 元数据），也不得带任何文本/提及；图片只能是冻结路径重建的那张。
+        没给白名单（或白名单为空）时必须 fail closed，一个组件都不发。
+        """
+
         components = _mods()["components"]
-        image = components.Image.fromBytes(png_bytes(36))
-        forward = components.Nodes(
-            nodes=[components.Node(content=[components.At(qq="all"), image, components.Plain("x")])]
-        )
+        with TemporaryDirectory() as directory:
+            product = Path(directory) / "product.png"
+            product.write_bytes(png_bytes(36))
+            forward = components.Nodes(
+                nodes=[
+                    components.Node(
+                        content=[
+                            components.At(qq="all"),
+                            components.Image.fromBytes(png_bytes(99)),
+                            components.Plain("x"),
+                        ]
+                    )
+                ]
+            )
+            cleaned = self.route.sanitize_chain(
+                [forward],
+                target="",
+                image_only=True,
+                image_allowlist=[str(product)],
+            )
+            payload = [await item.to_dict() for item in cleaned]
+            # 白名单为空 / 未提供：fail closed，不猜、不透传链上的图。
+            self.assertEqual(
+                self.route.sanitize_chain(
+                    [forward], target="", image_only=True, image_allowlist=None
+                ),
+                [],
+            )
 
-        cleaned = self.route.sanitize_chain([forward], target="", image_only=True, image_allowlist=None)
-        payload = [await item.to_dict() for item in cleaned]
-
-        def types(value):
-            if isinstance(value, dict):
-                if "type" in value and isinstance(value["type"], str):
-                    yield value["type"]
-                for item in value.values():
-                    yield from types(item)
-            elif isinstance(value, list):
-                for item in value:
-                    yield from types(item)
-
-        kinds = [kind for document in payload for kind in types(document)]
-        self.assertIn("image", kinds)
+        self.assertEqual([item.get("type") for item in payload], ["image"])
+        kinds = [item.get("type") for item in payload]
+        self.assertNotIn("node", kinds)
+        self.assertNotIn("nodes", kinds)
         self.assertNotIn("text", kinds)
+        self.assertNotIn("at", kinds)
+        # 出站来源是冻结的本地成品文件，而不是链上那个「别人的图」。
+        self.assertEqual(cleaned[0].path, str(product))
+        self.assertIn("product.png", str(payload[0]["data"]["file"]))
 
     # ── R1-05 派发图片计数：只有文字不算送图成功 ────────────────────────
 

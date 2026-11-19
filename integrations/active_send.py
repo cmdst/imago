@@ -26,9 +26,17 @@ class SendOutcome:
     generation_success: bool | None = None
     usable_output_count: int | None = None
     delivery_kind: str = ""
-    # 经过守门过滤、**真正交给适配器序列化**的图片数（主发 + 成功旁发）。
-    # 它是「派发」事实，不是成员实际收件；图片任务若为 0 不得记送图成功。
+    # 守门过滤后**曾尝试**交给适配器的图片数（主发 + 旁发，含随后被适配器
+    # 拒绝的那部分）。它与下面的「已提交」分开，便于排障时区分"尝试过"与
+    # "真的交出去了"（t13 R2-03）。
+    attempted_image_count: int = 0
+    # 适配器 `send_message` 返回 True **之后**才累加的图片数（主发 + 成功旁发）。
+    # 它是「已提交给平台适配器」的事实，不是成员实际收件；图片任务若为 0 不得
+    # 记送图成功。
     dispatched_image_count: int = 0
+    # 主链被装饰链清空/过滤为空（但没有旁发成功）：作为独立观察保留，不用它
+    # 冒充"零投递"，也不据此误重发。
+    main_suppressed: bool = False
 
 
 class _ProactiveMessageEvent(AstrMessageEvent):
@@ -59,7 +67,11 @@ class _ProactiveMessageEvent(AstrMessageEvent):
         self._side_send_started = False
         self._side_send_error = ""
         self._side_suppressed = False
+        self._side_image_attempted = 0
         self._side_image_count = 0
+        # 旁发上下文：只有带图片的旁发才允许归一化提及（纯文本 hook 不得被补成
+        # 一条独立的 @ 提醒，t13 R2-02）。
+        self._mention_needs_image = True
         super().__init__(
             message_str="",
             message_obj=message_obj,
@@ -84,6 +96,7 @@ class _ProactiveMessageEvent(AstrMessageEvent):
             target=self._mention_target,
             image_only=self._image_only,
             image_allowlist=self._image_allowlist,
+            mention_without_image=not self._mention_needs_image,
         )
         if not sanitized:
             if self._image_only:
@@ -94,8 +107,10 @@ class _ProactiveMessageEvent(AstrMessageEvent):
             # 整条旁发只剩非法提及：没有任何可安全投递的内容，不得静默算成功。
             self._side_send_error = "NoSendableComponents"
             raise RuntimeError(self._side_send_error)
-        self._side_send_started = True
-        self._side_image_count += count_images(sanitized)
+        # 先记"尝试"，等适配器真的接受了整条链，再把它计入"已提交"（R2-03）：
+        # `send_message` 返回 False 或抛异常时 `_side_image_count` 不得虚增。
+        attempted = count_images(sanitized)
+        self._side_image_attempted += attempted
         outbound = MessageChain(chain=sanitized)
         try:
             sent = await self._context.send_message(self._outbound_session, outbound)
@@ -105,6 +120,8 @@ class _ProactiveMessageEvent(AstrMessageEvent):
         if not sent:
             self._side_send_error = "PlatformNotFound"
             raise RuntimeError(self._side_send_error)
+        self._side_send_started = True
+        self._side_image_count += attempted
         await super().send(outbound)
 
     @property
@@ -134,6 +151,18 @@ class _ProactiveMessageEvent(AstrMessageEvent):
     @property
     def side_image_count(self) -> int:
         return self._side_image_count
+
+    @property
+    def side_image_attempted(self) -> int:
+        return self._side_image_attempted
+
+    @property
+    def mention_needs_image(self) -> bool:
+        return self._mention_needs_image
+
+    @mention_needs_image.setter
+    def mention_needs_image(self, value: bool) -> None:
+        self._mention_needs_image = bool(value)
 
 
 class ProactiveSender:
@@ -256,8 +285,15 @@ class ProactiveSender:
         mention_target: str = "",
         image_only: bool = False,
         image_allowlist=None,
+        mention_needs_image: bool = False,
     ) -> SendOutcome:
-        """主动发送适配：装饰链 → 提及守门 → 发送 → after 钩子。"""
+        """主动发送适配：装饰链 → 提及守门 → 发送 → after 钩子。
+
+        ``mention_needs_image`` 只作用于**主发**：任务本身出了成品图时置真——此时
+        主链若被钩子改成纯文本，不得凭空补一条 @ 提醒；任务本身没有图（失败/超时/
+        回吐等既有终态通知）时置假，沿用原有的"通知带 @ 触发者"语义。
+        旁发（``event.send``）恒为"必须带图"，见 ``_ProactiveMessageEvent``。
+        """
         try:
             event = self.build_event(
                 umo,
@@ -289,40 +325,48 @@ class ProactiveSender:
         result = event.get_result()
         # 装饰链与主发共用同一套提及策略：只保留冻结触发者的一个 At，别的 At
         # （注入/篡改/广播/重复）在这里统一拦掉；钩子删掉的提及不会被补回。
+        event.mention_needs_image = bool(mention_needs_image)
         processed = sanitize_chain(
             list(getattr(result, "chain", None) or []),
             target=event.mention_target,
             image_only=event.image_only,
             image_allowlist=event.image_allowlist,
+            mention_without_image=not event.mention_needs_image,
         )
         self.debug(
             "[ImagoFusion] 主动发送装饰完成 components=%d stopped=%s",
             len(processed),
             event.is_stopped(),
         )
+        main_attempted = count_images(processed)
+        main_sent = False
+        main_suppressed = False
         error = ""
-        success = True
-        main_image_count = count_images(processed)
         if processed:
             event.begin_send_stage()
             try:
-                success = bool(
+                main_sent = bool(
                     await self.context.send_message(umo, MessageChain(chain=processed))
                 )
-                if not success:
+                if not main_sent:
                     error = "PlatformNotFound"
             except Exception as exc:
-                success = False
+                main_sent = False
                 error = type(exc).__name__
                 self.logger("主动消息发送异常", exc)
         else:
-            # 装饰链把结果清空但未 stop_event：没有任何内容可发，不得记成功。
-            success = False
+            # 装饰链把结果清空但未 stop_event：主链没有任何内容可发。这是**主链
+            # 抑制**，作为独立观察保留；是否算投递失败要看旁发有没有真的送出。
+            main_suppressed = True
             error = "EmptyAfterFilter" if event.image_only else "DecoratorSuppressed"
         await self._run_hooks(event, EventType.OnAfterMessageSentEvent)
+        side_committed = bool(event.side_send_started and not event.side_send_error)
         if event.side_send_error:
-            success = False
-            error = error or f"SideSend:{event.side_send_error}"
+            error = f"{error};SideSend:{event.side_send_error}" if error else f"SideSend:{event.side_send_error}"
+        # 已提交 = 主链适配器接受，或旁发真的发出去过。真正"全路无发"才算失败：
+        # 旁发已送出成品图时，主链被钩子清空不得冒充零投递（t13 R2-03）。
+        success = bool(main_sent or side_committed)
+        dispatched = (main_attempted if main_sent else 0) + event.side_image_count
         self.debug("[ImagoFusion] 主动发送结束 success=%s error=%s", success, error or "none")
         return SendOutcome(
             success,
@@ -330,5 +374,7 @@ class ProactiveSender:
             side_effects_started=True,
             side_send_started=event.side_send_started,
             side_send_error=event.side_send_error,
-            dispatched_image_count=main_image_count + event.side_image_count,
+            attempted_image_count=main_attempted + event.side_image_attempted,
+            dispatched_image_count=dispatched,
+            main_suppressed=main_suppressed,
         )
