@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import time
 from contextlib import contextmanager
 from contextvars import ContextVar
@@ -294,4 +295,91 @@ def as_manifest(entries: Any) -> list[dict]:
         cleaned.append({key: entry.get(key) for key in (
             "provider_id", "model", "phase", "elapsed", "up_bytes", "timeout", "error_type", "status"
         )})
+    return cleaned
+
+
+# --------------------------------------------------- Persona 观测投影（v1.4.2 C-PERSONA）
+# 值域封闭：来源/图库状态都是有限枚举，"不可判定"必须显式标 ``unknown``，不许猜。
+PERSONA_SOURCE_UMO = "umo_forced"
+PERSONA_SOURCE_CONVERSATION = "conversation"
+PERSONA_SOURCE_RUNNER = "runner_config"
+PERSONA_SOURCE_IMPLICIT = "implicit_default"
+PERSONA_SOURCE_UNKNOWN = "unknown"
+PERSONA_SOURCES = (
+    PERSONA_SOURCE_UMO,
+    PERSONA_SOURCE_CONVERSATION,
+    PERSONA_SOURCE_RUNNER,
+    PERSONA_SOURCE_IMPLICIT,
+    PERSONA_SOURCE_UNKNOWN,
+)
+
+PERSONA_LIBRARY_OK = "ok"
+PERSONA_LIBRARY_EMPTY = "empty"
+PERSONA_LIBRARY_MISSING = "missing"
+PERSONA_LIBRARY_ERROR = "error"
+PERSONA_LIBRARY_STATES = (
+    PERSONA_LIBRARY_OK,
+    PERSONA_LIBRARY_EMPTY,
+    PERSONA_LIBRARY_MISSING,
+    PERSONA_LIBRARY_ERROR,
+)
+
+#: 别名域前缀：换前缀即等于换一整套别名（旧日志不再能和新日志关联）。
+_PERSONA_ALIAS_SALT = "imago-fusion/persona-alias/v1"
+_PERSONA_ALIAS_HEX = 12
+#: 外部标签（节点 id / 模型名）的投影上限，防止异常长的配置值撑爆日志与 task.json。
+MAX_LABEL_CHARS = 48
+
+
+def persona_alias(persona_id: Any) -> str:
+    """把 Persona 原始 ID 投影成**稳定、不可逆、不可枚举**的观测别名。
+
+    稳定 ⇒ 同一 ID 跨任务/跨重启得到同一别名，日志可关联；不可逆 ⇒ 只暴露
+    ``sha256(域前缀 ‖ ID)`` 的前 48 bit，不留可还原片段；不可枚举 ⇒ 空值单独成
+    ``persona-none``，且**禁止**用图库目录名（可逆编码）冒充别名（验收 t3）。
+
+    Args:
+        persona_id: 宿主解析出来的 Persona 标识；空/None 视为"无"。
+
+    Returns:
+        形如 ``persona-1a2b3c4d5e6f`` 的短别名。
+    """
+    text = str(persona_id or "")
+    if not text:
+        return "persona-none"
+    digest = hashlib.sha256(f"{_PERSONA_ALIAS_SALT}:{text}".encode("utf-8")).hexdigest()
+    return f"persona-{digest[:_PERSONA_ALIAS_HEX]}"
+
+
+def safe_label(value: Any) -> str:
+    """节点/模型等**外部标签**的安全投影：先脱敏（URL/路径/长数字/凭据），再截断。"""
+    text = redact_debug(str(value or "")).strip()
+    text = "".join(char for char in text if char.isprintable())
+    return text[:MAX_LABEL_CHARS]
+
+
+def as_reference_plans(entries: Any, *, limit: int = MAX_DIAGNOSTIC_ENTRIES) -> list[dict]:
+    """把 runtime 里的"逐腿参考图实发计划"整理成可写入 ``task.json`` 的有界形状。
+
+    只投影固定键（节点/模型标签过 :func:`safe_label`），不落任何 Persona 原始 ID、
+    账号、会话、消息 ID、图片内容或本地路径。
+    """
+    if not isinstance(entries, list):
+        return []
+    cleaned: list[dict] = []
+    for entry in entries[-limit:]:
+        if not isinstance(entry, dict):
+            continue
+        cleaned.append({
+            "node": safe_label(entry.get("node")),
+            "model": safe_label(entry.get("model")),
+            "kind": str(entry.get("kind") or "")[:16],
+            "reference_limit": max(0, int(entry.get("reference_limit", 0) or 0)),
+            "explicit_sent": max(0, int(entry.get("explicit_sent", 0) or 0)),
+            "persona_sent": max(0, int(entry.get("persona_sent", 0) or 0)),
+            "persona_pool": max(0, int(entry.get("persona_pool", 0) or 0)),
+            "persona_budget": max(0, int(entry.get("persona_budget", 0) or 0)),
+            "library": str(entry.get("library") or "")[:16],
+            "reason": str(entry.get("reason") or "")[:32],
+        })
     return cleaned

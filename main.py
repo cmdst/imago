@@ -74,6 +74,7 @@ from .core.security import parse_extra_params, redact, redact_debug
 from .integrations.active_send import ProactiveSender, SendOutcome
 from .integrations.chat_memory_context import load_chat_memory_context_state
 from .integrations.web_api import PageAPI
+from .services import persona_store
 from .services.persona_store import PersonaStore
 from .services.quota_store import QuotaStore, terminal_refund_amount
 from .services.scheduler import (
@@ -534,6 +535,22 @@ class ImagoFusion(Star):
         return self.store.set_summary(persona_id, prompt, summary, manual=False, reference_names=names)["summary"]
 
     async def _resolve_persona(self, event, identity: RouteIdentity | None = None):
+        """兼容入口：仍返回 ``(persona_id, prompt)``，供只关心这两项的调用方使用。"""
+        persona_id, prompt, _source = await self._resolve_persona_detail(
+            event, identity=identity
+        )
+        return persona_id, prompt
+
+    async def _resolve_persona_detail(self, event, identity: RouteIdentity | None = None):
+        """按宿主 resolver 的真实规则解析 Persona，并标注**来源**（值域封闭）。
+
+        来源只用于观测（``人格图库 ... source=`` 与 ``runtime["persona_source"]``）：
+        ``umo_forced`` = UMO 层显式指定（含 ``[%None]`` 禁用，此时后续一定取不到
+        prompt 而安全失败）；``conversation`` = 会话覆盖；``runner_config`` = 命中
+        runner 配置；``implicit_default`` = 宿主 implicit 默认；其余一律 ``unknown``
+        而**不猜**。来源判定只依据本函数亲自拿到的入参，不依据 resolver 的第二/第三
+        返回值（宿主在不同版本里对它们的含义不一致）。
+        """
         manager = getattr(self.context, "persona_manager", None)
         resolver = getattr(manager, "resolve_selected_persona", None)
         if not callable(resolver): raise ValueError("当前 AstrBot 不支持 Persona 正式解析")
@@ -564,11 +581,31 @@ class ImagoFusion(Star):
             )
         except Exception:
             provider_settings = {}
-        persona_id, persona, _, _ = await resolver(
+        forced_persona_id = None
+        webchat_default = False
+        try:
+            session_config = self.context.get_config(umo=umo) or {}
+            session_block = session_config.get("session_service_config")
+            if isinstance(session_block, dict):
+                forced_persona_id = session_block.get("persona_id") or None
+        except Exception:
+            forced_persona_id = None
+        persona_id, persona, host_forced, host_webchat = await resolver(
             umo=umo,
             conversation_persona_id=conversation_persona_id,
             platform_name=identity.platform_name or event.get_platform_name(),
             provider_settings=provider_settings,
+        )
+        if forced_persona_id is None and host_forced:
+            # 插件侧没读到会话 UMO 配置（不同宿主版本落点不同）时，用 resolver 自己
+            # 报的 force 值补齐来源判定 —— 只用于分类，不参与 persona_id 选择。
+            forced_persona_id = host_forced
+        if isinstance(host_webchat, bool):
+            webchat_default = host_webchat
+        source = self._persona_source(
+            forced_persona_id=forced_persona_id,
+            conversation_persona_id=conversation_persona_id,
+            webchat_default=webchat_default,
         )
         persona_id = str(persona_id or "")
         prompt = str(
@@ -576,7 +613,18 @@ class ImagoFusion(Star):
             or (persona.get("prompt", "") if isinstance(persona, dict) else "")
         )
         if not persona_id or not prompt: raise ValueError("Persona 不存在或 prompt 为空")
-        return persona_id, prompt
+        return persona_id, prompt, source
+
+    @staticmethod
+    def _persona_source(*, forced_persona_id=None, conversation_persona_id=None, webchat_default=False) -> str:
+        """把"谁选的人格"归到封闭值域；判不出就 ``unknown``，绝不臆测。"""
+        if forced_persona_id:
+            return attempt_diagnostics.PERSONA_SOURCE_UMO
+        if conversation_persona_id:
+            return attempt_diagnostics.PERSONA_SOURCE_CONVERSATION
+        if webchat_default:
+            return attempt_diagnostics.PERSONA_SOURCE_IMPLICIT
+        return attempt_diagnostics.PERSONA_SOURCE_RUNNER
 
     async def _submit(self, event, prompt: str, *, persona=False, resolved_persona=None, count=1, aspect_ratio="", size="", extra_params="", style="", plain_draw_tool=False, identity: RouteIdentity | None = None):
         """创建后台绘图/Persona 图片任务。
@@ -671,8 +719,19 @@ class ImagoFusion(Star):
         task.runtime["plain_draw_tool"] = bool(plain_draw_tool)
         if persona:
             if resolved_persona is None:
-                resolved_persona = await self._resolve_persona(event, identity=identity)
-            task.persona_id, task.persona_prompt = resolved_persona
+                resolved_persona = await self._resolve_persona_detail(
+                    event, identity=identity
+                )
+            # 兼容 2 元组（老调用方）与 3 元组（带来源）：**精确绑定一次**，
+            # 之后建任务/查重/额度/主动事件一律用 task.persona_id，不重读活事件。
+            task.persona_id = str(resolved_persona[0] or "")
+            task.persona_prompt = str(resolved_persona[1] or "")
+            task.runtime["persona_source"] = (
+                str(resolved_persona[2])
+                if len(resolved_persona) > 2 and resolved_persona[2]
+                else attempt_diagnostics.PERSONA_SOURCE_UNKNOWN
+            )
+            task.runtime["persona_alias"] = attempt_diagnostics.persona_alias(task.persona_id)
         charged = 0
         if task.owner_user_id:
             try:
@@ -1115,11 +1174,23 @@ class ImagoFusion(Star):
                     style=resolved_style,
                     fallback_suffix=True,
                 )
+            # v1.4.2 C-PERSONA：人格图库**只读本 Persona 的目录**（不搬旧图、不跨
+            # 人格借库、不改原图），并把"缺目录 / 空库 / 读取失败"三者分开：
+            # 前两者是正常"没有图"，读取失败必须让任务安全失败（0 provider calls），
+            # 不许静默伪装成空库（t3 验收）。
+            scan = self.store.scan_references(task.persona_id)
+            task.runtime["persona_library_status"] = scan.status
+            task.runtime["persona_reference_pool"] = scan.pool
+            task.runtime["persona_reference_skipped"] = int(scan.skipped)
+            task.runtime["persona_alias"] = attempt_diagnostics.persona_alias(task.persona_id)
+            if scan.status == persona_store.REFERENCE_STATUS_ERROR:
+                raise persona_store.PersonaReferenceError(scan.reason or "enum_failed")
             persona_references = []
-            for ref in self.store.list_references(task.persona_id):
-                path = self.store.reference_path(task.persona_id, str(ref["name"]))
-                mime = {".png":"image/png",".jpg":"image/jpeg",".webp":"image/webp",".gif":"image/gif"}.get(path.suffix.lower(), "image/png")
-                persona_references.append(ImageInput(path.read_bytes(), mime, path.name))
+            for entry in scan.entries:
+                name = str(entry["name"])
+                data = self.store.read_reference(task.persona_id, name)
+                mime = {".png":"image/png",".jpg":"image/jpeg",".webp":"image/webp",".gif":"image/gif"}.get(Path(name).suffix.lower(), "image/png")
+                persona_references.append(ImageInput(data, mime, Path(name).name))
             task.runtime["persona_references"] = persona_references
         elif use_optimizer:
             # 普通绘图经副脑（generate_fusion_image 且「普通绘图也走副脑」开启，见
@@ -1189,6 +1260,20 @@ class ImagoFusion(Star):
             len(task.runtime.get("persona_references", [])),
             sum(len(item.data) for item in [*task.request.references, *task.runtime.get("persona_references", [])]),
         )
+        if task.persona_id:
+            # 人格观测一行：只放稳定脱敏别名、解析来源、图库状态与**可读池**张数。
+            # 明确不是"实发"——逐节点实发在 ``绘图节点尝试`` 的 explicit/persona/
+            # pool/limit/reason 字段，两者不可互相冒充（t3 验收）。
+            logger.info(
+                "%s task=%s 人格图库 alias=%s source=%s status=%s pool=%d skipped=%d",
+                self._log_prefix(task.runtime.get("source_event")),
+                task.id[:8],
+                task.runtime.get("persona_alias") or attempt_diagnostics.persona_alias(task.persona_id),
+                task.runtime.get("persona_source") or attempt_diagnostics.PERSONA_SOURCE_UNKNOWN,
+                task.runtime.get("persona_library_status", attempt_diagnostics.PERSONA_LIBRARY_MISSING),
+                int(task.runtime.get("persona_reference_pool", 0) or 0),
+                int(task.runtime.get("persona_reference_skipped", 0) or 0),
+            )
         if cfg.llm_caption and cfg.llm_caption_pregen:
             # 图片 Provider 请求期间并行预生成成功版配文；失败时 _finish_task 取消，
             # 未完成时 _finalize_task 兜底清理。
@@ -1610,12 +1695,16 @@ class ImagoFusion(Star):
                 echo_guard.summarize(echo_state),
             )
         elif isinstance(echo_state, dict) and "references_sent" in echo_state:
-            # 闸门跑了但这一轮没发参考图（纯文字请求）：显式说明"不需要比"。
+            # 闸门跑了但这一轮**没有可比对的对象**（纯文字请求，references_sent=0）：
+            # 显式标"未比较"——这一行既不是"检查通过"，也不是"放行 N 张"。
+            # 历史实现只打 ``检查=0 拦下=0 放行=0 未知=0``，读者容易误读成"比过了、
+            # 全放行"；``references_sent=`` 子串保留（既有回归按它断言）。
             logger.info(
-                "%s task=%s %s references_sent=0",
+                "%s task=%s %s references_sent=%d 未比较",
                 self._log_prefix(task.runtime.get("source_event")),
                 task.id[:8],
                 echo_guard.summarize(echo_state),
+                int(echo_state.get("references_sent", 0) or 0),
             )
         if echo_blocked:
             # ``no_change`` 是唯一新增 marker（每任务最多一条）：混合回吐靠它把终态
@@ -1918,9 +2007,46 @@ class ImagoFusion(Star):
                 # references_sent=0 表示"这一轮压根没发参考图"，运维据此区分
                 # "不需要比"与"闸门没跑"（验收 10）。
                 "references_sent": int(echo_state.get("references_sent", 0) or 0),
+                # compared=False 表示"这一轮没有可比对对象"（纯文字），与
+                # checked>0 的"比过且全放行"必须能分开读。
+                "compared": int(echo_state.get("checked", 0) or 0) > 0,
                 "no_change": bool(echo_state.get("no_change", False)),
                 "blocked_files": list(echo_state.get("blocked_files") or [])[:12],
             }
+        # ── v1.4.2 C-PERSONA：人格绑定/图库/逐腿实发观测（与 INFO 同源） ──
+        if task.persona_id:
+            manifest_extra["persona"] = {
+                "alias": str(
+                    task.runtime.get("persona_alias")
+                    or attempt_diagnostics.persona_alias(task.persona_id)
+                ),
+                "source": str(
+                    task.runtime.get("persona_source")
+                    or attempt_diagnostics.PERSONA_SOURCE_UNKNOWN
+                ),
+                "library": str(
+                    task.runtime.get("persona_library_status")
+                    or attempt_diagnostics.PERSONA_LIBRARY_MISSING
+                ),
+                # 可读池张数（**不是**任何节点实际发出去的张数）。
+                "pool": max(0, int(task.runtime.get("persona_reference_pool", 0) or 0)),
+                "skipped": max(0, int(task.runtime.get("persona_reference_skipped", 0) or 0)),
+            }
+        reference_plans = attempt_diagnostics.as_reference_plans(
+            task.runtime.get("reference_plans")
+        )
+        if reference_plans:
+            manifest_extra["reference_plans"] = reference_plans
+            trimmed = [item for item in reference_plans if item["reason"] in ("limit_trimmed", "limit_exhausted_by_explicit")]
+            if trimmed:
+                # 有库但被节点限额挤占 ≠ 缺库：留痕（不落任何 Persona 身份信息）。
+                logger.warning(
+                    "%s task=%s 人格参考图被节点限额挤占 legs=%d nodes=%s",
+                    self._log_prefix(task.runtime.get("source_event")),
+                    task.id[:8],
+                    len(trimmed),
+                    ",".join(sorted({item["node"] for item in trimmed}))[:160],
+                )
         attempt_errors = list(task.runtime.get("attempt_errors", []) or [])
         manifest_extra["attempts"] = {
             "count": len(attempt_errors),

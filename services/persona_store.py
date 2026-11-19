@@ -7,12 +7,49 @@ import re
 import shutil
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from pathlib import Path
 
 from ..core.errors import DuplicateImage
 from ..core.security import ensure_child, safe_component
 
 ALLOWED_MIME = {"image/png": ".png", "image/jpeg": ".jpg", "image/webp": ".webp", "image/gif": ".gif"}
+
+#: 图库三态 + 故障态。值域与 ``core.diagnostics.PERSONA_LIBRARY_*`` 逐字相同；
+#: 这里只留字符串常量，避免 ``services`` 反向依赖 ``core.diagnostics``。
+REFERENCE_STATUS_OK = "ok"
+REFERENCE_STATUS_EMPTY = "empty"
+REFERENCE_STATUS_MISSING = "missing"
+REFERENCE_STATUS_ERROR = "error"
+
+
+class PersonaReferenceError(RuntimeError):
+    """Persona 图库无法**安全**枚举或读取。
+
+    与"空库"必须分开：空库是正常状态（继续只发显式图或只用 prompt），读取失败
+    必须让任务安全失败（0 provider calls），不许静默伪装成"这个人格没有参考图"。
+    异常文本只放稳定原因码，不含 Persona ID、文件名、目录或本地路径。
+    """
+
+    def __init__(self, reason: str, status: str = REFERENCE_STATUS_ERROR):
+        self.reason = str(reason or "unknown")
+        self.status = str(status or REFERENCE_STATUS_ERROR)
+        super().__init__(f"Persona 参考图读取失败（reason={self.reason}）")
+
+
+@dataclass(frozen=True, slots=True)
+class ReferenceScan:
+    """一次图库扫描的结果：状态位 + 可用条目 + 被跳过的条目数。"""
+
+    status: str
+    entries: tuple[dict, ...] = ()
+    skipped: int = 0
+    reason: str = ""
+
+    @property
+    def pool(self) -> int:
+        #: 可读参考图张数（**不是**任何节点实际发出去的张数）。
+        return len(self.entries)
 
 
 class PersonaStore:
@@ -207,6 +244,52 @@ class PersonaStore:
         if not directory.exists():
             return []
         return [{"name": p.name, "size": p.stat().st_size} for p in sorted(directory.iterdir()) if p.is_file() and not p.is_symlink()]
+
+    def scan_references(self, persona_id: str) -> ReferenceScan:
+        """区分「目录不存在 / 库为空 / 枚举失败」，并给出可读条目。
+
+        ``list_references`` 对"目录不存在"和"空目录"都返回 ``[]``（历史行为，保留
+        给调用方），本方法补上状态位，供 ``_prepare`` 留痕与安全失败使用：缺目录与
+        空库都是正常的"没有图"，枚举失败则是故障，不能伪装成前两者。
+        符号链接与非普通文件不计入可读条目（与 ``reference_path`` 的拒绝口径一致），
+        但计入 ``skipped``，避免"文件在那儿却发不出去"无声无息。
+        """
+        directory = self.persona_dir(persona_id)
+        try:
+            if not directory.exists():
+                return ReferenceScan(REFERENCE_STATUS_MISSING)
+            if not directory.is_dir():
+                return ReferenceScan(REFERENCE_STATUS_ERROR, reason="not_a_directory")
+            children = sorted(directory.iterdir())
+        except OSError as error:
+            return ReferenceScan(
+                REFERENCE_STATUS_ERROR, reason=f"enum_failed:{type(error).__name__}"
+            )
+        entries: list[dict] = []
+        skipped = 0
+        for path in children:
+            try:
+                if path.is_symlink() or not path.is_file():
+                    skipped += 1
+                    continue
+                entries.append({"name": path.name, "size": int(path.stat().st_size)})
+            except OSError:
+                skipped += 1
+        status = REFERENCE_STATUS_OK if entries else REFERENCE_STATUS_EMPTY
+        return ReferenceScan(status, tuple(entries), skipped)
+
+    def read_reference(self, persona_id: str, filename: str) -> bytes:
+        """读取一张参考图字节；任何 IO/路径问题统一转 :class:`PersonaReferenceError`。"""
+        try:
+            return self.reference_path(persona_id, filename).read_bytes()
+        except PersonaReferenceError:
+            raise
+        except FileNotFoundError as error:
+            raise PersonaReferenceError("read_missing") from error
+        except OSError as error:
+            raise PersonaReferenceError(f"read_failed:{type(error).__name__}") from error
+        except ValueError as error:
+            raise PersonaReferenceError("read_unsafe_name") from error
 
     def reference_path(self, persona_id: str, filename: str) -> Path:
         if Path(filename).name != filename:

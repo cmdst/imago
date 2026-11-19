@@ -42,6 +42,8 @@ def _err(
 
 # 单次上传 Persona 参考图的数量上限（每张仍有 max_upload_bytes 大小限制）。
 MAX_UPLOAD_IMAGES = 20
+#: Persona 标识长度上限（与 :meth:`PageAPI.detail` 同一口径）。
+MAX_PERSONA_ID_CHARS = 256
 
 _MISSING = object()
 
@@ -462,7 +464,7 @@ class PageAPI:
 
     async def detail(self):
         persona_id = str(request.args.get("persona_id", "")).strip()
-        if not persona_id or len(persona_id) > 256:
+        if not persona_id or len(persona_id) > MAX_PERSONA_ID_CHARS:
             return _err("persona_id 无效")
         try:
             prompt = await self.plugin.get_persona_prompt(persona_id)
@@ -483,6 +485,10 @@ class PageAPI:
         try:
             body = await request.get_json(force=True)
             persona_id = str((body or {}).get("persona_id", "")).strip()
+            # v1.4.2 C-PERSONA：显式校验绑定目标，别把"空/超长"混进"Persona 不存在"。
+            # 上传**只**写这一个 ID 的目录：不搬旧图、不跨人格借库、不改原图。
+            if not persona_id or len(persona_id) > MAX_PERSONA_ID_CHARS:
+                return _err("persona_id 无效")
             if not await self.plugin.get_persona_prompt(persona_id):
                 return _err("Persona 不存在", 404)
             images = (body or {}).get("images", [])

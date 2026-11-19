@@ -19,7 +19,7 @@ except ImportError:  # 允许在不含 AstrBot 运行依赖的源码环境运行
 from ..core import diagnostics
 from ..core.config import available_providers, matches_template
 from ..core.errors import ConfigurationError, NoOutputError, ProviderError, ProviderTimeout
-from ..core.models import DrawTask, ImageResult, TaskStage, TaskState
+from ..core.models import DrawTask, GenerationRequest, ImageResult, TaskStage, TaskState
 from ..core.prompting import (
     REFERENCE_RELATION_SUFFIX,
     reference_caption_user_prompt,
@@ -54,6 +54,74 @@ FALLBACK_CAPTION_SYSTEM = (
 # ``vision_timeout + 15 + 20`` 的余量（契约 §6 D2：超时/取消要及时前进或终止）。
 _TEXT_GUARD_SECONDS = 15.0
 _TEXT_STAGE_MARGIN_SECONDS = 20.0
+
+
+# ------------------------------------------------- 逐腿参考图实发计划（v1.4.2 C-PERSONA）
+# 值域封闭：每个 attempt 只能落进下面这些原因之一。**"原始池张数"与"实际送进
+# adapter 的张数"是两件事**，历史日志把前者当后者（persona_refs 读上一次 attempt
+# 的覆盖值）导致纯文字腿也被报成带着人格图，这里用不可变计划切断该错误来源。
+REFERENCE_REASON_OK = "ok"
+REFERENCE_REASON_UNLIMITED = "limit_unlimited"
+REFERENCE_REASON_COVERS = "limit_covers_pool"
+REFERENCE_REASON_TRIMMED = "limit_trimmed"
+REFERENCE_REASON_EXHAUSTED = "limit_exhausted_by_explicit"
+REFERENCE_REASON_LIBRARY_MISSING = "library_missing"
+REFERENCE_REASON_LIBRARY_EMPTY = "library_empty"
+REFERENCE_REASON_LIBRARY_ERROR = "library_error"
+REFERENCE_REASON_NO_POOL = "no_persona_pool"
+REFERENCE_REASON_TEXT_FALLBACK = "text_fallback"
+#: 逐腿参考图计划的保留条数（manifest 侧同样有界投影）。
+REFERENCE_PLAN_ENTRIES = 16
+
+REFERENCE_REASONS = (
+    REFERENCE_REASON_OK,
+    REFERENCE_REASON_UNLIMITED,
+    REFERENCE_REASON_COVERS,
+    REFERENCE_REASON_TRIMMED,
+    REFERENCE_REASON_EXHAUSTED,
+    REFERENCE_REASON_LIBRARY_MISSING,
+    REFERENCE_REASON_LIBRARY_EMPTY,
+    REFERENCE_REASON_LIBRARY_ERROR,
+    REFERENCE_REASON_NO_POOL,
+    REFERENCE_REASON_TEXT_FALLBACK,
+)
+
+
+@dataclass(frozen=True, slots=True)
+class ReferencePlan:
+    """一次 adapter 调用的参考图**实发**计划（不可变，逐腿记录用）。
+
+    ``persona_pool`` 是采样前的可用候选数，``persona_sent`` 才是真的进
+    ``adapter.generate`` 的张数 —— 观测字段只认后者，``reason`` 解释差在哪。
+    """
+
+    request: GenerationRequest
+    explicit_count: int
+    persona_count: int
+    persona_pool: int
+    persona_budget: int
+    reference_limit: int
+    reason: str
+    library_status: str = ""
+
+    @property
+    def total(self) -> int:
+        return self.explicit_count + self.persona_count
+
+    def as_record(self, *, node: str, model: str, kind: str = "normal") -> dict:
+        """投影成可写进 runtime/manifest 的**脱敏**观测记录（键固定、值有界）。"""
+        return {
+            "node": str(node or ""),
+            "model": str(model or ""),
+            "kind": str(kind or "normal"),
+            "reference_limit": max(0, int(self.reference_limit)),
+            "explicit_sent": max(0, int(self.explicit_count)),
+            "persona_sent": max(0, int(self.persona_count)),
+            "persona_pool": max(0, int(self.persona_pool)),
+            "persona_budget": max(0, int(self.persona_budget)),
+            "library": str(self.library_status or ""),
+            "reason": str(self.reason or ""),
+        }
 
 
 @dataclass(slots=True)
@@ -204,6 +272,19 @@ class TaskScheduler:
         ``cfg`` 是调用方已解析好的 ``RuntimeConfig``（**必填、不给默认值**）：参考图关系
         声明的注入开关（``task_config.inject_reference_note``）就在里面。漏传必须炸，
         不许静默按 True/False 走 —— 这是 ``core/enhance.plan(*, remaining)`` 的同一条教训。
+
+        v1.4.2：本方法保留为**纯请求**薄包装（既有静态签名/三个 ``current_*`` runtime
+        键的语义不变）；需要"这一腿到底发了什么"的调用方改用
+        :meth:`_plan_attempt_request` 拿 :class:`ReferencePlan`。
+        """
+        return TaskScheduler._plan_attempt_request(task, provider, cfg).request
+
+    @staticmethod
+    def _plan_attempt_request(task: DrawTask, provider, cfg) -> ReferencePlan:
+        """算出**一次 adapter 调用**的参考图实发计划（显式优先 + 人格按限额补位）。
+
+        显式参考（用户指定/引用图）永远在前且**不被人格限额截断**；节点
+        ``reference_image_limit`` 只约束"显式之外还能补几张人格图"，``0`` 表示不限。
         """
         # v1.4.1 C-COMPRESS：主流程在 ``_prepare`` 末尾把"发往 provider 的副本"算好并
         # 放进 runtime（``send_references`` / ``send_persona_references``）。这里优先取
@@ -219,6 +300,7 @@ class TaskScheduler:
             if "send_persona_references" in task.runtime
             else (task.runtime.get("persona_references", []) or [])
         )
+        library_status = str(task.runtime.get("persona_library_status", "") or "")
         limit = max(0, int(getattr(provider, "reference_image_limit", 0) or 0))
         if limit > 0:
             persona_budget = max(0, limit - len(explicit_references))
@@ -227,7 +309,31 @@ class TaskScheduler:
                 min(persona_budget, len(persona_references)),
             ) if persona_budget else []
         else:
+            persona_budget = len(persona_references)
             selected_persona = persona_references
+        # 实发原因：只解释"人格图为什么不是全量"，绝不把池大小当实发张数。
+        # ``persona_pool`` 报的是**可读池**（原始张数，`_prepare` 落盘的那个），
+        # 不是本次采样集合的大小：压缩去重可能让副本比原图少，"池"若跟着副本变
+        # 就等于拿实发冒充实有。采样/裁剪判定仍以真正参与采样的集合为准。
+        readable_pool = task.runtime.get("persona_reference_pool")
+        persona_pool = int(readable_pool) if isinstance(readable_pool, int) and readable_pool >= 0 else len(persona_references)
+        if not persona_references:
+            if library_status == "missing":
+                reason = REFERENCE_REASON_LIBRARY_MISSING
+            elif library_status == "empty":
+                reason = REFERENCE_REASON_LIBRARY_EMPTY
+            elif library_status == "error":
+                reason = REFERENCE_REASON_LIBRARY_ERROR
+            else:
+                reason = REFERENCE_REASON_NO_POOL
+        elif limit == 0:
+            reason = REFERENCE_REASON_UNLIMITED
+        elif persona_budget <= 0:
+            reason = REFERENCE_REASON_EXHAUSTED
+        elif len(selected_persona) < len(persona_references):
+            reason = REFERENCE_REASON_TRIMMED
+        else:
+            reason = REFERENCE_REASON_COVERS
         references = [*explicit_references, *selected_persona]
         prompt = task.request.prompt
         # 注入开关（`task_config.inject_reference_note`，默认 True = 与 1.1.0 逐字节
@@ -245,7 +351,17 @@ class TaskScheduler:
         task.runtime["current_explicit_reference_count"] = len(explicit_references)
         task.runtime["current_persona_reference_count"] = len(selected_persona)
         task.runtime["current_reference_count"] = len(references)
-        return replace(task.request, references=references, prompt=prompt)
+        task.runtime["current_reference_reason"] = reason
+        return ReferencePlan(
+            request=replace(task.request, references=references, prompt=prompt),
+            explicit_count=len(explicit_references),
+            persona_count=len(selected_persona),
+            persona_pool=persona_pool,
+            persona_budget=persona_budget,
+            reference_limit=limit,
+            reason=reason,
+            library_status=library_status,
+        )
 
     @staticmethod
     def set_stage(task: DrawTask, stage: TaskStage) -> None:
@@ -519,6 +635,25 @@ class TaskScheduler:
         if subcalls:
             task.runtime["native_subcalls"] = int(task.runtime.get("native_subcalls", 0) or 0) + subcalls
 
+    @staticmethod
+    def _record_reference_plan(
+        task: DrawTask, plan: ReferencePlan, *, node: str, model: str, kind: str = "normal",
+    ) -> None:
+        """逐腿记录"这一腿实际发了什么参考图"（有界、脱敏）。
+
+        记录的是**插件交给 adapter 的入参事实**，不是远端收件、也不是可用池大小。
+        ``persona_library_status`` 一起带上，便于把"没有图"和"有图没发"分开看。
+        """
+        records = task.runtime.setdefault("reference_plans", [])
+        if not isinstance(records, list):
+            records = task.runtime["reference_plans"] = []
+        record = plan.as_record(node=node, model=model, kind=kind)
+        record["library"] = str(
+            plan.library_status or task.runtime.get("persona_library_status", "") or ""
+        )
+        records.append(record)
+        del records[:-REFERENCE_PLAN_ENTRIES]
+
     def _record_rejection(self, task: DrawTask, verdict, attempt, *, status=None) -> None:
         """记录首个非 ``unknown`` 的拒绝事件（只做排障留痕）。
 
@@ -748,6 +883,22 @@ class TaskScheduler:
             # 顶层同口径计数：manifest 的 attempts.text_attempts 直接读这个键（验收 10）。
             task.runtime["text_attempts"] = int(info["text_attempts"])
             text_request = replace(rejected_request, prompt=text_prompt, references=())
+            # 纯文字腿**没有**任何参考图：显式写死 0/0，绝不沿用上一轮带图 attempt
+            # 的 ``current_persona_reference_count``（历史 DEBUG 会把 1 张人格图报成
+            # 这一腿的实发，t2 已在隔离实验里复现）。
+            text_plan = ReferencePlan(
+                request=text_request,
+                explicit_count=0,
+                persona_count=0,
+                persona_pool=int(task.runtime.get("persona_reference_pool", 0) or 0),
+                persona_budget=0,
+                reference_limit=max(0, int(getattr(attempt, "reference_image_limit", 0) or 0)),
+                reason=REFERENCE_REASON_TEXT_FALLBACK,
+                library_status=str(task.runtime.get("persona_library_status", "") or ""),
+            )
+            self._record_reference_plan(
+                task, text_plan, node=attempt.id, model=model, kind="text_fallback"
+            )
             self.debug(
                 task,
                 "task=%s 参考图文字降级 尝试 node=%s model=%s attempt=%d/%d prompt_len=%d",
@@ -761,12 +912,13 @@ class TaskScheduler:
             try:
                 self.debug(
                     task,
-                    "task=%s 绘图节点尝试 node=%s type=%s model=%s model_attempt=%d/%d size=%s aspect=%s count=%d references=%d persona_refs=%d",
+                    "task=%s 绘图节点尝试 node=%s type=%s model=%s model_attempt=%d/%d size=%s aspect=%s count=%d references=%d persona_refs=%d explicit=%d pool=%d limit=%d reason=%s",
                     task.id[:8], attempt.id, attempt.api_type, model,
                     number, per_node,
                     text_request.size or attempt.default_size, text_request.aspect_ratio,
                     text_request.count, len(text_request.references),
-                    task.runtime.get("current_persona_reference_count", 0),
+                    text_plan.persona_count, text_plan.explicit_count,
+                    text_plan.persona_pool, text_plan.reference_limit, text_plan.reason,
                 )
                 try:
                     try:
@@ -791,10 +943,10 @@ class TaskScheduler:
                     self._record_adapter_subcalls(task, adapter)
                 self.debug(
                     task,
-                    "task=%s 绘图模型成功 node=%s model=%s results=%d references=%d persona_refs=%d forms=%s bytes=%d",
+                    "task=%s 绘图模型成功 node=%s model=%s results=%d references=%d persona_refs=%d explicit=%d forms=%s bytes=%d",
                     task.id[:8], attempt.id, model, len(results),
                     len(text_request.references),
-                    task.runtime.get("current_persona_reference_count", 0),
+                    text_plan.persona_count, text_plan.explicit_count,
                     ["bytes" if item.data is not None else "local" if item.local_path else "url" for item in results],
                     sum(len(item.data or b"") for item in results),
                 )
@@ -834,10 +986,10 @@ class TaskScheduler:
                 )
                 self.debug(
                     task,
-                    "task=%s 绘图模型失败 node=%s model=%s references=%d persona_refs=%d error_type=%s detail=%s",
+                    "task=%s 绘图模型失败 node=%s model=%s references=%d persona_refs=%d explicit=%d reason=%s error_type=%s detail=%s",
                     task.id[:8], attempt.id, model,
                     len(text_request.references),
-                    task.runtime.get("current_persona_reference_count", 0),
+                    text_plan.persona_count, text_plan.explicit_count, text_plan.reason,
                     type(exc).__name__, str(exc),
                 )
                 self.logger(attempt, exc, task)
@@ -863,10 +1015,10 @@ class TaskScheduler:
                 )
                 self.debug(
                     task,
-                    "task=%s 绘图模型失败 node=%s model=%s references=%d persona_refs=%d error_type=%s detail=%s",
+                    "task=%s 绘图模型失败 node=%s model=%s references=%d persona_refs=%d explicit=%d reason=%s error_type=%s detail=%s",
                     task.id[:8], attempt.id, model,
                     len(text_request.references),
-                    task.runtime.get("current_persona_reference_count", 0),
+                    text_plan.persona_count, text_plan.explicit_count, text_plan.reason,
                     type(wrapped).__name__, str(wrapped),
                 )
                 self.logger(attempt, wrapped, task)
@@ -955,22 +1107,29 @@ class TaskScheduler:
                 attempt = replace(provider, model=model)
                 # ``config`` 是本函数开头已取好的 RuntimeConfig，不新增一次
                 # load_config（逐图重复解析的教训就在那儿）。
-                attempt_request = self._request_for_attempt(task, attempt, config)
+                plan = self._plan_attempt_request(task, attempt, config)
+                attempt_request = plan.request
                 task.runtime["current_provider_id"] = attempt.id
                 task.runtime["current_model"] = model
+                # v1.4.2 C-PERSONA：逐腿记录**实发**张数与原因（不可变计划 → 有界
+                # 记录），manifest 由 finalizer 投影；绝不把可用池当实发。
+                self._record_reference_plan(task, plan, node=attempt.id, model=model)
                 # rev3.1 §7.2：``attempt_meta`` 每次尝试覆盖写，只存元数据。
+                # 计数与角色**只认本腿计划**：历史实现用 ``task.request.references``
+                # （全量池）当 explicit_count，纯文字/被裁减的腿都会虚报。
                 task.runtime["attempt_meta"] = {
                     "provider_id": attempt.id,
                     "model": model,
                     "api_type": attempt.api_type,
-                    "explicit_count": len(task.request.references),
-                    "persona_count": int(
-                        task.runtime.get("current_persona_reference_count", 0) or 0
-                    ),
+                    "explicit_count": plan.explicit_count,
+                    "persona_count": plan.persona_count,
+                    "persona_pool": plan.persona_pool,
+                    "reference_limit": plan.reference_limit,
+                    "reference_reason": plan.reason,
                     "references": [
                         {
                             "role": "explicit"
-                            if index < len(task.request.references) else "persona",
+                            if index < plan.explicit_count else "persona",
                             "index": index,
                             "mime_type": image.mime_type,
                             "bytes": len(image.data or b""),
@@ -994,12 +1153,13 @@ class TaskScheduler:
                 try:
                     self.debug(
                         task,
-                        "task=%s 绘图节点尝试 node=%s type=%s model=%s model_attempt=%d/%d size=%s aspect=%s count=%d references=%d persona_refs=%d",
+                        "task=%s 绘图节点尝试 node=%s type=%s model=%s model_attempt=%d/%d size=%s aspect=%s count=%d references=%d persona_refs=%d explicit=%d pool=%d limit=%d reason=%s",
                         task.id[:8], attempt.id, attempt.api_type, model,
                         model_index, len(models),
                         attempt_request.size or attempt.default_size, attempt_request.aspect_ratio,
                         attempt_request.count, len(attempt_request.references),
-                        task.runtime.get("current_persona_reference_count", 0),
+                        plan.persona_count, plan.explicit_count, plan.persona_pool,
+                        plan.reference_limit, plan.reason,
                     )
                     try:
                         try:
@@ -1027,10 +1187,10 @@ class TaskScheduler:
                         self._record_adapter_subcalls(task, adapter)
                     self.debug(
                         task,
-                        "task=%s 绘图模型成功 node=%s model=%s results=%d references=%d persona_refs=%d forms=%s bytes=%d",
+                        "task=%s 绘图模型成功 node=%s model=%s results=%d references=%d persona_refs=%d explicit=%d forms=%s bytes=%d",
                         task.id[:8], attempt.id, model, len(results),
                         len(attempt_request.references),
-                        task.runtime.get("current_persona_reference_count", 0),
+                        plan.persona_count, plan.explicit_count,
                         ["bytes" if item.data is not None else "local" if item.local_path else "url" for item in results],
                         sum(len(item.data or b"") for item in results),
                     )
@@ -1062,10 +1222,10 @@ class TaskScheduler:
                     task.runtime.setdefault("attempt_errors", []).append(f"{attempt.id}:{model}:{type(exc).__name__}")
                     self.debug(
                         task,
-                        "task=%s 绘图模型失败 node=%s model=%s references=%d persona_refs=%d error_type=%s detail=%s",
+                        "task=%s 绘图模型失败 node=%s model=%s references=%d persona_refs=%d explicit=%d reason=%s error_type=%s detail=%s",
                         task.id[:8], attempt.id, model,
                         len(attempt_request.references),
-                        task.runtime.get("current_persona_reference_count", 0),
+                        plan.persona_count, plan.explicit_count, plan.reason,
                         type(exc).__name__, str(exc),
                     )
                     verdict = classify_rejection(exc, api_type=attempt.api_type, model=model)
@@ -1140,10 +1300,10 @@ class TaskScheduler:
                     )
                     self.debug(
                         task,
-                        "task=%s 绘图模型失败 node=%s model=%s references=%d persona_refs=%d error_type=%s detail=%s",
+                        "task=%s 绘图模型失败 node=%s model=%s references=%d persona_refs=%d explicit=%d reason=%s error_type=%s detail=%s",
                         task.id[:8], attempt.id, model,
                         len(attempt_request.references),
-                        task.runtime.get("current_persona_reference_count", 0),
+                        plan.persona_count, plan.explicit_count, plan.reason,
                         type(wrapped).__name__, str(wrapped),
                     )
                     self.logger(attempt, wrapped, task)

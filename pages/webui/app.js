@@ -77,6 +77,31 @@ async function renderGallery(refs){
   gallery.innerHTML=cards.join('');
 }
 function readFile(file){return new Promise((resolve,reject)=>{const reader=new FileReader();reader.onload=()=>resolve(String(reader.result).split(',')[1]);reader.onerror=reject;reader.readAsDataURL(file)})}
+function sameFiles(current,expected){
+  const now=[...(current||[])];
+  if(now.length!==expected.length)return false;
+  return now.every((file,index)=>file===expected[index]);
+}
+/* 上传参考图：**点击瞬间**锁定绑定目标与文件集。
+   FileReader 是异步的（大图可能读几百毫秒），历史实现把 persona_id 留到读完之后才读
+   state.current——读取期间切换 Persona 就会把 A 的图写进 B 的图库（v1.4.2 首要缺陷）。
+   迟到的完成回调同样不得刷新/清空"已经不是它"的人格界面：只在目标未变时才清空文件
+   选择并重载详情，否则只提示图落到了哪个人格下。 */
+async function uploadReferences(){
+  const personaId=state.current;
+  if(!personaId){notify('请先选择 Persona',true);return}
+  const input=$('#reference-files');
+  const files=[...(input.files||[])];
+  if(!files.length){notify('请先选择图片',true);return}
+  const images=[];
+  for(const file of files)images.push({mime_type:file.type||'',data:await readFile(file)});
+  const r=await apiPost('upload',{persona_id:personaId,images});
+  if(!r.success){notify(r.message||'上传失败',true);return}
+  const stale=state.current!==personaId;
+  if(!stale&&sameFiles(input.files,files))input.value='';
+  notify(stale?`${r.message}（已绑定 Persona：${personaId}）`:r.message,false);
+  if(!stale)await loadPersonaDetail();
+}
 function updateSummaryCount(){const area=$('#persona-summary');$('#summary-count').textContent=`${area.value.length} 字符`}
 function setRebuildLoading(active){state.rebuilding=active;const button=$('#rebuild');button.disabled=active||!state.current;button.classList.toggle('is-loading',active);button.setAttribute('aria-busy',active?'true':'false');button.textContent=active?'正在重建…':'重建外观摘要'}
 
@@ -585,11 +610,11 @@ $('#persona-select').addEventListener('change',async event=>{state.current=event
 $('#rebuild').addEventListener('click',async()=>{if(state.rebuilding||!state.current)return;const personaId=state.current;setRebuildLoading(true);try{const r=await apiPost('rebuild',{persona_id:personaId,reference_names:[...state.selectedReferences]});if(!r.success){notify(r.message||'重建失败',true);return}if(state.current===personaId)await loadPersonaDetail();notify(r.message||'外观摘要已重建')}catch(error){notify(error.message||'重建失败',true)}finally{setRebuildLoading(false)}});
 $('#persona-summary').addEventListener('input',updateSummaryCount);
 $('#save-summary').addEventListener('click',async()=>{const summary=$('#persona-summary').value.trim();if(!summary){notify('外观摘要不能为空',true);return}const r=await apiPost('summary',{persona_id:state.current,summary});notify(r.message,!r.success);if(r.success)await loadPersonaDetail()});
-$('#upload').addEventListener('click',async()=>{const files=[...$('#reference-files').files];if(!files.length){notify('请先选择图片',true);return}const images=[];for(const file of files)images.push({mime_type:file.type,data:await readFile(file)});const r=await apiPost('upload',{persona_id:state.current,images});notify(r.message,!r.success);if(r.success){$('#reference-files').value='';await loadPersonaDetail()}});
+$('#upload').addEventListener('click',()=>{uploadReferences().catch(error=>notify(error&&error.message?error.message:'上传失败',true))});
 window.addEventListener('beforeunload',event=>{if(!state.dirty&&!state.quotaDirty)return;event.preventDefault();event.returnValue=''});
 
 /* 测试钩子：Node vm 回归直接调用真实渲染/装配逻辑（对线上无副作用）。 */
-window.__imagoWebui={state,catalogEntry,catalogLabel,paramFields,capabilitiesOf,qualityText,thinkingCapText,referencesText,thinkingValues,thinkingLabel,normalizeProvider,renderProviders,renderGroups,groupState,buildProviderPayload,applySnapshot,syncProviderField,syncGroupField,setParamValue,clearConfirmMessage};
+window.__imagoWebui={state,catalogEntry,catalogLabel,paramFields,capabilitiesOf,qualityText,thinkingCapText,referencesText,thinkingValues,thinkingLabel,normalizeProvider,renderProviders,renderGroups,groupState,buildProviderPayload,applySnapshot,syncProviderField,syncGroupField,setParamValue,clearConfirmMessage,loadPersonaDetail,renderGallery,readFile,uploadReferences,sameFiles};
 
 (async()=>{
   try{
